@@ -1,0 +1,25 @@
+# Copyright 2026 ALTESSA SOLUTIONS INC.
+# Use of this source code is governed by an MIT-style license that can be
+# found in the LICENSE file.
+
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - errorlint
+    - gocritic
+    - misspell
+    - revive
+  settings:
+    gocritic:
+      disabled-checks:
+        # Fires on the code cgo generates for a C call, not on the source.
+        - dupSubExpr
+  exclusions:
+    presets:
+      - std-error-handling
+
+formatters:
+  enable:
+    - gofmt

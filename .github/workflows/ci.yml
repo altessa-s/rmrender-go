@@ -1,0 +1,114 @@
+# Copyright 2026 ALTESSA SOLUTIONS INC.
+# Use of this source code is governed by an MIT-style license that can be
+# found in the LICENSE file.
+
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+jobs:
+  macos:
+    name: macos / ${{ matrix.backend }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # CoreGraphics is the darwin default; the rmrender_cairo build tag
+        # selects the Cairo backend, which Linux uses.
+        backend: [coregraphics, cairo]
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+
+      - name: Install the Cairo stack and PDFium
+        if: matrix.backend == 'cairo'
+        run: |
+          brew install cairo pango fontconfig harfbuzz gdk-pixbuf pkgconf
+          arch=$(uname -m | sed 's/x86_64/x64/')
+          python3 internal/clib/rmrender/scripts/fetch-pdfium.py --platform "mac-$arch" --output "$RUNNER_TEMP/pdfium"
+          echo "CGO_CFLAGS=-I$RUNNER_TEMP/pdfium/include" >> "$GITHUB_ENV"
+          echo "CGO_LDFLAGS=-L$RUNNER_TEMP/pdfium/lib -Wl,-rpath,$RUNNER_TEMP/pdfium/lib" >> "$GITHUB_ENV"
+          echo "GOFLAGS=-tags=rmrender_cairo" >> "$GITHUB_ENV"
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+      - name: Test with full cgo pointer checks
+        run: GOEXPERIMENT=cgocheck2 go test -count=1 ./...
+
+      - name: Fuzz page drawing briefly
+        run: go test -run='^$' -fuzz=FuzzPage -fuzztime=20s .
+
+      - name: Link beside rmlines-go, rmdoc-go and rmmarks-go
+        run: go -C internal/coexist test -count=1 ./...
+
+  linux:
+    name: linux / ${{ matrix.arch }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    # Debian 13 ships clang 19, the oldest clang that reads the vendored C23,
+    # and the Cairo stack rmrender-lib is tested with.
+    container: debian:trixie
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    env:
+      CGO_ENABLED: "1"
+      CC: clang
+    steps:
+      - name: Install the compiler and the Cairo stack
+        run: |
+          apt-get update
+          apt-get install -y ca-certificates git clang pkg-config python3 libcairo2-dev libpango1.0-dev \
+              libharfbuzz-dev libgdk-pixbuf-2.0-dev libfontconfig1-dev zlib1g-dev
+          clang --version | head -1
+
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+
+      - name: Fetch PDFium
+        run: |
+          python3 internal/clib/rmrender/scripts/fetch-pdfium.py --platform linux-${{ matrix.arch }} --output "$RUNNER_TEMP/pdfium"
+          echo "CGO_CFLAGS=-I$RUNNER_TEMP/pdfium/include" >> "$GITHUB_ENV"
+          echo "CGO_LDFLAGS=-L$RUNNER_TEMP/pdfium/lib -Wl,-rpath,$RUNNER_TEMP/pdfium/lib" >> "$GITHUB_ENV"
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+      - name: Test with full cgo pointer checks
+        run: GOEXPERIMENT=cgocheck2 go test -count=1 ./...
+
+      - name: Fuzz page drawing briefly
+        run: go test -run='^$' -fuzz=FuzzPage -fuzztime=20s .
+
+      - name: Link beside rmlines-go, rmdoc-go and rmmarks-go
+        run: go -C internal/coexist test -count=1 ./...
+
+  lint:
+    # The CoreGraphics backend type-checks with nothing to install.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.15
