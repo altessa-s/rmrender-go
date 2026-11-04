@@ -7,9 +7,11 @@ package rmrender_test
 import (
 	"bytes"
 	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"image/color"
+	"image/jpeg"
 	"image/png"
 	"io/fs"
 	"log"
@@ -64,6 +66,60 @@ func ExamplePagePDF() {
 	fmt.Println(string(pdf[:5]))
 	// Output:
 	// %PDF-
+}
+
+func ExamplePageJPEG() {
+	page, err := os.ReadFile("testdata/pages/Normal_AB.rm")
+	if err != nil {
+		log.Fatal(err)
+	}
+	f, err := rmrender.NewFonts(fonts.FS)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer f.Close()
+	out, err := rmrender.PageJPEG(context.Background(), page, 0.5, 85, &rmrender.Options{Fonts: f, Template: "P Dots S"})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	config, err := jpeg.DecodeConfig(bytes.NewReader(out))
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Println(config.Width, config.Height)
+	// Output:
+	// 702 993
+}
+
+func ExamplePageSVG() {
+	page, err := os.ReadFile("testdata/pages/Bold_Heading_Bullet_Normal.rm")
+	if err != nil {
+		log.Fatal(err)
+	}
+	f, err := rmrender.NewFonts(fonts.FS)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer f.Close()
+	svg, err := rmrender.PageSVG(context.Background(), page, &rmrender.Options{Fonts: f, Paper: rmrender.PaperLetter})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	var root struct {
+		Width   string `xml:"width,attr"`
+		Height  string `xml:"height,attr"`
+		ViewBox string `xml:"viewBox,attr"`
+	}
+	if err := xml.Unmarshal(svg, &root); err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Println(root.Width, root.Height, root.ViewBox)
+	// Output:
+	// 612pt 816pt 0 0 612 816
 }
 
 func ExamplePageMarks() {
@@ -134,6 +190,39 @@ func ExampleOpenDocument() {
 	// 2 p3 P Lines medium
 	// %PDF- 3 pages, 0 blocks skipped
 	// 140 199
+}
+
+func ExampleDocument_SVG() {
+	data, err := os.ReadFile("testdata/pages/Notes.rmdoc")
+	if err != nil {
+		log.Fatal(err)
+	}
+	f, err := rmrender.NewFonts(fonts.FS)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer f.Close()
+	doc, err := rmrender.OpenDocument(data, nil)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer doc.Close()
+	opts := &rmrender.Options{Fonts: f, PDFRasterDPI: 200}
+	pages, report, err := doc.SVG(context.Background(), opts)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	for i, svg := range pages {
+		fmt.Println(i, string(svg[:38]))
+	}
+	fmt.Println(report.RenderedPages, "of", report.DocumentPages, "pages")
+	// Output:
+	// 0 <?xml version="1.0" encoding="UTF-8"?>
+	// 1 <?xml version="1.0" encoding="UTF-8"?>
+	// 2 <?xml version="1.0" encoding="UTF-8"?>
+	// 3 of 3 pages
 }
 
 func ExampleNewTemplates() {

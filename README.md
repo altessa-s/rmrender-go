@@ -1,7 +1,8 @@
 # rmrender-go
 
-reMarkable pages and documents, drawn from Go: a `.rm` page to a PNG or a one-page PDF, a `.rmdoc` document page by page or whole to a PDF,
-with handwriting and its pen textures, typed text, highlights, images and page templates; and the highlights of a page, read as Go values.
+reMarkable pages and documents, drawn from Go: a `.rm` page to a PNG, a JPEG, a one-page PDF or an SVG, a `.rmdoc` document page by page or
+whole to a PDF or to SVG, with handwriting and its pen textures, typed text, highlights, images and page templates; and the highlights of a page,
+read as Go values.
 
 Idiomatic cgo bindings over **[rmrender-lib](https://github.com/altessa-s/rmrender-lib)**, the portable C23 renderer, whose sources are
 vendored into this module together with the libraries it reads its input with: **[rmlines-lib](https://github.com/altessa-s/rmlines-lib)**
@@ -117,6 +118,33 @@ fmt.Println(string(pdf[:5]))
 
 `PagePDF` draws the same page as one vector PDF page on the paper, in PDF points.
 
+```go
+page, err := os.ReadFile("testdata/pages/Normal_AB.rm")
+if err != nil {
+	log.Fatal(err)
+}
+f, err := rmrender.NewFonts(fonts.FS)
+if err != nil {
+	log.Fatal(err)
+}
+defer f.Close()
+out, err := rmrender.PageJPEG(context.Background(), page, 0.5, 85, &rmrender.Options{Fonts: f, Template: "P Dots S"})
+if err != nil {
+	fmt.Println(err)
+	return
+}
+config, err := jpeg.DecodeConfig(bytes.NewReader(out))
+if err != nil {
+	fmt.Println(err)
+	return
+}
+fmt.Println(config.Width, config.Height)
+```
+
+`PageJPEG` is `PageImage` encoded as JPEG, at a quality from 1 to 100, or 0 for `DefaultJPEGQuality`, 75. JPEG has no transparency: the page is
+drawn on `Background`, white without one, and what a translucent background leaves is flattened onto white. `Document.PageJPEG` does the same for
+a page of a document.
+
 ## Highlights
 
 ```go
@@ -204,6 +232,74 @@ three modes, which differ only for an imported PDF:
 A page that does not parse fails the call. What could be recovered from is counted in the `Report`: blocks of a page left out, pages that name
 an imported page the PDF does not have, and the links a fresh export could not carry over. `MaximumPages` caps the pages drawn.
 
+## SVG
+
+```go
+page, err := os.ReadFile("testdata/pages/Bold_Heading_Bullet_Normal.rm")
+if err != nil {
+	log.Fatal(err)
+}
+f, err := rmrender.NewFonts(fonts.FS)
+if err != nil {
+	log.Fatal(err)
+}
+defer f.Close()
+svg, err := rmrender.PageSVG(context.Background(), page, &rmrender.Options{Fonts: f, Paper: rmrender.PaperLetter})
+if err != nil {
+	fmt.Println(err)
+	return
+}
+var root struct {
+	Width   string `xml:"width,attr"`
+	Height  string `xml:"height,attr"`
+	ViewBox string `xml:"viewBox,attr"`
+}
+if err := xml.Unmarshal(svg, &root); err != nil {
+	fmt.Println(err)
+	return
+}
+fmt.Println(root.Width, root.Height, root.ViewBox)
+```
+
+`PageSVG` draws a page as a standalone SVG 1.1 document on the sheet `PagePDF` draws it on: `width` and `height` in points and a `viewBox`
+that spans the sheet, which clips it. Strokes, highlights with their blend modes, erasers and templates stay vectors, pencil and brush grain
+is a mask holding its one-bit raster as an embedded PNG, and images keep their PNG or JPEG bytes as `data:` URIs. Typed text becomes the filled
+outlines of its glyphs, laid out with the backend's fonts as the PDF lays it out, so the SVG needs no fonts; it is not selectable. `Background`
+is not drawn. The output is deterministic and refers to nothing outside itself.
+
+```go
+data, err := os.ReadFile("testdata/pages/Notes.rmdoc")
+if err != nil {
+	log.Fatal(err)
+}
+f, err := rmrender.NewFonts(fonts.FS)
+if err != nil {
+	log.Fatal(err)
+}
+defer f.Close()
+doc, err := rmrender.OpenDocument(data, nil)
+if err != nil {
+	fmt.Println(err)
+	return
+}
+defer doc.Close()
+opts := &rmrender.Options{Fonts: f, PDFRasterDPI: 200}
+pages, report, err := doc.SVG(context.Background(), opts)
+if err != nil {
+	fmt.Println(err)
+	return
+}
+for i, svg := range pages {
+	fmt.Println(i, string(svg[:38]))
+}
+fmt.Println(report.RenderedPages, "of", report.DocumentPages, "pages")
+```
+
+`Document.SVG` draws a whole document, one SVG document per page in order, on the sheets of its PDF, with a `Report` as `PDF` gives one, and
+`Document.PageSVG` one of those pages alone. An imported PDF page cannot stay vector in SVG: it is rasterized beneath the marks at
+`PDFRasterDPI` pixels per inch of the sheet, 150 when it is zero, and embedded as a PNG; its crop box, links and outline are not kept.
+`MaximumPages` caps the pages, and `Limits.MaximumPDFBytes` bounds the bytes of all of them together.
+
 ## Templates
 
 ```go
@@ -246,13 +342,14 @@ Every failure is an `*Error` whose `Status` mirrors the C library's, matched wit
 `Index` of the input it concerns where there is one, and in `Err` what reading a font, template or image failed with. A page that does not
 parse is `StatusBackend`, or `StatusUnsupported` for a format generation the parser does not read, as in the document export; an archive that
 is not one is `StatusInvalidArgument`. `Limits` bound points, path elements, draw commands, plan, bitmap and PDF bytes, bitmap sides,
-coordinates and widths; `DefaultLimits` answers the C library's defaults, and a call over one fails with `StatusLimit`.
+coordinates and widths, and the PDF byte limit bounds SVG output too; `DefaultLimits` answers the C library's defaults, and a call over one
+fails with `StatusLimit`.
 
 ## Design
 
-**Values out, handles only where C keeps state.** Images, PDFs, marks and reports are Go values, copied out of C memory and released before
-the call returns. `Fonts` and `Document` are handles because the C library keeps the loaded fonts and the unpacked archive between calls; both
-must be closed, and neither has a finalizer.
+**Values out, handles only where C keeps state.** Images, PDFs, SVG documents, marks and reports are Go values, copied out of C memory and
+released before the call returns. `Fonts` and `Document` are handles because the C library keeps the loaded fonts and the unpacked archive
+between calls; both must be closed, and neither has a finalizer.
 
 **One call at a time per font set.** rmrender-lib's fonts and the layouts made with them serve one thread at a time, so a `Fonts` holds a lock
 for the length of every call that uses it, and `Close` waits for those in flight. Calls with different `Fonts` run in parallel. The calls of one
@@ -273,7 +370,9 @@ the test binary's symbol table and fails on any name left unprefixed; `internal/
 test binary.
 
 **The library's own pipeline.** A page of a document is laid out as rmrender-lib's document export lays it out, page by page, so the PNG of a
-page is the page of the PDF. A lone `.rm` page is laid out the same way, with the edge mode and template it is given.
+page is the page of the PDF. A lone `.rm` page is laid out the same way, with the edge mode and template it is given. SVG output takes the
+library's own page and document SVG pipelines, so a page of `Document.SVG`, the same `Document.PageSVG` and the lone page's `PageSVG` are the
+same bytes.
 
 ## Layout
 

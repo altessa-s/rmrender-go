@@ -156,11 +156,19 @@ type Options struct {
 	// leaves them blank in their place. A document's pages take theirs from
 	// the archive.
 	Images fs.FS
-	// Background fills a bitmap before drawing; nil leaves it transparent.
+	// Background fills a bitmap before drawing; nil leaves it transparent,
+	// or white for a JPEG, which has no transparency.
 	Background color.Color
+	// PDFRasterDPI is the resolution SVG output draws the pages of an
+	// imported PDF at, in pixels per inch of the sheet. SVG cannot hold
+	// a PDF page as vectors, so each one is rasterized and embedded as a
+	// PNG beneath the marks, which stay vectors. Zero means the C library's
+	// default, 150; the most is 10,000, and the bitmap limits apply.
+	PDFRasterDPI float64
 	// MaximumPages caps the pages of a document PDF; zero means all.
 	MaximumPages int
-	// Limits bound the work; nil means [DefaultLimits].
+	// Limits bound the work; nil means [DefaultLimits]. MaximumPDFBytes
+	// bounds SVG output too, all pages of a document together.
 	Limits *Limits
 }
 
@@ -183,6 +191,7 @@ func (o *Options) request() (C.rmrgo_request, error) {
 	r.paper = C.rmr_paper(o.Paper)
 	r.edge = C.rmr_ink_edge(o.Edge)
 	r.margin = C.double(o.Margin)
+	r.raster_dpi = C.double(o.PDFRasterDPI)
 	r.limits = limits
 	return r, nil
 }

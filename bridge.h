@@ -19,6 +19,7 @@
 #include <rmrender/archive.h>
 #include <rmrender/marks.h>
 #include <rmrender/pdf.h>
+#include <rmrender/svg.h>
 
 #if defined(RMRGO_APPLE)
 #include <rmrender/apple_document.h>
@@ -46,12 +47,15 @@ void rmrgo_fonts_free(rmrgo_fonts *fonts);
 
 // What one render call is given. handle reaches the Go callbacks for
 // templates and, for a lone page, images; cancel is a flag or null.
+// raster_dpi is the resolution SVG output rasterizes imported PDF pages at,
+// in pixels per inch of sheet, zero for the library's default.
 typedef struct {
     const rmrgo_fonts *fonts;
     uintptr_t handle;
     rmr_paper paper;
     rmr_ink_edge edge;
     double margin;
+    double raster_dpi;
     rmr_limits limits;
     void *cancel;
 } rmrgo_request;
@@ -61,10 +65,12 @@ rmr_status rmrgo_page_parse(const uint8_t *bytes, size_t size, const char *templ
                             rm_page **out, rmr_error *error);
 
 // A lone page drawn to a bitmap at scale pixels per .rm unit, to a one-page
-// PDF, or read for its highlights.
+// PDF or an SVG document, or read for its highlights.
 rmr_status rmrgo_page_bitmap(const rmrgo_request *request, const rm_page *page, double scale,
                              rmr_color background, rmr_bitmap *out, rmr_error *error);
 rmr_status rmrgo_page_pdf(const rmrgo_request *request, const rm_page *page, rmr_buffer *out,
+                          rmr_error *error);
+rmr_status rmrgo_page_svg(const rmrgo_request *request, const rm_page *page, rmr_buffer *out,
                           rmr_error *error);
 rmr_status rmrgo_page_marks(const rmrgo_request *request, const rm_page *page, const char *id,
                             size_t id_length, rmr_page_marks **out, rmr_error *error);
@@ -85,6 +91,8 @@ size_t rmrgo_document_source_pages(const rmrgo_document *document);
 rmr_status rmrgo_document_bitmap(const rmrgo_request *request, rmrgo_document *document,
                                  size_t index, double scale, rmr_color background,
                                  rmr_bitmap *out, rmr_error *error);
+rmr_status rmrgo_document_page_svg(const rmrgo_request *request, rmrgo_document *document,
+                                   size_t index, rmr_buffer *out, rmr_error *error);
 rmr_status rmrgo_document_marks(const rmrgo_request *request, rmrgo_document *document,
                                 size_t index, rmr_page_marks **out, rmr_error *error);
 
@@ -96,6 +104,12 @@ rmr_status rmrgo_document_marks(const rmrgo_request *request, rmrgo_document *do
 
 rmr_status rmrgo_document_pdf(const rmrgo_request *request, rmrgo_document *document,
                               uint32_t mode, size_t maximum_pages, rmr_buffer *out,
+                              rmr_document_report *report, rmr_error *error);
+
+// The whole document as SVG, one document per page, as the library's
+// document export makes it.
+rmr_status rmrgo_document_svg(const rmrgo_request *request, rmrgo_document *document,
+                              size_t maximum_pages, rmr_svg_pages *out,
                               rmr_document_report *report, rmr_error *error);
 
 #endif
