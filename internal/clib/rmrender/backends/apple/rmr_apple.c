@@ -254,9 +254,8 @@ static rmr_status draw_pdf(apple_context* a, const rmr_draw* d) {
   return RMR_OK;
 }
 
-/* Build a CoreText line for utf8/size at font_size in color. */
-static rmr_status text_line(const char* utf8, size_t size, double font_size,
-                            rmr_color color, CTLineRef* out) {
+rmr_status rmr_apple_text_line(const char* utf8, size_t size, double font_size,
+                               rmr_color color, CTLineRef* out) {
   if ((!utf8 && size) || !isfinite(font_size) || font_size <= 0 ||
       font_size > 1e6)
     return RMR_ERR_INVALID_ARGUMENT;
@@ -302,8 +301,8 @@ static rmr_status measure_text(void* context, const char* utf8, size_t size,
   if (!out) return RMR_ERR_INVALID_ARGUMENT;
 
   CTLineRef line = nullptr;
-  rmr_status s =
-      text_line(utf8, size, font_size, (rmr_color){0, 0, 0, 1}, &line);
+  rmr_status s = rmr_apple_text_line(utf8, size, font_size,
+                                     (rmr_color){0, 0, 0, 1}, &line);
   if (s != RMR_OK) return s;
 
   CGFloat ascent = 0, descent = 0, leading = 0;
@@ -331,8 +330,8 @@ rmr_text_provider rmr_apple_text_provider(void) {
 /* Draw a single text run at its baseline origin. */
 static rmr_status draw_text(apple_context* a, const rmr_draw* d) {
   CTLineRef line = nullptr;
-  rmr_status s =
-      text_line(d->text.utf8, d->text.size, d->text.font_size, d->color, &line);
+  rmr_status s = rmr_apple_text_line(d->text.utf8, d->text.size,
+                                     d->text.font_size, d->color, &line);
   if (s != RMR_OK) return s;
 
   CGContextSaveGState(a->cg);

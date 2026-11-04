@@ -80,6 +80,27 @@ func takeBuffer(b *C.rmr_buffer) ([]byte, error) {
 	return goBytes(b.bytes, b.size, "output")
 }
 
+// takeSVGPages copies the SVG documents of C into Go memory, one slice
+// each, and releases them.
+func takeSVGPages(p *C.rmr_svg_pages) ([][]byte, error) {
+	defer C.rmr_svg_pages_free(p)
+	count, err := goLength(p.count, "page count")
+	if err != nil {
+		return nil, err
+	}
+	if count == 0 {
+		return [][]byte{}, nil
+	}
+	buffers := unsafe.Slice(p.pages, count)
+	out := make([][]byte, count)
+	for i := range buffers {
+		if out[i], err = goBytes(buffers[i].bytes, buffers[i].size, "output"); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
 // takeBitmap copies a C bitmap, premultiplied RGBA with the first row at the
 // top, into an image of the same layout and releases it.
 func takeBitmap(b *C.rmr_bitmap) (*image.RGBA, error) {

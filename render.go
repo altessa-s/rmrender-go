@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"image"
+	"image/jpeg"
 	"image/png"
 	"unsafe"
 )
@@ -97,6 +98,42 @@ func render(ctx context.Context, o *Options, f func(r *C.rmrgo_request, cerr *C.
 		return e
 	}
 	return c.errorOf(status, &cerr)
+}
+
+// DefaultJPEGQuality is the JPEG quality of a quality of 0, that of
+// [image/jpeg].
+const DefaultJPEGQuality = jpeg.DefaultQuality
+
+// checkJPEGQuality refuses a JPEG quality outside 0 to 100.
+func checkJPEGQuality(quality int) error {
+	if quality < 0 || quality > 100 {
+		return errInvalid("JPEG quality must be 1 to 100, or 0 for the default")
+	}
+	return nil
+}
+
+// encodeJPEG answers img as JPEG bytes at quality, 0 for the default. JPEG
+// has no transparency, so what is left of it is composited onto white:
+// img is premultiplied, and drawing it over white adds the white its alpha
+// lets through.
+func encodeJPEG(img *image.RGBA, quality int) ([]byte, error) {
+	if quality == 0 {
+		quality = DefaultJPEGQuality
+	}
+	for i := 0; i+3 < len(img.Pix); i += 4 {
+		if a := img.Pix[i+3]; a != 0xff {
+			through := 0xff - a
+			img.Pix[i] += through
+			img.Pix[i+1] += through
+			img.Pix[i+2] += through
+			img.Pix[i+3] = 0xff
+		}
+	}
+	var b bytes.Buffer
+	if err := jpeg.Encode(&b, img, &jpeg.Options{Quality: quality}); err != nil {
+		return nil, err
+	}
+	return b.Bytes(), nil
 }
 
 // encodePNG answers img as PNG bytes.

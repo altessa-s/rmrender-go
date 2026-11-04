@@ -140,10 +140,8 @@ static rmr_status segment_end(drawing* c) {
   return s;
 }
 
-/* Builds a single-paragraph Pango layout for text in the fixed
- * sans-serif family at an absolute point size. */
-static PangoLayout* label(cairo_t* cr, const char* text, size_t size,
-                          double font_size) {
+PangoLayout* rmr_linux_label(cairo_t* cr, const char* text, size_t size,
+                             double font_size) {
   PangoLayout* p = pango_cairo_create_layout(cr);
   PangoFontDescription* f = pango_font_description_new();
   pango_font_description_set_family(
@@ -168,7 +166,7 @@ static rmr_status measure(void* ctx, const char* text, size_t size,
 
   cairo_surface_t* s = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
   cairo_t* cr = cairo_create(s);
-  PangoLayout* p = label(cr, text, size, font_size);
+  PangoLayout* p = rmr_linux_label(cr, text, size, font_size);
   PangoRectangle ink, logical;
   pango_layout_get_extents(p, &ink, &logical);
   double base = (double)pango_layout_get_baseline(p) / PANGO_SCALE;
@@ -607,7 +605,8 @@ static rmr_status draw(void* ctx, const rmr_draw* d) {
       }
     }
   } else if (d->mode == RMR_TEXT) {
-    PangoLayout* p = label(cr, d->text.utf8, d->text.size, d->text.font_size);
+    PangoLayout* p =
+        rmr_linux_label(cr, d->text.utf8, d->text.size, d->text.font_size);
     cairo_move_to(
         cr, d->text.origin.x,
         d->text.origin.y - (double)pango_layout_get_baseline(p) / PANGO_SCALE);

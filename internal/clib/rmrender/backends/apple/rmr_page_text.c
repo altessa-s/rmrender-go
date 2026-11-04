@@ -6,13 +6,15 @@
 
 /* Shared implementation behind page_plan, page_ink_plan and page_bounds,
  * building ink/writing above template/image backgrounds, or just measuring
- * their combined bounds when measured is given. */
+ * their combined bounds when measured is given. outlines draws typed text as
+ * glyph outline fills instead of an embedded text PDF. */
 static rmr_status page_build(const rm_page* page, rmr_point canvas,
                              rmr_ink_edge edge, double margin,
                              const rmr_page_resources* given_resources,
                              const rmr_apple_fonts* fonts,
                              const rmr_limits* given, bool ink_only,
-                             rmr_rect* measured, rmr_plan** out, rmr_error* e) {
+                             bool outlines, rmr_rect* measured, rmr_plan** out,
+                             rmr_error* e) {
   if (!page || (!out && !measured) || !isfinite(canvas.x) ||
       !isfinite(canvas.y) || canvas.x <= 0 || canvas.y <= 0 ||
       canvas.x > 100000 || canvas.y > 100000)
@@ -85,7 +87,10 @@ static rmr_status page_build(const rm_page* page, rmr_point canvas,
   }
 
   if (layout) {
-    s = rmr_apple_layout_plan(layout, viewport, &remaining, &text, e);
+    s = outlines
+            ? rmr_apple_layout_outline_plan(layout, viewport, &remaining, &text,
+                                            e)
+            : rmr_apple_layout_plan(layout, viewport, &remaining, &text, e);
     if (s != RMR_OK) goto done;
     remaining.maximum_plan_bytes -= rmr_plan_bytes(text);
   }
@@ -174,7 +179,7 @@ rmr_status rmr_apple_page_plan(const rm_page* page, rmr_point canvas,
                                const rmr_limits* limits, rmr_plan** out,
                                rmr_error* error) {
   return page_build(page, canvas, edge, margin, resources, fonts, limits, false,
-                    nullptr, out, error);
+                    false, nullptr, out, error);
 }
 
 rmr_status rmr_apple_page_ink_plan(const rm_page* page, rmr_point canvas,
@@ -183,7 +188,7 @@ rmr_status rmr_apple_page_ink_plan(const rm_page* page, rmr_point canvas,
                                    const rmr_limits* limits, rmr_plan** out,
                                    rmr_error* error) {
   return page_build(page, canvas, edge, margin, nullptr, fonts, limits, true,
-                    nullptr, out, error);
+                    false, nullptr, out, error);
 }
 
 rmr_status rmr_apple_page_bounds(const rm_page* page, rmr_point canvas,
@@ -196,7 +201,51 @@ rmr_status rmr_apple_page_bounds(const rm_page* page, rmr_point canvas,
                                 "missing bounds output");
   rmr_rect result;
   rmr_status status = page_build(page, canvas, edge, margin, nullptr, fonts,
-                                 limits, false, &result, nullptr, error);
+                                 limits, false, false, &result, nullptr, error);
   if (status == RMR_OK) *out = result;
   return status;
+}
+
+rmr_status rmr_apple_page_outline_plan(const rm_page* page, rmr_point canvas,
+                                       rmr_ink_edge edge, double margin,
+                                       const rmr_page_resources* resources,
+                                       const rmr_apple_fonts* fonts,
+                                       const rmr_limits* limits, rmr_plan** out,
+                                       rmr_error* error) {
+  return page_build(page, canvas, edge, margin, resources, fonts, limits, false,
+                    true, nullptr, out, error);
+}
+
+rmr_status rmr_apple_page_svg(const rm_page* page, rmr_point canvas,
+                              rmr_ink_edge edge, double margin,
+                              const rmr_page_resources* resources,
+                              const rmr_apple_fonts* fonts, rmr_paper paper,
+                              double raster_dpi, const rmr_limits* limits,
+                              rmr_cancel_fn cancel, void* context,
+                              rmr_buffer* out, rmr_error* error) {
+  if (!out)
+    return rmr_apple_text_error(error, RMR_ERR_INVALID_ARGUMENT,
+                                "missing SVG output");
+
+  rmr_plan* plan = nullptr;
+  rmr_status s = page_build(page, canvas, edge, margin, resources, fonts,
+                            limits, false, true, nullptr, &plan, error);
+  if (s != RMR_OK) return s;
+
+  rmr_sheet sheet;
+  s = rmr_paper_sheet(paper, canvas.x, canvas.y, rmr_plan_viewport(plan),
+                      &sheet, error);
+
+  rmr_svg_pages pages = {0};
+  const rmr_plan* plans[] = {plan};
+  if (s == RMR_OK)
+    s = rmr_apple_svg(plans, &sheet, 1, raster_dpi, limits, cancel, context,
+                      &pages, error);
+  rmr_plan_free(plan);
+  if (s != RMR_OK) return s;
+
+  *out = pages.pages[0];
+  pages.pages[0] = (rmr_buffer){0};
+  rmr_svg_pages_free(&pages);
+  return RMR_OK;
 }

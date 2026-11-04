@@ -18,6 +18,11 @@
 #include "_cgo_export.h"
 #include "bridge.h"
 
+// The backend's page plan with typed text as glyph outlines, which its
+// document export draws SVG pages with: exported by the vendored backend,
+// though not part of its public headers.
+#include "rmr_typography_internal.h"
+
 #if defined(RMRGO_APPLE)
 #define NATIVE(name) rmr_apple_##name
 #else
@@ -199,13 +204,18 @@ static rmr_rect sheet_frame(rmr_sheet sheet) {
                       sheet.width / a, sheet.height / a};
 }
 
+// The canvas of a lone page: its own plausible size, else the tablet's.
+static rmr_status lone_canvas(const rmrgo_request *r, const rm_page *page, rmr_point *out,
+                              rmr_error *e) {
+    const rm_page *pages[] = {page};
+    return rmr_lines_document_canvas(pages, 1, (rmr_point){0}, false, &r->limits, out, e);
+}
+
 static rmr_status lone_layout(const rmrgo_request *r, const rm_page *page, layout *out,
                               rmr_error *e) {
     *out = (layout){0};
     rmr_point canvas;
-    const rm_page *pages[] = {page};
-    rmr_status s =
-        rmr_lines_document_canvas(pages, 1, (rmr_point){0}, false, &r->limits, &canvas, e);
+    rmr_status s = lone_canvas(r, page, &canvas, e);
     if (s == RMR_OK)
         s = rmr_paper_points(r->paper, canvas.x, canvas.y, &out->points, e);
     if (s != RMR_OK)
@@ -246,6 +256,23 @@ rmr_status rmrgo_page_pdf(const rmrgo_request *r, const rm_page *page, rmr_buffe
         s = NATIVE(pdf_sheets)(plans, &sheet, 1, &r->limits, cancelled, r->cancel, out, e);
     }
     layout_free(&l);
+    return s;
+}
+
+// The library's own page SVG lays the page out as its page plan does, with
+// typed text as glyph outlines, on rmr_paper_sheet: the sheet pdf_sheet makes
+// for a notebook page.
+rmr_status rmrgo_page_svg(const rmrgo_request *r, const rm_page *page, rmr_buffer *out,
+                          rmr_error *e) {
+    rmr_point canvas;
+    rmr_status s = lone_canvas(r, page, &canvas, e);
+    if (s != RMR_OK)
+        return s;
+    templates t;
+    rmr_page_resources res = resources(r, &t, nullptr);
+    s = NATIVE(page_svg)(page, canvas, r->edge, r->margin, &res, r->fonts, r->paper,
+                         r->raster_dpi, &r->limits, cancelled, r->cancel, out, e);
+    rmr_template_document_free(t.document);
     return s;
 }
 
@@ -449,8 +476,10 @@ static rmr_status document_canvas(rmrgo_document *d, const rmr_limits *limits, r
 
 // One page of a document laid out as the document export lays it out. page
 // receives the parsed page, null for a page with no notebook content.
+// outlines plans typed text as glyph outlines, as the SVG export does.
 static rmr_status document_layout(const rmrgo_request *r, rmrgo_document *d, size_t index,
-                                  rm_page **parsed, rm_page *shown, layout *out, rmr_error *e) {
+                                  bool outlines, rm_page **parsed, rm_page *shown, layout *out,
+                                  rmr_error *e) {
     *out = (layout){0};
     *parsed = nullptr;
     if (index >= rmrgo_document_count(d))
@@ -509,9 +538,9 @@ static rmr_status document_layout(const rmrgo_request *r, rmrgo_document *d, siz
 
     templates t;
     rmr_page_resources res = resources(r, &t, d->document);
-    s = NATIVE(page_plan)(shown, size, d->source ? RMR_EDGE_CENTRELINE : RMR_EDGE_RIBBON,
-                          d->source ? SOURCE_MARGIN : 0, &res, r->fonts, &r->limits, &out->plan,
-                          e);
+    s = (outlines ? NATIVE(page_outline_plan) : NATIVE(page_plan))(
+        shown, size, d->source ? RMR_EDGE_CENTRELINE : RMR_EDGE_RIBBON,
+        d->source ? SOURCE_MARGIN : 0, &res, r->fonts, &r->limits, &out->plan, e);
     rmr_template_document_free(t.document);
     return s;
 }
@@ -551,7 +580,7 @@ rmr_status rmrgo_document_bitmap(const rmrgo_request *r, rmrgo_document *d, size
                                  rmr_error *e) {
     rm_page *parsed = nullptr, shown;
     layout l;
-    rmr_status s = document_layout(r, d, index, &parsed, &shown, &l, e);
+    rmr_status s = document_layout(r, d, index, false, &parsed, &shown, &l, e);
     rmr_sheet sheet;
     if (s == RMR_OK)
         s = bitmap_sheet(&l, scale, &sheet, e);
@@ -567,11 +596,41 @@ rmr_status rmrgo_document_bitmap(const rmrgo_request *r, rmrgo_document *d, size
     return s;
 }
 
+// A page of the document as the SVG export draws it: the outline plan on
+// the PDF sheet, over its imported page, which the SVG writer rasterizes.
+rmr_status rmrgo_document_page_svg(const rmrgo_request *r, rmrgo_document *d, size_t index,
+                                   rmr_buffer *out, rmr_error *e) {
+    rm_page *parsed = nullptr, shown;
+    layout l;
+    rmr_status s = document_layout(r, d, index, true, &parsed, &shown, &l, e);
+    rmr_sheet sheet;
+    if (s == RMR_OK)
+        s = pdf_sheet(&l, &sheet, e);
+    rmr_plan *full = nullptr;
+    if (s == RMR_OK && l.source)
+        s = with_source(r, d, &l, &full, e);
+    rmr_svg_pages pages = {0};
+    if (s == RMR_OK) {
+        const rmr_plan *plans[] = {full ? full : l.plan};
+        s = NATIVE(svg)(plans, &sheet, 1, r->raster_dpi, &r->limits, cancelled, r->cancel, &pages,
+                        e);
+    }
+    if (s == RMR_OK) {
+        *out = pages.pages[0];
+        pages.pages[0] = (rmr_buffer){0};
+    }
+    rmr_svg_pages_free(&pages);
+    rmr_plan_free(full);
+    layout_free(&l);
+    rm_page_free(parsed);
+    return s;
+}
+
 rmr_status rmrgo_document_marks(const rmrgo_request *r, rmrgo_document *d, size_t index,
                                 rmr_page_marks **out, rmr_error *e) {
     rm_page *parsed = nullptr, shown;
     layout l;
-    rmr_status s = document_layout(r, d, index, &parsed, &shown, &l, e);
+    rmr_status s = document_layout(r, d, index, false, &parsed, &shown, &l, e);
     if (s == RMR_OK) {
         const rmr_document_page *record = rmrgo_document_page(d, index);
         rm_str id = record && record->id ? (rm_str){record->id, strlen(record->id)} : (rm_str){0};
@@ -604,6 +663,17 @@ rmr_status rmrgo_document_pdf(const rmrgo_request *r, rmrgo_document *d, uint32_
     default:
         s = fail(e, RMR_ERR_INVALID_ARGUMENT, "unknown PDF mode");
     }
+    rmr_template_document_free(t.document);
+    return s;
+}
+
+rmr_status rmrgo_document_svg(const rmrgo_request *r, rmrgo_document *d, size_t maximum_pages,
+                              rmr_svg_pages *out, rmr_document_report *report, rmr_error *e) {
+    templates t;
+    rmr_page_resources res = resources(r, &t, d->document);
+    rmr_status s = NATIVE(document_svg)(d->document, &res, r->fonts, r->paper, maximum_pages,
+                                        r->raster_dpi, &r->limits, cancelled, r->cancel, out,
+                                        report, e);
     rmr_template_document_free(t.document);
     return s;
 }

@@ -111,6 +111,23 @@ func TestTemplate(t *testing.T) {
 	}
 }
 
+// NoTemplates draws a page without its template, even a bundled one named.
+func TestNoTemplates(t *testing.T) {
+	data := loadPage(t, strokesPage)
+	bare, err := rmrender.PageImage(context.Background(), data, 0.25, withFonts(t, rmrender.Options{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	none, err := rmrender.PageImage(context.Background(), data, 0.25,
+		withFonts(t, rmrender.Options{Templates: rmrender.NoTemplates(), Template: "P Lines medium"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(none.Pix, bare.Pix) {
+		t.Fatal("NoTemplates drew a template")
+	}
+}
+
 // A layer of templates comes before the bundled ones, and may add names.
 func TestTemplateLayers(t *testing.T) {
 	data := loadPage(t, strokesPage)

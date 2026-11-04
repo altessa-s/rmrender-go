@@ -2,10 +2,11 @@
 // Use of this source code is governed by an MIT-style license that can be
 // found in the LICENSE file.
 
-// Package rmrender draws reMarkable pages and documents: a .rm page to a PNG
-// or a one-page PDF, a .rmdoc document page by page or whole to a PDF, with
-// handwriting and its pen textures, typed text, highlights, images and page
-// templates; and it reads the highlights of a page as Go values.
+// Package rmrender draws reMarkable pages and documents: a .rm page to a PNG,
+// a JPEG, a one-page PDF or an SVG document, a .rmdoc document page by page
+// or whole to a PDF or to SVG, with handwriting and its pen textures, typed
+// text, highlights, images and page templates; and it reads the highlights
+// of a page as Go values.
 //
 // The package binds rmrender-lib, a C23 library, together with the libraries
 // it reads its input with: rmlines-lib for .rm pages, rmdoc-lib for .rmdoc
@@ -17,16 +18,17 @@
 //
 // # Pages
 //
-// [PageImage], [PagePNG] and [PagePDF] draw the bytes of one .rm page on a
-// [Paper], with a template named in [Options] and the page grown with its ink
-// as [Edge] says. [PageMarks] answers its highlights.
+// [PageImage], [PagePNG], [PageJPEG], [PagePDF] and [PageSVG] draw the bytes
+// of one .rm page on a [Paper], with a template named in [Options] and the
+// page grown with its ink as [Edge] says. [PageMarks] answers its highlights.
 //
 // # Documents
 //
 // [OpenDocument] unpacks a .rmdoc archive. A [Document] draws any of its pages
 // as the document's own PDF lays them out, imported PDF pages beneath their
-// marks, and the whole document as a PDF in each [PDFMode], with a [Report]
-// of what could not be kept.
+// marks, and the whole document as a PDF in each [PDFMode] or as one SVG
+// document per page, with a [Report] of what could not be kept. SVG holds an
+// imported PDF page as a raster, at [Options].PDFRasterDPI.
 //
 // # Fonts and templates
 //

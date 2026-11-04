@@ -95,6 +95,46 @@ func PagePDF(ctx context.Context, data []byte, o *Options) ([]byte, error) {
 	return takeBuffer(&out)
 }
 
+// PageJPEG is [PageImage], flattened onto o.Background, or white without
+// one, and encoded as JPEG at quality 1 to 100; 0 means
+// [DefaultJPEGQuality].
+func PageJPEG(ctx context.Context, data []byte, scale float64, quality int, o *Options) ([]byte, error) {
+	if err := checkJPEGQuality(quality); err != nil {
+		return nil, err
+	}
+	img, err := PageImage(ctx, data, scale, o.opaque())
+	if err != nil {
+		return nil, err
+	}
+	return encodeJPEG(img, quality)
+}
+
+// PageSVG draws the .rm page data as a standalone SVG 1.1 document on the
+// sheet [PagePDF] draws it on: width and height in points, and a viewBox
+// that spans the sheet. Strokes, highlights and templates stay vectors,
+// typed text becomes the outlines of its glyphs, laid out as the PDF lays
+// it out, so that the SVG needs no fonts, and images keep their PNG or JPEG
+// bytes. o.Background is not drawn: the sheet is transparent around the ink.
+// The output is deterministic, and refers to nothing outside itself.
+func PageSVG(ctx context.Context, data []byte, o *Options) ([]byte, error) {
+	if err := live(ctx); err != nil {
+		return nil, err
+	}
+	page, err := parsePage(data, o)
+	if err != nil {
+		return nil, err
+	}
+	defer C.rm_page_free(page)
+	var out C.rmr_buffer
+	err = render(ctx, o, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
+		return C.rmrgo_page_svg(r, page, &out, cerr)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return takeBuffer(&out)
+}
+
 // PageMarks answers the highlights of the .rm page data: the text each one
 // covers and the bands it is drawn as, in boxes that are fractions of the
 // page [PagePDF] draws with the same options. id names the page in the
@@ -122,4 +162,17 @@ func (o *Options) background() color.Color {
 		return nil
 	}
 	return o.Background
+}
+
+// opaque answers o for a JPEG: a copy with a white background unless it
+// names one.
+func (o *Options) opaque() *Options {
+	var c Options
+	if o != nil {
+		c = *o
+	}
+	if c.Background == nil {
+		c.Background = color.White
+	}
+	return &c
 }

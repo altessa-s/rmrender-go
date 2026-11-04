@@ -71,6 +71,18 @@ RMR_API bool rmr_linux_layout_bottom(const rmr_linux_layout* layout,
     const rmr_page_resources* resources, const rmr_linux_fonts* fonts,
     const rmr_limits* limits, rmr_plan** out, rmr_error* error);
 
+/* One notebook page as a standalone SVG document on its paper sheet
+ * (rmr_paper_sheet over the page viewport). Same composition as
+ * rmr_linux_page_plan, except typed text: its shaped Pango lines become glyph
+ * outline paths rather than an embedded text PDF, so the SVG matches the PDF
+ * output without fonts. Rendered by rmr_linux_svg; see there for raster_dpi. */
+[[nodiscard]] RMR_API rmr_status rmr_linux_page_svg(
+    const rm_page* page, rmr_point canvas, rmr_ink_edge edge, double margin,
+    const rmr_page_resources* resources, const rmr_linux_fonts* fonts,
+    rmr_paper paper, double raster_dpi, const rmr_limits* limits,
+    rmr_cancel_fn cancel, void* cancel_context, rmr_buffer* out,
+    rmr_error* error);
+
 /* Handwriting only, for OCR. Text still positions anchors and contributes to
  * bounds; typed glyphs, highlights, images and templates are not drawn. */
 [[nodiscard]] RMR_API rmr_status rmr_linux_page_ink_plan(

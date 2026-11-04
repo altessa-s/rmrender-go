@@ -10,7 +10,7 @@
 // alike, so that the C names stay as written and the linker sees only the
 // prefixed ones: rmlines-go, rmdoc-go and rmmarks-go compile the same
 // libraries under their own names, and one program may link them all.
-// 456 symbols, read with nm from objects of both backends.
+// 472 symbols, read with nm from objects of both backends.
 
 #ifndef RMRENDER_GO_CLIB_SYMBOLS_H
 #define RMRENDER_GO_CLIB_SYMBOLS_H
@@ -255,6 +255,7 @@
 #define rmr_apple_document_pdf rmrgo_rmr_apple_document_pdf
 #define rmr_apple_document_pdf_preserving rmrgo_rmr_apple_document_pdf_preserving
 #define rmr_apple_document_pdf_recomposed rmrgo_rmr_apple_document_pdf_recomposed
+#define rmr_apple_document_svg rmrgo_rmr_apple_document_svg
 #define rmr_apple_draw_context rmrgo_rmr_apple_draw_context
 #define rmr_apple_fonts_create rmrgo_rmr_apple_fonts_create
 #define rmr_apple_fonts_create_directory rmrgo_rmr_apple_fonts_create_directory
@@ -265,13 +266,17 @@
 #define rmr_apple_layout_create rmrgo_rmr_apple_layout_create
 #define rmr_apple_layout_free rmrgo_rmr_apple_layout_free
 #define rmr_apple_layout_line rmrgo_rmr_apple_layout_line
+#define rmr_apple_layout_outline_plan rmrgo_rmr_apple_layout_outline_plan
 #define rmr_apple_layout_plan rmrgo_rmr_apple_layout_plan
+#define rmr_apple_line_outline rmrgo_rmr_apple_line_outline
 #define rmr_apple_mark_sheet rmrgo_rmr_apple_mark_sheet
 #define rmr_apple_mark_stroke_bounds rmrgo_rmr_apple_mark_stroke_bounds
 #define rmr_apple_page_bounds rmrgo_rmr_apple_page_bounds
 #define rmr_apple_page_ink_plan rmrgo_rmr_apple_page_ink_plan
 #define rmr_apple_page_marks rmrgo_rmr_apple_page_marks
+#define rmr_apple_page_outline_plan rmrgo_rmr_apple_page_outline_plan
 #define rmr_apple_page_plan rmrgo_rmr_apple_page_plan
+#define rmr_apple_page_svg rmrgo_rmr_apple_page_svg
 #define rmr_apple_pdf rmrgo_rmr_apple_pdf
 #define rmr_apple_pdf_fail rmrgo_rmr_apple_pdf_fail
 #define rmr_apple_pdf_incremental rmrgo_rmr_apple_pdf_incremental
@@ -284,7 +289,9 @@
 #define rmr_apple_pdf_source_free rmrgo_rmr_apple_pdf_source_free
 #define rmr_apple_pdf_source_length rmrgo_rmr_apple_pdf_source_length
 #define rmr_apple_pdf_source_size rmrgo_rmr_apple_pdf_source_size
+#define rmr_apple_svg rmrgo_rmr_apple_svg
 #define rmr_apple_text_error rmrgo_rmr_apple_text_error
+#define rmr_apple_text_line rmrgo_rmr_apple_text_line
 #define rmr_apple_text_provider rmrgo_rmr_apple_text_provider
 #define rmr_apple_text_width rmrgo_rmr_apple_text_width
 #define rmr_apple_unit_raster rmrgo_rmr_apple_unit_raster
@@ -352,23 +359,29 @@
 #define rmr_linux_document_pdf rmrgo_rmr_linux_document_pdf
 #define rmr_linux_document_pdf_preserving rmrgo_rmr_linux_document_pdf_preserving
 #define rmr_linux_document_pdf_recomposed rmrgo_rmr_linux_document_pdf_recomposed
+#define rmr_linux_document_svg rmrgo_rmr_linux_document_svg
 #define rmr_linux_error rmrgo_rmr_linux_error
 #define rmr_linux_fonts_create rmrgo_rmr_linux_fonts_create
 #define rmr_linux_fonts_create_directory rmrgo_rmr_linux_fonts_create_directory
 #define rmr_linux_fonts_free rmrgo_rmr_linux_fonts_free
+#define rmr_linux_label rmrgo_rmr_linux_label
 #define rmr_linux_layout_anchors rmrgo_rmr_linux_layout_anchors
 #define rmr_linux_layout_bottom rmrgo_rmr_linux_layout_bottom
 #define rmr_linux_layout_bytes rmrgo_rmr_linux_layout_bytes
 #define rmr_linux_layout_create rmrgo_rmr_linux_layout_create
 #define rmr_linux_layout_free rmrgo_rmr_linux_layout_free
 #define rmr_linux_layout_line rmrgo_rmr_linux_layout_line
+#define rmr_linux_layout_outline_plan rmrgo_rmr_linux_layout_outline_plan
 #define rmr_linux_layout_plan rmrgo_rmr_linux_layout_plan
 #define rmr_linux_mark_sheet rmrgo_rmr_linux_mark_sheet
 #define rmr_linux_mark_stroke_bounds rmrgo_rmr_linux_mark_stroke_bounds
 #define rmr_linux_page_bounds rmrgo_rmr_linux_page_bounds
 #define rmr_linux_page_ink_plan rmrgo_rmr_linux_page_ink_plan
 #define rmr_linux_page_marks rmrgo_rmr_linux_page_marks
+#define rmr_linux_page_outline_plan rmrgo_rmr_linux_page_outline_plan
 #define rmr_linux_page_plan rmrgo_rmr_linux_page_plan
+#define rmr_linux_page_svg rmrgo_rmr_linux_page_svg
+#define rmr_linux_path_capture rmrgo_rmr_linux_path_capture
 #define rmr_linux_pdf rmrgo_rmr_linux_pdf
 #define rmr_linux_pdf_incremental rmrgo_rmr_linux_pdf_incremental
 #define rmr_linux_pdf_overlay rmrgo_rmr_linux_pdf_overlay
@@ -381,6 +394,7 @@
 #define rmr_linux_pdf_source_length rmrgo_rmr_linux_pdf_source_length
 #define rmr_linux_pdf_source_size rmrgo_rmr_linux_pdf_source_size
 #define rmr_linux_render_pdf rmrgo_rmr_linux_render_pdf
+#define rmr_linux_svg rmrgo_rmr_linux_svg
 #define rmr_linux_text_provider rmrgo_rmr_linux_text_provider
 #define rmr_linux_text_width rmrgo_rmr_linux_text_width
 #define rmr_linux_write rmrgo_rmr_linux_write
@@ -452,6 +466,8 @@
 #define rmr_status_string rmrgo_rmr_status_string
 #define rmr_stretch_count rmrgo_rmr_stretch_count
 #define rmr_stretches rmrgo_rmr_stretches
+#define rmr_svg_pages_free rmrgo_rmr_svg_pages_free
+#define rmr_svg_sheets rmrgo_rmr_svg_sheets
 #define rmr_template_background_plan rmrgo_rmr_template_background_plan
 #define rmr_template_background_plan_with_text rmrgo_rmr_template_background_plan_with_text
 #define rmr_template_document_category rmrgo_rmr_template_document_category

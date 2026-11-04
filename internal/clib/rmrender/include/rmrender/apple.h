@@ -6,6 +6,7 @@
 #define RMR_APPLE_H
 #include "grain.h"
 #include "output.h"
+#include "svg.h"
 #include "template.h"
 
 /* Eraser path subtraction requires macOS 13+/iOS 16+ and an SDK exposing it.
@@ -53,5 +54,15 @@ RMR_API rmr_unit_raster rmr_apple_unit_raster(void);
 
 /* Stateless CoreText Helvetica metrics, matching Apple TEXT drawing. */
 RMR_API rmr_text_provider rmr_apple_text_provider(void);
+
+/* rmr_svg_sheets with CoreText services: TEXT commands become the outlines of
+ * the Helvetica line Apple TEXT drawing shapes (glyphs without outlines, such
+ * as bitmap emoji, are omitted); PDF commands are rasterized by
+ * rmr_apple_bitmap_on_sheet at raster_dpi (zero selects 150) and embedded as
+ * PNG. One owned SVG document per plan/sheet pair. */
+[[nodiscard]] RMR_API rmr_status rmr_apple_svg(
+    const rmr_plan* const* plans, const rmr_sheet* sheets, size_t count,
+    double raster_dpi, const rmr_limits* limits, rmr_cancel_fn cancel,
+    void* cancel_context, rmr_svg_pages* out, rmr_error* error);
 
 #endif
