@@ -25,4 +25,18 @@ CTFontRef rmr_ct_font(const rmr_apple_fonts* fonts, double size,
 double rmr_ct_kern(UniChar c, rmr_type_face face, bool bold, bool italic,
                    int script);
 
+/* rmr_apple_layout_plan's geometry with glyphs as page-space outline fills
+ * instead of an embedded text PDF, for SVG output. */
+rmr_status rmr_apple_layout_outline_plan(const rmr_apple_layout* layout,
+                                         rmr_rect viewport,
+                                         const rmr_limits* limits,
+                                         rmr_plan** out, rmr_error* error);
+
+/* rmr_apple_page_plan with typed text as outlines; exported for the Apple
+ * document library, not part of the public API. */
+RMR_API rmr_status rmr_apple_page_outline_plan(
+    const rm_page* page, rmr_point canvas, rmr_ink_edge edge, double margin,
+    const rmr_page_resources* resources, const rmr_apple_fonts* fonts,
+    const rmr_limits* limits, rmr_plan** out, rmr_error* error);
+
 #endif

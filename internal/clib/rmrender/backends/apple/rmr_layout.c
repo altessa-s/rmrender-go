@@ -5,6 +5,7 @@
 #include <limits.h>
 
 #include "rmr_alphabetic.h"
+#include "rmr_apple_internal.h"
 #include "rmr_typography_internal.h"
 
 typedef struct {
@@ -730,6 +731,229 @@ static void checkbox(CGContextRef cg, rm_checkbox_state state, double x,
   CGContextRestoreGState(cg);
 }
 
+typedef struct {
+  rmr_draw* draws;
+  rmr_path* paths;
+  size_t count, capacity, elements;
+  rmr_rect viewport;
+  rmr_limits limits;
+  rmr_status status;
+} outline_recorder;
+
+/* Appends a command with an empty owned path, returning the path, or
+ * nullptr once the recorder has failed. */
+static rmr_path* outline_add(outline_recorder* o, rmr_draw draw) {
+  if (o->status != RMR_OK) return nullptr;
+
+  if (o->count == o->limits.maximum_draws) {
+    o->status = RMR_ERR_LIMIT;
+    return nullptr;
+  }
+
+  if (o->count == o->capacity) {
+    size_t capacity = o->capacity ? o->capacity * 2 : 16;
+    rmr_draw* draws = realloc(o->draws, capacity * sizeof *draws);
+    if (draws) o->draws = draws;
+    rmr_path* paths =
+        draws ? realloc(o->paths, capacity * sizeof *paths) : nullptr;
+    if (!paths) {
+      o->status = RMR_ERR_OUT_OF_MEMORY;
+      return nullptr;
+    }
+    o->paths = paths;
+    o->capacity = capacity;
+  }
+
+  o->draws[o->count] = draw;
+  o->paths[o->count] = (rmr_path){0};
+  return &o->paths[o->count++];
+}
+
+/* Maps a text-PDF point (viewport origin, y up) to page coordinates. */
+static rmr_point outline_point(const outline_recorder* o, double x, double y) {
+  return (rmr_point){x + o->viewport.x, o->viewport.y + o->viewport.height - y};
+}
+
+/* Records line's glyph outlines at text position (x, y) as a black fill. */
+static void outline_line(outline_recorder* o, CTLineRef line, double x,
+                         double y) {
+  rmr_path* path =
+      outline_add(o, (rmr_draw){.mode = RMR_FILL, .color = {0, 0, 0, 1}});
+  if (!path) return;
+
+  rmr_limits limits = o->limits;
+  limits.maximum_elements -= o->elements;
+  rmr_point origin = outline_point(o, x, y);
+  o->status = rmr_apple_line_outline(
+      line, CGAffineTransformMake(1, 0, 0, -1, origin.x, origin.y), &limits,
+      path);
+  o->elements += path->count;
+}
+
+/* Records a polyline through count text-PDF points as a fill, or as a stroke
+ * of width with butt caps and miter joins like CoreGraphics' defaults. */
+static void outline_polyline(outline_recorder* o, const CGPoint* points,
+                             size_t count, bool closed, rmr_draw_mode mode,
+                             double gray, double width) {
+  rmr_path* path = outline_add(o, (rmr_draw){.mode = mode,
+                                             .color = {gray, gray, gray, 1},
+                                             .line_width = width,
+                                             .cap = RMR_CAP_BUTT,
+                                             .join = RMR_JOIN_MITER});
+  if (!path) return;
+
+  if (count + 1 > o->limits.maximum_elements - o->elements) {
+    o->status = RMR_ERR_LIMIT;
+    return;
+  }
+
+  path->elements = calloc(count + 1, sizeof *path->elements);
+  if (!path->elements) {
+    o->status = RMR_ERR_OUT_OF_MEMORY;
+    return;
+  }
+
+  for (size_t i = 0; i < count; i++)
+    path->elements[path->count++] =
+        (rmr_element){.kind = i ? RMR_LINE : RMR_MOVE,
+                      .end = outline_point(o, points[i].x, points[i].y)};
+  if (closed) path->elements[path->count++] = (rmr_element){.kind = RMR_CLOSE};
+  o->elements += path->count;
+}
+
+/* Records the checkbox glyph at (x, y) like checkbox() draws it. */
+static void outline_checkbox(outline_recorder* o, rm_checkbox_state state,
+                             double x, double y) {
+  double side = 26.67, bottom = y - 1.74;
+  CGPoint box[] = {{x, bottom},
+                   {x + side, bottom},
+                   {x + side, bottom + side},
+                   {x, bottom + side}};
+
+  if (state == RM_CHECKBOX_TICKED) {
+    CGPoint tick[] = {{x + side * .22, bottom + side * .50},
+                      {x + side * .48, bottom + side * .26},
+                      {x + side * .82, bottom + side * .76}};
+    outline_polyline(o, box, 4, true, RMR_FILL, 0, 0);
+    outline_polyline(o, tick, 3, false, RMR_STROKE, 1, 2.5);
+  } else {
+    outline_polyline(o, box, 4, true, RMR_STROKE, 0, 2.5);
+    if (state == RM_CHECKBOX_PARTIAL) {
+      CGPoint bar[] = {{x + side * .25, bottom + side / 2},
+                       {x + side * .75, bottom + side / 2}};
+      outline_polyline(o, bar, 2, false, RMR_STROKE, 0, 2.5);
+    }
+  }
+}
+
+/* Draws every paragraph marker, checkbox, line and strike rule in text-PDF
+ * coordinates (viewport origin, y up) into cg or, when o is given, records
+ * the same geometry as page-space outline commands. */
+static void text_layer(const rmr_apple_layout* l, rmr_rect viewport,
+                       CGContextRef cg, outline_recorder* o) {
+  for (size_t i = 0; i < l->anchors.count; i++) {
+    const rmr_anchor_paragraph* p = &l->paragraphs[i];
+    const native_paragraph* n = &l->native[i];
+    double x = l->anchors.left + p->indent - viewport.x;
+    double y = viewport.height - (p->baseline - viewport.y);
+
+    if (n->marker) {
+      double marker_x = n->family == RM_LIST_BULLET
+                            ? x - 28
+                            : x - 21.5 -
+                                  CTLineGetTypographicBounds(n->marker, nullptr,
+                                                             nullptr, nullptr);
+      if (o)
+        outline_line(o, n->marker, marker_x, y);
+      else {
+        CGContextSetTextPosition(cg, marker_x, y);
+        CTLineDraw(n->marker, cg);
+      }
+    } else if (n->family == RM_LIST_CHECKBOX) {
+      if (o)
+        outline_checkbox(o, n->checkbox, x - 41.33, y);
+      else
+        checkbox(cg, n->checkbox, x - 41.33, y);
+    }
+
+    for (size_t j = 0; j < p->line_count; j++) {
+      CTLineRef line = n->lines[j];
+      double margin =
+          p->right_to_left
+              ? l->anchors.left + l->anchors.column - p->indent -
+                    CTLineGetOffsetForStringIndex(
+                        line, (CFIndex)p->lines[j].location, nullptr)
+              : l->anchors.left + p->indent;
+      x = margin - viewport.x;
+      y = viewport.height - (p->lines[j].baseline - viewport.y);
+
+      if (o)
+        outline_line(o, line, x, y);
+      else {
+        CGContextSetTextPosition(cg, x, y);
+        CTLineDraw(line, cg);
+      }
+
+      if (n->checkbox == RM_CHECKBOX_TICKED) {
+        double rule = y + n->metrics.size * .3;
+        double width = fmax(n->metrics.size * .065, .6);
+        double end =
+            x + CTLineGetTypographicBounds(line, nullptr, nullptr, nullptr);
+        if (o) {
+          CGPoint points[] = {{x, rule}, {end, rule}};
+          outline_polyline(o, points, 2, false, RMR_STROKE, 0, width);
+        } else {
+          CGContextSetLineWidth(cg, width);
+          CGContextSetRGBStrokeColor(cg, 0, 0, 0, 1);
+          CGContextMoveToPoint(cg, x, rule);
+          CGContextAddLineToPoint(cg, end, rule);
+          CGContextStrokePath(cg);
+        }
+      }
+    }
+  }
+}
+
+rmr_status rmr_apple_layout_outline_plan(const rmr_apple_layout* l,
+                                         rmr_rect viewport,
+                                         const rmr_limits* given,
+                                         rmr_plan** out, rmr_error* e) {
+  if (!l || !out)
+    return rmr_apple_text_error(e, RMR_ERR_INVALID_ARGUMENT,
+                                "missing layout/output");
+
+  outline_recorder o = {.viewport = viewport,
+                        .limits = given ? *given : rmr_limits_default()};
+  rmr_plan* validation = nullptr;
+  rmr_status s =
+      rmr_plan_create(nullptr, 0, viewport, &o.limits, &validation, e);
+  if (s != RMR_OK) return s;
+  rmr_plan_free(validation);
+
+  text_layer(l, viewport, nullptr, &o);
+
+  /* Whitespace-only lines have no outlines; drop their empty fills. */
+  size_t kept = 0;
+  for (size_t i = 0; i < o.count; i++) {
+    o.draws[i].path = (rmr_path_view){o.paths[i].elements, o.paths[i].count};
+    if (o.paths[i].count) {
+      o.draws[kept] = o.draws[i];
+      kept++;
+    }
+  }
+
+  s = o.status;
+  if (s == RMR_OK)
+    s = rmr_plan_create(o.draws, kept, viewport, &o.limits, out, e);
+  else
+    rmr_apple_text_error(e, s, "text outline failed");
+
+  for (size_t i = 0; i < o.count; i++) rmr_path_free(&o.paths[i]);
+  free(o.paths);
+  free(o.draws);
+  return s;
+}
+
 rmr_status rmr_apple_layout_plan(const rmr_apple_layout* l, rmr_rect viewport,
                                  const rmr_limits* given, rmr_plan** out,
                                  rmr_error* e) {
@@ -766,51 +990,7 @@ rmr_status rmr_apple_layout_plan(const rmr_apple_layout* l, rmr_rect viewport,
 
   CGPDFContextBeginPage(cg, nullptr);
   CGContextSetTextMatrix(cg, CGAffineTransformIdentity);
-
-  for (size_t i = 0; i < l->anchors.count; i++) {
-    const rmr_anchor_paragraph* p = &l->paragraphs[i];
-    const native_paragraph* n = &l->native[i];
-    double x = l->anchors.left + p->indent - viewport.x;
-    double y = viewport.height - (p->baseline - viewport.y);
-
-    if (n->marker) {
-      double marker_x = n->family == RM_LIST_BULLET
-                            ? x - 28
-                            : x - 21.5 -
-                                  CTLineGetTypographicBounds(n->marker, nullptr,
-                                                             nullptr, nullptr);
-      CGContextSetTextPosition(cg, marker_x, y);
-      CTLineDraw(n->marker, cg);
-    } else if (n->family == RM_LIST_CHECKBOX)
-      checkbox(cg, n->checkbox, x - 41.33, y);
-
-    for (size_t j = 0; j < p->line_count; j++) {
-      CTLineRef line = n->lines[j];
-      double margin =
-          p->right_to_left
-              ? l->anchors.left + l->anchors.column - p->indent -
-                    CTLineGetOffsetForStringIndex(
-                        line, (CFIndex)p->lines[j].location, nullptr)
-              : l->anchors.left + p->indent;
-      x = margin - viewport.x;
-      y = viewport.height - (p->lines[j].baseline - viewport.y);
-
-      CGContextSetTextPosition(cg, x, y);
-      CTLineDraw(line, cg);
-
-      if (n->checkbox == RM_CHECKBOX_TICKED) {
-        double rule = y + n->metrics.size * .3;
-        CGContextSetLineWidth(cg, fmax(n->metrics.size * .065, .6));
-        CGContextSetRGBStrokeColor(cg, 0, 0, 0, 1);
-        CGContextMoveToPoint(cg, x, rule);
-        CGContextAddLineToPoint(
-            cg, x + CTLineGetTypographicBounds(line, nullptr, nullptr, nullptr),
-            rule);
-        CGContextStrokePath(cg);
-      }
-    }
-  }
-
+  text_layer(l, viewport, cg, nullptr);
   CGPDFContextEndPage(cg);
   CGPDFContextClose(cg);
   CGContextRelease(cg);

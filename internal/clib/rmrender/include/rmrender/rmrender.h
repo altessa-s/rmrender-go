@@ -9,7 +9,7 @@
 
 #include "export.h"
 #define RMRENDER_VERSION_MAJOR 1
-#define RMRENDER_VERSION_MINOR 1
+#define RMRENDER_VERSION_MINOR 2
 #define RMRENDER_VERSION_PATCH 0
 constexpr double RMR_POINTS_PER_UNIT = 0.317180616;
 
@@ -190,7 +190,7 @@ typedef struct {
  * calls. All output arguments are unchanged on failure. Error is optional and
  * unchanged on success. Owning results must not be copied; free before reusing
  * an output. */
-/* Library version string (e.g. "1.1.0"), statically owned. */
+/* Library version string (e.g. "1.2.0"), statically owned. */
 RMR_API const char* rmr_version(void);
 
 /* Static, null-terminated description of status, for logging. */

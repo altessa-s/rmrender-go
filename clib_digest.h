@@ -6,7 +6,7 @@
 //
 // A digest of every file under internal/clib, which holds:
 //
-//   rmrender-lib v1.1.0 8055cf3a75b59548ec24b1908b6ddd9dcdfda2a2
+//   rmrender-lib v1.2.0 69f8164b31fc06eeaa3054dac6c061fc4a567218
 //   rmlines-lib v1.1.0 14ea47353d4881aefd4987ab332765cd06609296
 //   rmdoc-lib v1.1.0 aea7ed1670e2aa34ee0281d00eedc372b80b3f7c
 //   rmmarks-lib v1.1.0 565f2dfe0d2e31a218c4a874bdba96417d1ddc83
@@ -18,6 +18,6 @@
 #ifndef RMRENDER_GO_CLIB_DIGEST_H
 #define RMRENDER_GO_CLIB_DIGEST_H
 
-#define RMRENDER_GO_CLIB_DIGEST "d05458f07a74bedf3f77b8916530ca06a5b505c7073b74dd99d0f3488ad422a9"
+#define RMRENDER_GO_CLIB_DIGEST "c7608c8d2af8559b0b73c16e520ba9ee6055c0f49c112f60cee09dcfec43225a"
 
 #endif

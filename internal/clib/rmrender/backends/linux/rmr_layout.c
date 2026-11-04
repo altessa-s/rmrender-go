@@ -890,6 +890,178 @@ static cairo_status_t layout_write(void* closure, const unsigned char* data,
   return CAIRO_STATUS_SUCCESS;
 }
 
+typedef struct {
+  rmr_draw* draws;
+  rmr_path* paths;
+  size_t count, capacity, elements;
+  rmr_limits limits;
+} outline_recorder;
+
+/* Paints cr's current path with its source color: filled or stroked onto
+ * the text PDF, or, when o is given, recorded as an outline command. */
+static rmr_status paint(cairo_t* cr, outline_recorder* o, rmr_draw_mode mode) {
+  if (!o) {
+    if (mode == RMR_FILL)
+      cairo_fill(cr);
+    else
+      cairo_stroke(cr);
+    return RMR_OK;
+  }
+
+  if (o->count == o->limits.maximum_draws) return RMR_ERR_LIMIT;
+  if (o->count == o->capacity) {
+    size_t capacity = o->capacity ? o->capacity * 2 : 16;
+    rmr_draw* draws = realloc(o->draws, capacity * sizeof *draws);
+    if (draws) o->draws = draws;
+    rmr_path* paths =
+        draws ? realloc(o->paths, capacity * sizeof *paths) : nullptr;
+    if (!paths) return RMR_ERR_OUT_OF_MEMORY;
+    o->paths = paths;
+    o->capacity = capacity;
+  }
+
+  double red = 0, green = 0, blue = 0, alpha = 1;
+  cairo_pattern_get_rgba(cairo_get_source(cr), &red, &green, &blue, &alpha);
+  cairo_line_cap_t cap = cairo_get_line_cap(cr);
+  cairo_line_join_t join = cairo_get_line_join(cr);
+  o->draws[o->count] = (rmr_draw){
+      .mode = mode,
+      .color = {red, green, blue, alpha},
+      .line_width = mode == RMR_STROKE ? cairo_get_line_width(cr) : 0,
+      .cap = cap == CAIRO_LINE_CAP_ROUND    ? RMR_CAP_ROUND
+             : cap == CAIRO_LINE_CAP_SQUARE ? RMR_CAP_SQUARE
+                                            : RMR_CAP_BUTT,
+      .join = join == CAIRO_LINE_JOIN_ROUND   ? RMR_JOIN_ROUND
+              : join == CAIRO_LINE_JOIN_BEVEL ? RMR_JOIN_BEVEL
+                                              : RMR_JOIN_MITER,
+      .miter_limit = cairo_get_miter_limit(cr)};
+
+  rmr_path* path = &o->paths[o->count++];
+  *path = (rmr_path){0};
+  rmr_limits limits = o->limits;
+  limits.maximum_elements -= o->elements;
+  rmr_status s = rmr_linux_path_capture(cr, &limits, path);
+  o->elements += path->count;
+  return s;
+}
+
+/* Draws every paragraph marker, checkbox, line and strike rule in page
+ * coordinates on cr, or, when o is given, records the same geometry as
+ * outline commands; retained tracks emoji bytes kept alive for the PDF. */
+static rmr_status text_layer(const rmr_linux_layout* l, cairo_t* cr,
+                             const rmr_limits* limits, size_t* retained,
+                             outline_recorder* o, rmr_error* e) {
+  rmr_status s = RMR_OK;
+  cairo_set_source_rgb(cr, 0, 0, 0);
+  for (size_t i = 0; s == RMR_OK && i < l->anchors.count; i++) {
+    const rmr_anchor_paragraph* p = &l->paragraphs[i];
+    const paragraph* n = &l->native[i];
+    double x = l->anchors.left + p->indent, y = p->baseline;
+
+    if (n->marker) {
+      PangoRectangle logical;
+      pango_layout_get_extents(n->marker, nullptr, &logical);
+      cairo_move_to(
+          cr,
+          n->family == RM_LIST_BULLET
+              ? x - 28
+              : x - 21.5 - (double)logical.width / PANGO_SCALE,
+          y - (double)pango_layout_get_baseline(n->marker) / PANGO_SCALE);
+      if (o) {
+        pango_cairo_layout_path(cr, n->marker);
+        s = paint(cr, o, RMR_FILL);
+      } else
+        pango_cairo_show_layout(cr, n->marker);
+    } else if (n->family == RM_LIST_CHECKBOX) {
+      double bx = x - 41.33, by = y - 24.93;
+      cairo_set_line_width(cr, 2.5);
+      cairo_rectangle(cr, bx, by, 26.67, 26.67);
+      if (n->checkbox == RM_CHECKBOX_TICKED) {
+        s = paint(cr, o, RMR_FILL);
+        cairo_set_source_rgb(cr, 1, 1, 1);
+        cairo_move_to(cr, bx + 5.87, by + 13.34);
+        cairo_line_to(cr, bx + 12.8, by + 19.74);
+        cairo_line_to(cr, bx + 21.87, by + 6.4);
+        if (s == RMR_OK) s = paint(cr, o, RMR_STROKE);
+        cairo_set_source_rgb(cr, 0, 0, 0);
+      } else {
+        s = paint(cr, o, RMR_STROKE);
+        if (s == RMR_OK && n->checkbox == RM_CHECKBOX_PARTIAL) {
+          cairo_move_to(cr, bx + 6.67, by + 13.34);
+          cairo_line_to(cr, bx + 20, by + 13.34);
+          s = paint(cr, o, RMR_STROKE);
+        }
+      }
+    }
+
+    for (size_t j = 0; s == RMR_OK && j < p->line_count; j++) {
+      rmr_text_line v;
+      s = rmr_linux_layout_line(l, i, j, &v, e);
+      if (s != RMR_OK) break;
+      PangoLayoutLine* native_line =
+          pango_layout_get_line_readonly(n->lines[j], 0);
+      cairo_move_to(cr, v.start - rtl_trailing_width(native_line), v.baseline);
+      if (o) {
+        pango_cairo_layout_line_path(cr, native_line);
+        s = paint(cr, o, RMR_FILL);
+      } else
+        s = rmr_pango_show_line(cr, native_line, limits, retained);
+      if (s != RMR_OK) break;
+      if (n->checkbox == RM_CHECKBOX_TICKED) {
+        cairo_set_line_width(cr, fmax(n->metrics.size * .065, .6));
+        cairo_move_to(cr, v.start, v.baseline - n->metrics.size * .3);
+        cairo_line_to(cr, v.end, v.baseline - n->metrics.size * .3);
+        s = paint(cr, o, RMR_STROKE);
+      }
+    }
+  }
+
+  return s;
+}
+
+rmr_status rmr_linux_layout_outline_plan(const rmr_linux_layout* l,
+                                         rmr_rect viewport,
+                                         const rmr_limits* given,
+                                         rmr_plan** out, rmr_error* e) {
+  if (!l || !out)
+    return rmr_linux_error(e, RMR_ERR_INVALID_ARGUMENT,
+                           "missing layout/output");
+
+  outline_recorder o = {.limits = given ? *given : rmr_limits_default()};
+  rmr_plan* valid = nullptr;
+  rmr_status s = rmr_plan_create(nullptr, 0, viewport, &o.limits, &valid, e);
+  if (s != RMR_OK) return s;
+  rmr_plan_free(valid);
+
+  /* Recording surfaces, like PDF surfaces, keep glyph outlines unhinted. */
+  cairo_surface_t* surface =
+      cairo_recording_surface_create(CAIRO_CONTENT_COLOR_ALPHA, nullptr);
+  cairo_t* cr = cairo_create(surface);
+  size_t retained = 0;
+  s = text_layer(l, cr, &o.limits, &retained, &o, e);
+  if (s == RMR_OK && cairo_status(cr) != CAIRO_STATUS_SUCCESS)
+    s = RMR_ERR_BACKEND;
+  cairo_destroy(cr);
+  cairo_surface_destroy(surface);
+
+  /* Whitespace-only lines have no outlines; drop their empty fills. */
+  size_t kept = 0;
+  for (size_t i = 0; i < o.count; i++) {
+    o.draws[i].path = (rmr_path_view){o.paths[i].elements, o.paths[i].count};
+    if (o.paths[i].count) o.draws[kept++] = o.draws[i];
+  }
+
+  if (s == RMR_OK)
+    s = rmr_plan_create(o.draws, kept, viewport, &o.limits, out, e);
+  else
+    rmr_linux_error(e, s, "text outline failed");
+
+  for (size_t i = 0; i < o.count; i++) rmr_path_free(&o.paths[i]);
+  free(o.paths);
+  free(o.draws);
+  return s;
+}
+
 rmr_status rmr_linux_layout_plan(const rmr_linux_layout* l, rmr_rect viewport,
                                  const rmr_limits* given, rmr_plan** out,
                                  rmr_error* e) {
@@ -915,62 +1087,8 @@ rmr_status rmr_linux_layout_plan(const rmr_linux_layout* l, rmr_rect viewport,
       layout_write, &output, viewport.width, viewport.height);
   cairo_t* cr = cairo_create(surface);
   cairo_translate(cr, -viewport.x, -viewport.y);
-  cairo_set_source_rgb(cr, 0, 0, 0);
   size_t retained = 0;
-  for (size_t i = 0; s == RMR_OK && i < l->anchors.count; i++) {
-    const rmr_anchor_paragraph* p = &l->paragraphs[i];
-    const paragraph* n = &l->native[i];
-    double x = l->anchors.left + p->indent, y = p->baseline;
-
-    if (n->marker) {
-      PangoRectangle logical;
-      pango_layout_get_extents(n->marker, nullptr, &logical);
-      cairo_move_to(
-          cr,
-          n->family == RM_LIST_BULLET
-              ? x - 28
-              : x - 21.5 - (double)logical.width / PANGO_SCALE,
-          y - (double)pango_layout_get_baseline(n->marker) / PANGO_SCALE);
-      pango_cairo_show_layout(cr, n->marker);
-    } else if (n->family == RM_LIST_CHECKBOX) {
-      double bx = x - 41.33, by = y - 24.93;
-      cairo_set_line_width(cr, 2.5);
-      cairo_rectangle(cr, bx, by, 26.67, 26.67);
-      if (n->checkbox == RM_CHECKBOX_TICKED) {
-        cairo_fill(cr);
-        cairo_set_source_rgb(cr, 1, 1, 1);
-        cairo_move_to(cr, bx + 5.87, by + 13.34);
-        cairo_line_to(cr, bx + 12.8, by + 19.74);
-        cairo_line_to(cr, bx + 21.87, by + 6.4);
-        cairo_stroke(cr);
-        cairo_set_source_rgb(cr, 0, 0, 0);
-      } else {
-        cairo_stroke(cr);
-        if (n->checkbox == RM_CHECKBOX_PARTIAL) {
-          cairo_move_to(cr, bx + 6.67, by + 13.34);
-          cairo_line_to(cr, bx + 20, by + 13.34);
-          cairo_stroke(cr);
-        }
-      }
-    }
-
-    for (size_t j = 0; j < p->line_count; j++) {
-      rmr_text_line v;
-      s = rmr_linux_layout_line(l, i, j, &v, e);
-      if (s != RMR_OK) break;
-      PangoLayoutLine* native_line =
-          pango_layout_get_line_readonly(n->lines[j], 0);
-      cairo_move_to(cr, v.start - rtl_trailing_width(native_line), v.baseline);
-      s = rmr_pango_show_line(cr, native_line, &limits, &retained);
-      if (s != RMR_OK) break;
-      if (n->checkbox == RM_CHECKBOX_TICKED) {
-        cairo_set_line_width(cr, fmax(n->metrics.size * .065, .6));
-        cairo_move_to(cr, v.start, v.baseline - n->metrics.size * .3);
-        cairo_line_to(cr, v.end, v.baseline - n->metrics.size * .3);
-        cairo_stroke(cr);
-      }
-    }
-  }
+  s = text_layer(l, cr, &limits, &retained, nullptr, e);
 
   output.discard = s != RMR_OK;
   cairo_show_page(cr);

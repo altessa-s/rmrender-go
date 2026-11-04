@@ -12,6 +12,7 @@
 #include <fpdf_transformpage.h>
 #include <fpdfview.h>
 #include <math.h>
+#include <pango/pangocairo.h>
 #include <rmrender/linux.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,5 +61,16 @@ rmr_status rmr_linux_render_pdf(const rmr_plan* const* plans,
                                 const rmr_sheet* sheets, size_t count,
                                 const rmr_limits* limits, rmr_cancel_fn cancel,
                                 void* context, rmr_buffer* out, rmr_error* e);
+
+/* Builds the single-paragraph Pango layout TEXT commands draw: the fixed
+ * sans-serif family at an absolute point size. */
+PangoLayout* rmr_linux_label(cairo_t* cr, const char* text, size_t size,
+                             double font_size);
+
+/* Appends cr's current path (user space) to path within limits'
+ * maximum_elements and clears it. Exported for the Linux text library; not
+ * part of the public API. */
+RMR_API rmr_status rmr_linux_path_capture(cairo_t* cr, const rmr_limits* limits,
+                                          rmr_path* path);
 
 #endif

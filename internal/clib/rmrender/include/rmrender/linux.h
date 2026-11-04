@@ -6,6 +6,7 @@
 #define RMR_LINUX_H
 #include "grain.h"
 #include "output.h"
+#include "svg.h"
 #include "template.h"
 
 /* Cairo/PDFium bitmap rendering. PDFium calls are serialized process-wide; see
@@ -44,5 +45,15 @@ rmr_linux_pdf(const rmr_plan* const* plans, size_t count, double scale,
 
 /* Stateless Pango sans-serif metrics, matching Linux TEXT drawing. */
 RMR_API rmr_text_provider rmr_linux_text_provider(void);
+
+/* rmr_svg_sheets with Cairo/Pango services: TEXT commands become the unhinted
+ * outlines of the Pango line Linux TEXT drawing shapes; PDF commands are
+ * rasterized by PDFium through rmr_linux_bitmap_on_sheet at raster_dpi (zero
+ * selects 150) and embedded as PNG. One owned SVG document per plan/sheet
+ * pair. */
+[[nodiscard]] RMR_API rmr_status rmr_linux_svg(
+    const rmr_plan* const* plans, const rmr_sheet* sheets, size_t count,
+    double raster_dpi, const rmr_limits* limits, rmr_cancel_fn cancel,
+    void* cancel_context, rmr_svg_pages* out, rmr_error* error);
 
 #endif

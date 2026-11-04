@@ -65,4 +65,32 @@ double rmr_pango_caret_adjustment(PangoLayout* layout, size_t index);
 rmr_status rmr_pango_show_line(cairo_t* cr, PangoLayoutLine* line,
                                const rmr_limits* limits, size_t* retained);
 
+/* rmr_linux_layout_plan's geometry with glyphs as page-space outline fills
+ * instead of an embedded text PDF, for SVG output. */
+rmr_status rmr_linux_layout_outline_plan(const rmr_linux_layout* layout,
+                                         rmr_rect viewport,
+                                         const rmr_limits* limits,
+                                         rmr_plan** out, rmr_error* error);
+
+/* rmr_linux_page_plan with typed text as outlines; exported for the Linux
+ * document library, not part of the public API. */
+RMR_API rmr_status rmr_linux_page_outline_plan(
+    const rm_page* page, rmr_point canvas, rmr_ink_edge edge, double margin,
+    const rmr_page_resources* resources, const rmr_linux_fonts* fonts,
+    const rmr_limits* limits, rmr_plan** out, rmr_error* error);
+
+/* rmr_linux_layout_plan's geometry with glyphs as page-space outline fills
+ * instead of an embedded text PDF, for SVG output. */
+rmr_status rmr_linux_layout_outline_plan(const rmr_linux_layout* layout,
+                                         rmr_rect viewport,
+                                         const rmr_limits* limits,
+                                         rmr_plan** out, rmr_error* error);
+
+/* rmr_linux_page_plan with typed text as outlines; exported for the Linux
+ * document library, not part of the public API. */
+RMR_API rmr_status rmr_linux_page_outline_plan(
+    const rm_page* page, rmr_point canvas, rmr_ink_edge edge, double margin,
+    const rmr_page_resources* resources, const rmr_linux_fonts* fonts,
+    const rmr_limits* limits, rmr_plan** out, rmr_error* error);
+
 #endif
