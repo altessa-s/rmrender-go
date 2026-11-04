@@ -69,6 +69,16 @@ func TestDocumentPageImage(t *testing.T) {
 	}
 	wantSize(t, decodePNG(t, png), canvasWidth, int(math.Round(canvasWidth*841.89/595.276)))
 
+	o.Templates = rmrender.NoTemplates()
+	plain, err := d.PageImage(context.Background(), 0, 0.25, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inked(plain) >= inked(got) {
+		t.Fatalf("NoTemplates kept the document's template: %d inked pixels, %d with it", inked(plain), inked(got))
+	}
+	o.Templates = nil
+
 	_, err = d.PageImage(context.Background(), 1, 1, o)
 	wantStatus(t, err, rmrender.StatusInvalidArgument)
 	_, err = d.PageImage(context.Background(), -1, 1, o)

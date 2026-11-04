@@ -102,6 +102,13 @@ func NewTemplates(layers ...fs.FS) *Templates {
 	return t
 }
 
+// NoTemplates answers templates that hold no name, not even the bundled
+// ones: every page, of a lone .rm or of a document, is drawn without its
+// template, ink and imported PDF pages only.
+func NoTemplates() *Templates {
+	return &Templates{search: []fs.FS{}}
+}
+
 // layers answers where a name is looked up, in order; only the bundled
 // templates for a nil t.
 func (t *Templates) layers() []fs.FS {

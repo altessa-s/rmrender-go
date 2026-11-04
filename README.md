@@ -219,7 +219,8 @@ _ = &rmrender.Options{Templates: mine, Template: "P Lines small"}
 
 `BundledTemplates` holds rmrender-lib's page templates, the tablet's templates redrawn as vector models, as `<name>.template` files. A page's
 template is looked up by name in the layers given to `NewTemplates`, in order, and then in the bundled ones; a name none of them holds leaves
-the page blank behind its ink, and a malformed file fails the call. Nothing is read from disk unless a layer reads it.
+the page blank behind its ink, and a malformed file fails the call. Nothing is read from disk unless a layer reads it. `NoTemplates` holds no
+name at all: every page, of a lone `.rm` or of a document, is drawn with its ink and imported PDF pages only.
 
 ## Cancellation and errors
 
