@@ -302,10 +302,13 @@ go -C internal/coexist test ./...
 
 The script reads the symbols to rename from objects of both backends, so it runs on macOS with the Homebrew Cairo stack and a PDFium SDK.
 
-## See also
+## Bindings
 
 - **[rmrender-lib](https://github.com/altessa-s/rmrender-lib)** — the C23 renderer these bindings compile.
 - **[rmrender-swift](https://github.com/altessa-s/rmrender-swift)** — the same renderer as a Swift package.
+
+## See also
+
 - **[rmlines-go](https://github.com/altessa-s/rmlines-go)** — the `.rm` v6 page format for Go: pages, strokes, typed text and highlights, read and
   written.
 - **[rmdoc-go](https://github.com/altessa-s/rmdoc-go)** — the `.rmdoc` container for Go: the archive a document and its pages travel in.
