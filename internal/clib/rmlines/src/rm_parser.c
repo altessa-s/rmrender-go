@@ -143,6 +143,10 @@ typedef struct scene_item {
 typedef struct tree_event {
   rm_crdt_id node;
   bool in_tree;
+  /* Where the record puts the node (tag 4) — read only for a node going in;
+   * `has_parent` false when the record names no parent. */
+  bool has_parent;
+  rm_crdt_id parent;
 } tree_event;
 
 /* What a node hangs on in the typed text: the character the file names, and
@@ -567,10 +571,18 @@ static rm_status parse_line_item(parse_ctx* ctx, rm_reader* reader,
 /* The tree, the groups and the tombstones                             */
 /* ------------------------------------------------------------------ */
 
-/* A record of the scene tree. An adding record names its node in tag 1 with
- * tag 2 at nought; a removing one is a fresh record whose tag 2 names the node
- * taken out (`in_tree = 0` is a real removal — the device's five-layer limit
- * counts by these). */
+/* A record of the scene tree. The record that creates a node names it in tag 1
+ * with tag 2 at nought; every later record is a fresh one whose tag 2 names
+ * the node it moves — out of the tree (`in_tree = 0`, a real removal: the
+ * device's five-layer limit counts by these) or back in. The tablet does the
+ * second when typed text is moved: the handwriting anchored to it is taken
+ * out and put back, and a put-back read by its record's identifier would
+ * leave the node removed. A record that puts a node in names its parent in
+ * tag 4, and that parent can be another than the one before.
+ *
+ * Everything is read inside the block — `reader` ends where the block does:
+ * a parent that does not fit is a block that does not read, not a parent
+ * taken from the next block's bytes. */
 static rm_status parse_scene_tree(rm_reader* reader, tree_event* out) {
   rm_crdt_id record, target;
   uint8_t flag;
@@ -579,7 +591,14 @@ static rm_status parse_scene_tree(rm_reader* reader, tree_event* out) {
   RM_TRY(rm_expect_tag(reader, 3, RM_TAG_BYTE1));
   RM_TRY(rm_read_u8(reader, &flag));
   bool in_tree = flag != 0;
-  *out = (tree_event){.node = in_tree ? record : target, .in_tree = in_tree};
+  bool names = !rm_crdt_equal(target, RM_CRDT_NONE);
+  *out = (tree_event){.node = names ? target : record, .in_tree = in_tree};
+  if (in_tree && rm_match_tag(reader, 4, RM_TAG_LENGTH4)) {
+    rm_reader place;
+    RM_TRY(rm_read_subblock(reader, &place));
+    RM_TRY(rm_read_crdt(&place, 1, &out->parent));
+    out->has_parent = true;
+  }
   return RM_OK;
 }
 
@@ -2225,6 +2244,99 @@ typedef struct placed_image {
   rm_crdt_id parent;
 } placed_image;
 
+/* The scene tree as its records leave it, applied in file order: the nodes
+ * taken out, and the parent each node in the tree was last put under. */
+typedef struct tree_state {
+  /* Only an explicit removal counts: a node nobody added is not dropped, or
+   * a file without tree records would draw nothing. */
+  rm_idmap removed;
+  /* node -> index into `events` of the record that last put it under a
+   * parent. The record's place and not the parent itself: an identifier is
+   * wider than the map's value. */
+  rm_idmap placed_by;
+  const tree_event* events;
+} tree_state;
+
+/* Apply the page's tree records in order. False on allocation failure; the
+ * state is to be freed either way. */
+static bool tree_state_build(const parse_ctx* ctx, tree_state* out) {
+  rm_idmap_init(&out->removed);
+  rm_idmap_init(&out->placed_by);
+  out->events = ctx->tree_events.data;
+  for (size_t i = 0; i < ctx->tree_events.count; i += 1) {
+    const tree_event* event = &out->events[i];
+    if (!event->in_tree) {
+      if (!rm_idmap_set(&out->removed, event->node, 1)) return false;
+      continue;
+    }
+    (void)rm_idmap_take(&out->removed, event->node, nullptr);
+    if (event->has_parent && !rm_idmap_set(&out->placed_by, event->node, i))
+      return false;
+  }
+  return true;
+}
+
+/* Release what `tree_state_build` built. */
+static void tree_state_free(tree_state* tree) {
+  rm_idmap_free(&tree->placed_by);
+  rm_idmap_free(&tree->removed);
+}
+
+/* The parent the records last put `node` under, or false when no record
+ * places it. */
+static bool tree_parent_of(const tree_state* tree, rm_crdt_id node,
+                           rm_crdt_id* out) {
+  uint64_t index;
+  if (!rm_idmap_get(&tree->placed_by, node, &index)) return false;
+  *out = tree->events[index].parent;
+  return true;
+}
+
+/* Whether a group item under `parent` that names `child` is where the child
+ * is now. A node moved to another parent keeps its old group item until the
+ * tablet tombstones it; the tree record is the newer word on where the node
+ * lives. A node no record places is taken where its group item puts it. */
+static bool tree_links(const tree_state* tree, rm_crdt_id parent,
+                       rm_crdt_id child) {
+  rm_crdt_id placed;
+  return !tree_parent_of(tree, child, &placed) || rm_crdt_equal(placed, parent);
+}
+
+/* Whether `node` or a node above it, as the tree records place them, is in
+ * `removed` or `hidden`; the answer in `*out_under`. The answer for every
+ * node on the climb is kept in `known` (1 under, 0 not), so a page of many
+ * items on one deep node climbs once and not once per item. The climb ends
+ * at a node already known, at one no record places, or — a cycle in the
+ * records — after one step more than there are placed nodes, which no climb
+ * without a repeat can take. `path` is scratch. False only on allocation
+ * failure. */
+static bool tree_is_under(const tree_state* tree, const rm_idmap* removed,
+                          const rm_idmap* hidden, rm_idmap* known, rm_vec* path,
+                          rm_crdt_id node, bool* out_under) {
+  path->count = 0;
+  bool under = false;
+  rm_crdt_id at = node;
+  for (size_t steps = 0; steps <= tree->placed_by.count; steps += 1) {
+    uint64_t answer;
+    if (rm_idmap_get(known, at, &answer)) {
+      under = answer != 0;
+      break;
+    }
+    if (!rm_vec_push(path, &at)) return false;
+    if (rm_idmap_contains(removed, at) || rm_idmap_contains(hidden, at)) {
+      under = true;
+      break;
+    }
+    if (!tree_parent_of(tree, at, &at)) break;
+  }
+  for (size_t i = 0; i < path->count; i += 1) {
+    const rm_crdt_id* visited = rm_vec_at(path, i);
+    if (!rm_idmap_set(known, *visited, under ? 1 : 0)) return false;
+  }
+  *out_under = under;
+  return true;
+}
+
 typedef struct walk_frame {
   rm_crdt_id node;
   uint32_t* children;
@@ -2236,6 +2348,7 @@ typedef struct scene_walk {
   const scene_item* items;
   size_t item_count;
   const rm_grouping* children_of;
+  const tree_state* tree;
   const rm_idmap* removed;
   const rm_idmap* hidden;
   bool* placed;
@@ -2245,7 +2358,9 @@ typedef struct scene_walk {
 } scene_walk;
 
 /* A subtree that is not drawn, and whose items are nonetheless spoken for:
- * the fallback pass must not resurrect a hidden layer. */
+ * the fallback pass must not resurrect a hidden layer. A node moved out of
+ * it is not part of it any more and is left to be reached from where it is
+ * now. */
 static void claim_subtree(scene_walk* walk, rm_crdt_id node) {
   rm_vec stack;
   rm_vec_init(&stack, sizeof(uint32_t));
@@ -2265,6 +2380,10 @@ static void claim_subtree(scene_walk* walk, rm_crdt_id node) {
     if (walk->placed[index]) continue;
     walk->placed[index] = true;
     if (walk->items[index].kind != ITEM_GROUP) continue;
+    if (!tree_links(walk->tree, walk->items[index].parent,
+                    walk->items[index].group)) {
+      continue;
+    }
     if (!rm_grouping_find(walk->children_of, walk->items[index].group,
                           &children, &count)) {
       continue;
@@ -2334,6 +2453,9 @@ static void walk_from(scene_walk* walk, rm_crdt_id root) {
         }
         case ITEM_GROUP: {
           rm_crdt_id child = walk->items[index].group;
+          /* A stale link: the child is drawn, if at all, from its
+           * present parent. */
+          if (!tree_links(walk->tree, frame->node, child)) continue;
           if (rm_idmap_contains(walk->removed, child) ||
               rm_idmap_contains(walk->hidden, child)) {
             claim_subtree(walk, child);
@@ -2376,21 +2498,6 @@ static void walk_from(scene_walk* walk, rm_crdt_id root) {
   rm_vec_free(&stack);
 }
 
-/* The nodes taken out of the tree, by applying the records in order. Only an
- * explicit removal counts: a node nobody added is not dropped, or a file
- * without tree records would draw nothing. */
-static bool tree_removals(const parse_ctx* ctx, rm_idmap* removed) {
-  for (size_t i = 0; i < ctx->tree_events.count; i += 1) {
-    const tree_event* event = rm_vec_at(&ctx->tree_events, i);
-    if (event->in_tree) {
-      (void)rm_idmap_take(removed, event->node, nullptr);
-    } else if (!rm_idmap_set(removed, event->node, 1)) {
-      return false;
-    }
-  }
-  return true;
-}
-
 /* The strokes in the order the tablet draws them: the scene tree walked
  * depth-first, each node's children in their chain order. File order is not
  * that order — a reordering of layers rewrites no stroke at all.
@@ -2405,14 +2512,18 @@ static bool ordered_scene(parse_ctx* ctx, rm_vec* out_strokes,
   size_t count = ctx->items.count;
 
   bool ok = false;
-  rm_idmap removed;
-  rm_idmap interior;
-  rm_idmap_init(&removed);
+  /* A group item that names a node the records have since put elsewhere is
+   * a stale link: the node is reached from where it is now, or not at all. */
+  tree_state tree;
+  rm_idmap interior, known;
+  rm_vec path;
   rm_idmap_init(&interior);
+  rm_idmap_init(&known);
+  rm_vec_init(&path, sizeof(rm_crdt_id));
   rm_grouping children_of = {0};
   bool* placed = nullptr;
 
-  if (!tree_removals(ctx, &removed)) goto done;
+  if (!tree_state_build(ctx, &tree)) goto done;
 
   scene_key_ctx key_ctx = {.items = items, .positions = nullptr};
   if (!rm_grouping_build(&children_of, count, scene_parent_key, &key_ctx))
@@ -2432,7 +2543,8 @@ static bool ordered_scene(parse_ctx* ctx, rm_vec* out_strokes,
       .items = items,
       .item_count = count,
       .children_of = &children_of,
-      .removed = &removed,
+      .tree = &tree,
+      .removed = &tree.removed,
       .hidden = &ctx->hidden_nodes,
       .placed = placed,
   };
@@ -2446,15 +2558,18 @@ static bool ordered_scene(parse_ctx* ctx, rm_vec* out_strokes,
     if (walk.failed) goto done_walk;
   }
 
-  /* Whatever the walk never reached — in file order. */
+  /* Whatever the walk never reached — in file order. A node the records
+   * moved under a removed or hidden one goes with it here too. */
   for (size_t i = 0; i < count; i += 1) {
     if (placed[i]) continue;
     if (items[i].deleted != 0) continue;
     rm_crdt_id parent = items[i].parent;
-    if (rm_idmap_contains(&removed, parent) ||
-        rm_idmap_contains(&ctx->hidden_nodes, parent)) {
-      continue;
+    bool gone;
+    if (!tree_is_under(&tree, &tree.removed, &ctx->hidden_nodes, &known, &path,
+                       parent, &gone)) {
+      goto done_walk;
     }
+    if (gone) continue;
     if (items[i].kind == ITEM_STROKE) {
       ordered_stroke entry = {.item = (uint32_t)i, .parent = parent};
       if (!rm_vec_push(&walk.strokes, &entry)) goto done_walk;
@@ -2476,8 +2591,10 @@ done_walk:
 done:
   free(placed);
   rm_grouping_free(&children_of);
+  rm_vec_free(&path);
+  rm_idmap_free(&known);
   rm_idmap_free(&interior);
-  rm_idmap_free(&removed);
+  tree_state_free(&tree);
   return ok;
 }
 
@@ -3112,48 +3229,55 @@ fail:
   return status;
 }
 
-/* A key for the grouping of group items by the node they hang in. */
-typedef struct group_key_ctx {
-  const scene_item* items;
-  const uint32_t* groups;
-} group_key_ctx;
+/* A node under its parent, as a group item or a tree record puts it. */
+typedef struct tree_link {
+  rm_crdt_id parent;
+  rm_crdt_id child;
+} tree_link;
 
-/* The grouping key for a group item, by its position in `groups`: the node
- * it hangs on. */
-static rm_crdt_id group_parent_key(size_t position, void* ctx) {
-  group_key_ctx* state = ctx;
-  return state->items[state->groups[position]].parent;
+/* The grouping key for a link, by its position in the links: the node it
+ * hangs on. */
+static rm_crdt_id link_parent_key(size_t position, void* ctx) {
+  const tree_link* links = ctx;
+  return links[position].parent;
 }
 
-/* Every node taken out of the tree, and everything under one: a group nested
- * in a removed layer is as gone as the layer. Walked with a queue of its own,
+/* Every node taken out of the tree, and everything under one, added to
+ * `tree->removed`: a group nested in a removed layer is as gone as the layer.
+ * A node is under the parent the tree records last put it under: a group
+ * item left behind by a move links nothing, and a node moved without a group
+ * item of its own is still under its parent. Walked with a queue of its own,
  * and each node once, so a cycle in the links ends the walk. */
-static bool removed_subtrees(const parse_ctx* ctx, rm_idmap* removed) {
-  if (!tree_removals(ctx, removed)) return false;
-
+static bool removed_subtrees(const parse_ctx* ctx, tree_state* tree) {
   const scene_item* items = ctx->items.data;
   bool ok = false;
-  rm_vec groups, queue;
-  rm_vec_init(&groups, sizeof(uint32_t));
+  rm_vec links, queue;
+  rm_vec_init(&links, sizeof(tree_link));
   rm_vec_init(&queue, sizeof(rm_crdt_id));
   rm_grouping children_of = {0};
 
   for (size_t i = 0; i < ctx->items.count; i += 1) {
     if (items[i].deleted != 0 || items[i].kind != ITEM_GROUP) continue;
-    uint32_t index = (uint32_t)i;
-    if (!rm_vec_push(&groups, &index)) goto done;
+    if (!tree_links(tree, items[i].parent, items[i].group)) continue;
+    tree_link link = {.parent = items[i].parent, .child = items[i].group};
+    if (!rm_vec_push(&links, &link)) goto done;
   }
-  group_key_ctx key_ctx = {.items = items, .groups = groups.data};
-  if (!rm_grouping_build(&children_of, groups.count, group_parent_key,
-                         &key_ctx))
-    goto done;
-
   size_t cursor = 0;
   rm_crdt_id node;
-  uint64_t ignored;
-  while (rm_idmap_next(removed, &cursor, &node, &ignored)) {
+  uint64_t index;
+  while (rm_idmap_next(&tree->placed_by, &cursor, &node, &index)) {
+    tree_link link = {.parent = tree->events[index].parent, .child = node};
+    if (!rm_vec_push(&links, &link)) goto done;
+  }
+  if (!rm_grouping_build(&children_of, links.count, link_parent_key,
+                         links.data))
+    goto done;
+
+  cursor = 0;
+  while (rm_idmap_next(&tree->removed, &cursor, &node, &index)) {
     if (!rm_vec_push(&queue, &node)) goto done;
   }
+  const tree_link* all = links.data;
   while (queue.count > 0) {
     node = *(rm_crdt_id*)rm_vec_at(&queue, queue.count - 1);
     queue.count -= 1;
@@ -3161,10 +3285,10 @@ static bool removed_subtrees(const parse_ctx* ctx, rm_idmap* removed) {
     size_t count;
     if (!rm_grouping_find(&children_of, node, &children, &count)) continue;
     for (size_t k = 0; k < count; k += 1) {
-      uint32_t index = ((const uint32_t*)groups.data)[children[k]];
-      rm_crdt_id child = items[index].group;
-      if (rm_idmap_contains(removed, child)) continue;
-      if (!rm_idmap_set(removed, child, 1) || !rm_vec_push(&queue, &child))
+      rm_crdt_id child = all[children[k]].child;
+      if (rm_idmap_contains(&tree->removed, child)) continue;
+      if (!rm_idmap_set(&tree->removed, child, 1) ||
+          !rm_vec_push(&queue, &child))
         goto done;
     }
   }
@@ -3173,7 +3297,7 @@ static bool removed_subtrees(const parse_ctx* ctx, rm_idmap* removed) {
 done:
   rm_grouping_free(&children_of);
   rm_vec_free(&queue);
-  rm_vec_free(&groups);
+  rm_vec_free(&links);
   return ok;
 }
 
@@ -3202,10 +3326,12 @@ rm_status rm_scan_highlighter_items(const uint8_t* data, size_t size,
   }
 
   rm_status status = RM_ERR_OUT_OF_MEMORY;
-  rm_idmap removed, seen;
-  rm_idmap_init(&removed);
+  tree_state tree;
+  rm_idmap seen;
   rm_idmap_init(&seen);
-  if (!removed_subtrees(&ctx, &removed)) goto done;
+  if (!tree_state_build(&ctx, &tree)) goto done;
+  if (!removed_subtrees(&ctx, &tree)) goto done;
+  const rm_idmap* removed = &tree.removed;
 
   /* In file order, strokes first, and each identifier once: an order that
    * does not change between two calls on the same bytes. */
@@ -3213,7 +3339,7 @@ rm_status rm_scan_highlighter_items(const uint8_t* data, size_t size,
   for (size_t i = 0; i < ctx.items.count; i += 1) {
     if (items[i].kind != ITEM_STROKE || items[i].deleted != 0) continue;
     if (!rm_pen_tool_is_highlighter(items[i].stroke.tool)) continue;
-    if (rm_idmap_contains(&removed, items[i].parent)) continue;
+    if (rm_idmap_contains(removed, items[i].parent)) continue;
     if (rm_idmap_contains(&seen, items[i].id)) continue;
     rm_item_id id = rm_item_id_of(items[i].id);
     if (!rm_idmap_set(&seen, items[i].id, 1) || !rm_vec_push(out_ids, &id))
@@ -3230,7 +3356,7 @@ rm_status rm_scan_highlighter_items(const uint8_t* data, size_t size,
 
 done:
   rm_idmap_free(&seen);
-  rm_idmap_free(&removed);
+  tree_state_free(&tree);
   ctx_free(&ctx);
   rm_arena_destroy(ctx.arena);
   if (status != RM_OK) fail_with(out_error, status, 0, nullptr);
