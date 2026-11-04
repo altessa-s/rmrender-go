@@ -306,10 +306,11 @@ The script reads the symbols to rename from objects of both backends, so it runs
 
 - **[rmrender-lib](https://github.com/altessa-s/rmrender-lib)** — the C23 renderer these bindings compile.
 - **[rmrender-swift](https://github.com/altessa-s/rmrender-swift)** — the same renderer as a Swift package.
-- **[rmlines-go](https://github.com/altessa-s/rmlines-go)** — the `.rm` v6 page format for Go: the pages this package draws.
-- **[rmdoc-go](https://github.com/altessa-s/rmdoc-go)** — the `.rmdoc` container for Go.
-- **[rmmarks-go](https://github.com/altessa-s/rmmarks-go)** — which words a highlight covers, and OCR from cropped strips.
-- **[Slate Drive](https://slatedrive.app)** ([repository](https://github.com/altessa-s/slatedrive)) — the app these packages are part of.
+- **[rmlines-go](https://github.com/altessa-s/rmlines-go)** — the `.rm` v6 page format for Go: pages, strokes, typed text and highlights, read and
+  written.
+- **[rmdoc-go](https://github.com/altessa-s/rmdoc-go)** — the `.rmdoc` container for Go: the archive a document and its pages travel in.
+- **[rmmarks-go](https://github.com/altessa-s/rmmarks-go)** — marked text for Go: which words a highlight covers, and how OCR from cropped strips
+  returns to the page.
 
 ## Acknowledgements
 
