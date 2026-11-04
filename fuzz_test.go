@@ -5,19 +5,14 @@
 package rmrender_test
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"os"
 	"path/filepath"
-	"regexp"
 	"testing"
 
 	"github.com/altessa-s/rmrender-go"
 )
-
-// pageObject matches the type of a page object, and not of the page tree.
-var pageObject = regexp.MustCompile(`/Type\s*/Page[^s]`)
 
 // fuzzLimits keep one input cheap: arbitrary bytes may place ink far away
 // and grow the page with it, and the template repeats over all of it.
@@ -67,15 +62,7 @@ func FuzzPage(f *testing.F) {
 		}
 		pdf, err := rmrender.PagePDF(context.Background(), data, o)
 		if !wantError(err) {
-			if !bytes.HasPrefix(pdf, []byte("%PDF-")) {
-				t.Fatal("not a PDF")
-			}
-			// Page objects are counted in the text: CoreGraphics can write a
-			// cross-reference entry for an object it then leaves out, which
-			// the library's strict PDF parser refuses and readers ignore.
-			if n := len(pageObject.FindAll(pdf, -1)); n != 1 {
-				t.Fatalf("%d pages", n)
-			}
+			wantPDF(t, pdf, 1)
 		}
 		m, err := rmrender.PageMarks(data, "", o)
 		if !wantError(err) {

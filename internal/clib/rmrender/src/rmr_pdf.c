@@ -585,7 +585,7 @@ typedef struct {
   job* j;
   const uint8_t* bytes;
   size_t size, last, next_number;
-  bool overlay, xref_streams;
+  bool xref_streams;
   entry* entries;
   size_t count;
   node *trailer, *root;
@@ -613,6 +613,12 @@ static entry* lookup(file* f, uint32_t id) {
 
 static node* resolve(file* f, node* n, unsigned depth);
 static node* object(file* f, entry* e, unsigned depth);
+
+/* An in-use xref row that names no object: offset 0 outside an object
+ * stream. Such rows are skipped when every object is visited. */
+static bool absent(const entry* e) {
+  return e->live && !e->offset && !e->container;
+}
 
 /* Decodes an object stream and its header once per file. */
 static packed* unpack(file* f, entry* container, unsigned depth) {
@@ -665,6 +671,10 @@ bad:
 static node* object(file* f, entry* e, unsigned depth) {
   if (!e || !e->live) {
     stop(f->j, RMR_ERR_INVALID_ARGUMENT, "missing PDF object");
+    return nullptr;
+  }
+  if (absent(e)) {
+    stop(f->j, RMR_ERR_INVALID_ARGUMENT, "reference to an absent PDF object");
     return nullptr;
   }
   if (e->object) return e->object;
@@ -900,7 +910,10 @@ static node* stream_section(file* f, size_t offset, bool fill, size_t* used,
       if (fields[0] == 0) {
         if (fields[2] > 65535) goto bad;
       } else if (fields[0] == 1) {
-        if (!fields[1] || fields[1] >= f->size || fields[2] > 65535) goto bad;
+        /* Offset 0 with generation 0 is an absent object, as in a table. */
+        if ((!fields[1] && fields[2]) || fields[1] >= f->size ||
+            fields[2] > 65535)
+          goto bad;
         e.live = true;
         e.offset = (size_t)fields[1];
         e.generation = (uint32_t)fields[2];
@@ -968,8 +981,10 @@ static bool sections(file* f, bool fill) {
         if (!integer(&s, &at) || !integer(&s, &gen) || gen > 65535) goto bad;
         bool live = word(&s, "n");
         if (!live && !word(&s, "f")) goto bad;
-        if (live && ((at == 0 && (!f->overlay || gen != 0)) || at >= f->size ||
-                     first + i == 0))
+        /* Quartz writes an in-use row at offset 0 for an object number it
+         * never emits. The row is kept as an absent object: harmless while
+         * unreferenced, an error once anything resolves it. */
+        if (live && ((at == 0 && gen != 0) || at >= f->size || first + i == 0))
           goto bad;
         if (used == SIZE_MAX) goto bad;
         if (fill) {
@@ -1102,12 +1117,10 @@ bad:
 /* Indexes every xref revision of a PDF (newest row per object wins),
  * resolves the catalog and collects the pages. Refuses encryption and
  * catalog /Perms. Allocations live in the job's arena. */
-static bool open_file(file* f, job* j, const uint8_t* bytes, size_t size,
-                      bool overlay) {
+static bool open_file(file* f, job* j, const uint8_t* bytes, size_t size) {
   *f = (file){.j = j,
               .bytes = bytes,
               .size = size,
-              .overlay = overlay,
               .decoded_budget = decoded_file_budget};
 
   if (size > j->limits.maximum_pdf_bytes) {
@@ -1419,7 +1432,7 @@ static uint32_t stream_text(writer* w, const char* s) {
 static bool import_objects(writer* w, file* f) {
   for (size_t i = 0; i < f->count && w->j->status == RMR_OK; i++) {
     entry* e = &f->entries[i];
-    if (!e->live || (!e->offset && !e->container)) continue;
+    if (!e->live || absent(e)) continue;
     node* n = object(f, e, 0);
     if (!n) return false;
     node* type = n->type == DICT ? get(n, "Type") : nullptr;
@@ -1571,7 +1584,7 @@ static void overlay(writer* w, file* source, const rmr_pdf_overlay* o) {
   }
 
   file imported;
-  if (!open_file(&imported, w->j, o->pdf, o->size, true)) return;
+  if (!open_file(&imported, w->j, o->pdf, o->size)) return;
   if (imported.page_count != 1) {
     stop(w->j, RMR_ERR_INVALID_ARGUMENT, "overlay PDF must have one page");
     return;
@@ -1785,7 +1798,7 @@ rmr_status rmr_pdf_incremental(const uint8_t* source, size_t size,
   if (count > j.limits.maximum_draws)
     stop(&j, RMR_ERR_LIMIT, "overlay count limit");
 
-  if (tick(&j) && open_file(&f, &j, source, size, false)) {
+  if (tick(&j) && open_file(&f, &j, source, size)) {
     w.next_number = f.next_number;
     put(&w, source, size);
     if (count) text(&w, "\n");
@@ -1863,7 +1876,7 @@ rmr_status rmr_pdf_pages(const uint8_t* source, size_t size,
   job j = {.limits = given ? *given : rmr_limits_default()};
   file f;
 
-  if (tick(&j) && open_file(&f, &j, source, size, false)) {
+  if (tick(&j) && open_file(&f, &j, source, size)) {
     size_t i = 0;
     for (page* p = f.pages; p && tick(&j); p = p->next, i++) {
       rmr_pdf_page_geometry g;
@@ -1911,7 +1924,7 @@ rmr_status rmr_pdf_clip(const uint8_t* pdf, size_t size, rmr_path_view path,
   if (path.count > j.limits.maximum_elements)
     stop(&j, RMR_ERR_LIMIT, "clip path limit");
 
-  if (tick(&j) && open_file(&f, &j, pdf, size, false)) {
+  if (tick(&j) && open_file(&f, &j, pdf, size)) {
     if (f.page_count != 1)
       stop(&j, RMR_ERR_INVALID_ARGUMENT, "clip requires one page");
     w.next_number = f.next_number;
@@ -2021,7 +2034,7 @@ rmr_status rmr_pdf_navigation(const uint8_t* pdf, size_t size,
       outline_count >= j.limits.maximum_elements)
     stop(&j, RMR_ERR_LIMIT, "navigation limit");
 
-  if (tick(&j) && open_file(&f, &j, pdf, size, false)) {
+  if (tick(&j) && open_file(&f, &j, pdf, size)) {
     w.next_number = f.next_number;
     put(&w, pdf, size);
     text(&w, "\n");
@@ -2194,13 +2207,13 @@ rmr_status rmr_pdf_rewrite(const uint8_t* source, size_t size,
   writer w = {.j = &j};
   file f;
 
-  if (tick(&j) && open_file(&f, &j, source, size, false)) {
+  if (tick(&j) && open_file(&f, &j, source, size)) {
     w.next_number = f.next_number;
     header(&w, source, size);
 
     for (size_t i = 0; i < f.count && tick(&j); i++) {
       entry* e = &f.entries[i];
-      if (!e->live) continue;
+      if (!e->live || absent(e)) continue;
       node* n = object(&f, e, 0);
       if (!n) break;
       node* type = n->type == DICT ? get(n, "Type") : nullptr;
@@ -2568,7 +2581,7 @@ rmr_status rmr_pdf_select_pages(const uint8_t* source, size_t size,
       count > SIZE_MAX / sizeof(selected_page))
     stop(&j, RMR_ERR_LIMIT, "PDF selection page limit");
 
-  if (tick(&j) && open_file(&f, &j, source, size, false)) {
+  if (tick(&j) && open_file(&f, &j, source, size)) {
     w.next_number = f.next_number;
     if (f.page_count > SIZE_MAX / sizeof(page*) ||
         f.count > SIZE_MAX / sizeof(node*))
@@ -2585,7 +2598,8 @@ rmr_status rmr_pdf_select_pages(const uint8_t* source, size_t size,
     /* Load objects before installing new references: every imported
      * object remains bounded by the same parser and work limits. */
     for (size_t i = 0; i < f.count && tick(&j); i++)
-      if (f.entries[i].live) object(&f, &f.entries[i], 0);
+      if (f.entries[i].live && !absent(&f.entries[i]))
+        object(&f, &f.entries[i], 0);
 
     if (j.status == RMR_OK) {
       size_t pi = 0;
@@ -2744,7 +2758,7 @@ rmr_status rmr_pdf_select_pages(const uint8_t* source, size_t size,
 
     for (size_t i = 0; i < f.count && tick(&j); i++) {
       entry* e = &f.entries[i];
-      if (!e->live) continue;
+      if (!e->live || absent(e)) continue;
       node* type = get(e->object, "Type");
       if (e->stream && (named(type, "ObjStm") || named(type, "XRef"))) continue;
       select_refs(&f, e->object, nullptr, 0);
