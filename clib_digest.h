@@ -6,10 +6,10 @@
 //
 // A digest of every file under internal/clib, which holds:
 //
-//   rmrender-lib v1.0.0-25-g753f94c 753f94c6a4c2f1ae53dee2dcfc678311e15fab12
-//   rmlines-lib v1.0.1-5-ged5cb56 ed5cb56b5f47664a5b8d53be9912a0da35252e01
-//   rmdoc-lib v1.0.0-7-gb15961f b15961f25b1a9016aed2307fd3c0a551c4c928d8
-//   rmmarks-lib v1.0.1-6-g9feaf19 9feaf19fc977efdfd9c1a22d89e7f5f60e742d5c
+//   rmrender-lib v1.1.0 8055cf3a75b59548ec24b1908b6ddd9dcdfda2a2
+//   rmlines-lib v1.1.0 14ea47353d4881aefd4987ab332765cd06609296
+//   rmdoc-lib v1.1.0 aea7ed1670e2aa34ee0281d00eedc372b80b3f7c
+//   rmmarks-lib v1.1.0 565f2dfe0d2e31a218c4a874bdba96417d1ddc83
 //
 // Each clib_*.c includes this file, so a change to the vendored sources
 // changes a file in the package directory, which is what Go's build cache
@@ -18,6 +18,6 @@
 #ifndef RMRENDER_GO_CLIB_DIGEST_H
 #define RMRENDER_GO_CLIB_DIGEST_H
 
-#define RMRENDER_GO_CLIB_DIGEST "8a14e8a22cfaca14043300d5511a03574e0e7d1e198d000da8df02dad0b1acfe"
+#define RMRENDER_GO_CLIB_DIGEST "d05458f07a74bedf3f77b8916530ca06a5b505c7073b74dd99d0f3488ad422a9"
 
 #endif

@@ -7,8 +7,8 @@
 #include "rmmarks/text.h"
 #include "rmmarks/types.h"
 #define RMMARKS_VERSION_MAJOR 1
-#define RMMARKS_VERSION_MINOR 0
-#define RMMARKS_VERSION_PATCH 1
+#define RMMARKS_VERSION_MINOR 1
+#define RMMARKS_VERSION_PATCH 0
 /* Turns x into a string literal without macro-expanding it first. */
 #define RMMARKS_STRINGIFY_(x) #x
 /* Macro-expands x, then turns the result into a string literal. */

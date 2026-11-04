@@ -9,7 +9,7 @@
 
 #include "export.h"
 #define RMDOC_VERSION_MAJOR 1
-#define RMDOC_VERSION_MINOR 0
+#define RMDOC_VERSION_MINOR 1
 #define RMDOC_VERSION_PATCH 0
 
 /* C23 API. Counted UTF-8 names may not contain NUL. All output arguments remain
