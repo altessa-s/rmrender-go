@@ -1,37 +1,28 @@
-#define _POSIX_C_SOURCE 200809L
-
 /* Copyright 2026 ALTESSA SOLUTIONS INC.
  * Use of this source code is governed by an MIT-style license that can be
  * found in the LICENSE file. */
 
+#include <glib.h>
 #include <limits.h>
-#include <pthread.h>
 
 #include "rmr_linux_internal.h"
 
 /* PDFium is process-global and not thread safe. All entry points are
  * serialized. Never destroy the engine while another library may retain a
  * PDFium handle. */
-static pthread_mutex_t mutex;
-static pthread_once_t once = PTHREAD_ONCE_INIT;
-
-/* Initializes the recursive mutex and the PDFium library; runs once per
- * process. */
-static void initialize(void) {
-  pthread_mutexattr_t attr;
-  pthread_mutexattr_init(&attr);
-  pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-  pthread_mutex_init(&mutex, &attr);
-  pthread_mutexattr_destroy(&attr);
-  FPDF_InitLibrary();
-}
+static GRecMutex mutex;
+static gsize initialized;
 
 void rmr_pdfium_lock(void) {
-  pthread_once(&once, initialize);
-  pthread_mutex_lock(&mutex);
+  if (g_once_init_enter(&initialized)) {
+    g_rec_mutex_init(&mutex);
+    FPDF_InitLibrary();
+    g_once_init_leave(&initialized, 1);
+  }
+  g_rec_mutex_lock(&mutex);
 }
 
-void rmr_pdfium_unlock(void) { pthread_mutex_unlock(&mutex); }
+void rmr_pdfium_unlock(void) { g_rec_mutex_unlock(&mutex); }
 
 rmr_status rmr_linux_error(rmr_error* e, rmr_status s, const char* message) {
   if (e) {

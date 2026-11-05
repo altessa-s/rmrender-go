@@ -2,19 +2,10 @@
  * Use of this source code is governed by an MIT-style license that can be
  * found in the LICENSE file. */
 
-/* POSIX locales on the supported Apple/Linux hosts. A private C locale keeps
- * numeric conversion independent of the application's locale, without
- * setlocale. */
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
-#include <locale.h>
-#ifdef __APPLE__
-#include <xlocale.h>
-#endif
 #include <rmrender/template.h>
 
 #include "rmr_internal.h"
+#include "rmr_locale.h"
 
 typedef enum {
   END,
@@ -57,7 +48,7 @@ typedef struct {
   size_t length, position, start, token_length;
   operation token;
   double number;
-  locale_t locale;
+  rmr_locale locale;
   instruction* code;
   size_t count, maximum, stack, peak;
   unsigned depth;
@@ -108,7 +99,7 @@ static void next(parser* p) {
             p->source[p->position] == '.'))
       p->position++;
     char* end = nullptr;
-    p->number = strtod_l(p->source + p->start, &end, p->locale);
+    p->number = rmr_locale_number(p->source + p->start, &end, p->locale);
     if (end != p->source + p->position) {
       failure(p, RMR_ERR_INVALID_ARGUMENT, "invalid decimal literal");
       return;
@@ -350,7 +341,7 @@ rmr_status rmr_expression_compile(const char* source, size_t length,
   memcpy(copy, source, length);
   copy[length] = 0;
 
-  locale_t locale = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
+  rmr_locale locale = rmr_locale_create();
   if (!locale) {
     free(copy);
     return rmr_fail(e, RMR_ERR_OUT_OF_MEMORY, 0, "numeric locale unavailable");
@@ -392,7 +383,7 @@ rmr_status rmr_expression_compile(const char* source, size_t length,
     }
   }
 
-  freelocale(locale);
+  rmr_locale_free(locale);
 
   if (status != RMR_OK) {
     free(copy);

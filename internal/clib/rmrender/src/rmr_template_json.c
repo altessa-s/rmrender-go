@@ -3,13 +3,10 @@
  * found in the LICENSE file. */
 
 #define _GNU_SOURCE
-#include <locale.h>
+#include <rmrender/template.h>
 
 #include "rmr_internal.h"
-#ifdef __APPLE__
-#include <xlocale.h>
-#endif
-#include <rmrender/template.h>
+#include "rmr_locale.h"
 
 typedef struct block {
   struct block* next;
@@ -47,7 +44,7 @@ typedef struct {
   rmr_template_document* doc;
   rmr_error* error;
   rmr_status status;
-  locale_t locale;
+  rmr_locale locale;
 } parser;
 
 /* Record the first failure in p and its error; later calls are no-ops. */
@@ -333,7 +330,7 @@ static node* parse(parser* p, unsigned depth) {
     if (!buffer) return v;
     memcpy(buffer, p->source + start, len);
     v->text = buffer;
-    v->number = strtod_l(buffer, nullptr, p->locale);
+    v->number = rmr_locale_number(buffer, nullptr, p->locale);
     if (!isfinite(v->number)) goto number_error;
     return v;
 
@@ -690,7 +687,7 @@ rmr_status rmr_template_document_decode(const char* json, size_t length,
               .error = error,
               .bytes = sizeof *d};
 
-  p.locale = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
+  p.locale = rmr_locale_create();
   if (!p.locale) {
     free(d);
     return rmr_fail(error, RMR_ERR_OUT_OF_MEMORY, 0,
@@ -765,7 +762,7 @@ rmr_status rmr_template_document_decode(const char* json, size_t length,
     items(&p, field(&p, root, "items"), &d->model.items, &d->model.count, 0);
   }
 
-  freelocale(p.locale);
+  rmr_locale_free(p.locale);
 
   if (p.status != RMR_OK) {
     rmr_template_document_free(d);
@@ -949,7 +946,7 @@ rmr_status rmr_document_layout_decode(const char* json, size_t length,
               .error = error,
               .bytes = sizeof *storage};
 
-  p.locale = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
+  p.locale = rmr_locale_create();
   if (!p.locale) {
     free(storage);
     return rmr_fail(error, RMR_ERR_OUT_OF_MEMORY, 0,
@@ -1045,7 +1042,7 @@ rmr_status rmr_document_layout_decode(const char* json, size_t length,
     }
   }
 
-  freelocale(p.locale);
+  rmr_locale_free(p.locale);
 
   if (p.status != RMR_OK) {
     rmr_template_document_free(storage);

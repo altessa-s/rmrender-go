@@ -8,7 +8,7 @@ Idiomatic cgo bindings over **[rmrender-lib](https://github.com/altessa-s/rmrend
 vendored into this module together with the libraries it reads its input with: **[rmlines-lib](https://github.com/altessa-s/rmlines-lib)**
 for `.rm` pages, **[rmdoc-lib](https://github.com/altessa-s/rmdoc-lib)** for `.rmdoc` archives and
 **[rmmarks-lib](https://github.com/altessa-s/rmmarks-lib)** for highlights. Drawing is native: CoreGraphics and CoreText on macOS, Cairo, Pango
-and PDFium on Linux. The same renderer is available for Swift as **[rmrender-swift](https://github.com/altessa-s/rmrender-swift)**.
+and PDFium on Linux and Windows. The same renderer is available for Swift as **[rmrender-swift](https://github.com/altessa-s/rmrender-swift)**.
 
 Part of **[Slate Drive](https://slatedrive.app)** ([repository](https://github.com/altessa-s/slatedrive)), the macOS app that shows a reMarkable
 library in Finder.
@@ -41,10 +41,44 @@ library in Finder.
   ```
 
   Ship `libpdfium.so` and the graphics libraries, with their licences, beside a program that uses the Cairo backend.
+- **Windows** (x64): the Cairo backend, built as rmrender-lib builds it on Windows, with the [MSYS2](https://www.msys2.org) **CLANG64**
+  toolchain: its clang is the C23 compiler, and its pkg-config finds the Cairo stack. In a CLANG64 shell:
 
-The backend follows `GOOS`: CoreGraphics on `darwin`, Cairo on `linux`. On macOS the `rmrender_cairo` build tag selects the Cairo backend
-instead, with the same Homebrew packages (`brew install cairo pango fontconfig harfbuzz gdk-pixbuf`) and the `mac-arm64` or `mac-x64` PDFium.
-Anywhere else, or without cgo, the package does not build, and says so.
+  ```sh
+  pacman -S mingw-w64-clang-x86_64-clang mingw-w64-clang-x86_64-pkgconf mingw-w64-clang-x86_64-python \
+      mingw-w64-clang-x86_64-cairo mingw-w64-clang-x86_64-pango mingw-w64-clang-x86_64-fontconfig \
+      mingw-w64-clang-x86_64-harfbuzz mingw-w64-clang-x86_64-gdk-pixbuf2 mingw-w64-clang-x86_64-zlib
+  ```
+
+  The official Go for Windows works with it (or MSYS2's `mingw-w64-clang-x86_64-go`), with `CC=clang` and CLANG64's `bin` ahead on `PATH`.
+  PDFium comes from the same script, as the `win-x64` SDK: `include/`, the import library `lib/pdfium.dll.lib` (the package links it with
+  `-l:pdfium.dll.lib`) and `bin/pdfium.dll`. Give cgo the paths in Windows form, as `cygpath -m` writes them:
+
+  ```sh
+  module=$(go list -m -f '{{.Dir}}' github.com/altessa-s/rmrender-go)
+  pdfium="$(cygpath -m "$HOME")/pdfium"
+  python "$module/internal/clib/rmrender/scripts/fetch-pdfium.py" --platform win-x64 --output "$pdfium"
+  export CC=clang CGO_ENABLED=1
+  export CGO_CFLAGS="-I$pdfium/include"
+  export CGO_LDFLAGS="-L$pdfium/lib"
+  export PATH="$(cygpath -u "$pdfium")/bin:$PATH"   # pdfium.dll, for go test and go run
+  go build ./...
+  ```
+
+  The vendored C is compiled in statically, as rmrender-lib's static build is: none of the libraries' DLL macros (`RMRENDER_SHARED`,
+  `RMRENDER_BUILDING` and the like) is defined, and the package refuses them. A program built this way loads DLLs when it runs: it imports
+  `pdfium.dll` and CLANG64's `libcairo-2.dll`, `libpango-1.0-0.dll`, `libpangocairo-1.0-0.dll`, `libpangoft2-1.0-0.dll`,
+  `libfontconfig-1.dll`, `libharfbuzz-0.dll`, `libglib-2.0-0.dll`, `libgobject-2.0-0.dll`, `libgdk_pixbuf-2.0-0.dll` and `zlib1.dll`, and
+  those load more in turn (FreeType, libpng, pixman, FriBidi, the C++ and unwind runtimes and others). Ship them all beside the `.exe`, with
+  their licences: `ntldd -R program.exe` (`pacman -S mingw-w64-clang-x86_64-ntldd`) lists the full set, and every DLL it resolves under
+  CLANG64's `bin` or the PDFium SDK is one to ship.
+  Fonts reach Fontconfig as files: the first use writes each bundled font once to `%LOCALAPPDATA%\rmrender\fonts` (under `XDG_DATA_HOME`
+  when that is set), named by its digest, and later font sets reuse the files. Paths are UTF-8; a cache directory whose path is not ASCII is
+  reached through its 8.3 alias, so on a volume without 8.3 names it needs an ASCII path.
+
+The backend follows `GOOS`: CoreGraphics on `darwin`, Cairo on `linux` and `windows`. On macOS the `rmrender_cairo` build tag selects the Cairo
+backend instead, with the same Homebrew packages (`brew install cairo pango fontconfig harfbuzz gdk-pixbuf`) and the `mac-arm64` or `mac-x64`
+PDFium. Anywhere else, or without cgo, the package does not build, and says so.
 
 ## Installing
 
@@ -358,7 +392,8 @@ for the length of every call that uses it, and `Close` waits for those in flight
 **Resources through `fs.FS`, never through paths.** Fonts, templates and images reach C through callbacks: a `runtime/cgo.Handle` carried as an
 integer, and exported Go functions that read the file and lend its bytes to C, pinned with `runtime.Pinner` until the call returns. A read
 failure becomes the error's cause; a panic is recovered before it can unwind through C and raised again once C has returned. The fonts are
-loaded from memory, so no temporary files are written, except by the Cairo backend on macOS, where Fontconfig needs files.
+loaded from memory, so no temporary files are written, except by the Cairo backend on macOS, where Fontconfig needs files, and on Windows,
+where it keeps them in the font cache the requirements describe.
 
 **Cancellation without callbacks per draw.** A context is watched with `context.AfterFunc`, which raises an atomic flag in C memory that the
 library polls between draw operations.
@@ -401,6 +436,8 @@ go -C internal/coexist test ./...
 ```
 
 The script reads the symbols to rename from objects of both backends, so it runs on macOS with the Homebrew Cairo stack and a PDFium SDK.
+Windows compiles the Cairo backend's sources, whose `_WIN32` branches define no other external symbol; the symbol test reads the Windows test
+binary's COFF table as well.
 
 ## Bindings
 

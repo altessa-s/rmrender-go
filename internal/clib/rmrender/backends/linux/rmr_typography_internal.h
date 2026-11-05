@@ -19,8 +19,10 @@ struct rmr_linux_fonts {
   PangoFontMap* map;
   int fds[14];
 
-#ifdef __APPLE__
-  char paths[14][64];
+#ifndef __linux__
+  /* Font files Fontconfig loads: private temporary files removed with the
+   * fonts, or on Windows shared cache files that are kept. */
+  char* paths[14];
 #endif
   bool has_emoji;
 };

@@ -9,7 +9,7 @@
 
 #include "export.h"
 #define RMRENDER_VERSION_MAJOR 1
-#define RMRENDER_VERSION_MINOR 2
+#define RMRENDER_VERSION_MINOR 3
 #define RMRENDER_VERSION_PATCH 0
 constexpr double RMR_POINTS_PER_UNIT = 0.317180616;
 

@@ -5,6 +5,7 @@
 package rmrender_test
 
 import (
+	"bytes"
 	"os"
 	"regexp"
 	"strings"
@@ -22,6 +23,10 @@ func TestReadmeSnippetsAreExamples(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A checkout with core.autocrlf (the default of Git for Windows) has
+	// CRLF line endings, which .gitattributes asks it not to make.
+	readme = bytes.ReplaceAll(readme, []byte("\r\n"), []byte("\n"))
+	examples = bytes.ReplaceAll(examples, []byte("\r\n"), []byte("\n"))
 	bodies := map[string]bool{}
 	for _, m := range regexp.MustCompile(`(?s)\nfunc Example\w*\(\) \{\n(.*?)\n\}\n`).FindAllSubmatch(examples, -1) {
 		var lines []string
