@@ -3,6 +3,7 @@
  * found in the LICENSE file. */
 
 #include <errno.h>
+#include <glib/gstdio.h>
 #include <hb-ot.h>
 #include <limits.h>
 #include <pango/pangofc-font.h>
@@ -11,14 +12,15 @@
 #include <string.h>
 
 #include "../common/rmr_font_calibration.h"
+#include "rmr_font_cache.h"
 #include "rmr_hvar.h"
 #include "rmr_typography_internal.h"
-#ifdef __APPLE__
-#include <fcntl.h>
-#else
+#ifdef __linux__
 #include <sys/mman.h>
 #endif
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 /* Writes the calibration-table lookup name for this face/weight/script/size
  * combination into key and returns it. */
@@ -748,10 +750,20 @@ void rmr_linux_fonts_free(rmr_linux_fonts* f) {
   if (f->config) FcConfigDestroy(f->config);
 
   for (size_t i = 0; i < sizeof names / sizeof *names; i++) {
-    if (f->fds[i] >= 0) close(f->fds[i]);
+    if (f->fds[i] >= 0) g_close(f->fds[i], nullptr);
 
-#ifdef __APPLE__
-    if (f->paths[i][0]) unlink(f->paths[i]);
+#ifndef __linux__
+    if (f->paths[i]) {
+#ifndef _WIN32
+      /* Private temporary files here; Windows keeps its shared cache. There
+       * is no caller to report to and the library logs nothing by default,
+       * so a file left behind shows only with G_MESSAGES_DEBUG. */
+      if (g_unlink(f->paths[i]) != 0 && errno != ENOENT)
+        g_debug("rmrender: cannot remove font file %s: %s", f->paths[i],
+                g_strerror(errno));
+#endif
+      g_free(f->paths[i]);
+    }
 #endif
   }
 
@@ -778,6 +790,22 @@ rmr_status rmr_linux_fonts_create(rmr_font_resolve_fn resolve, void* context,
   f->config = FcConfigCreate();
   rmr_status s = f->config ? RMR_OK : RMR_ERR_OUT_OF_MEMORY;
 
+  const char* failure = "font resources could not be loaded";
+#ifdef _WIN32
+  /* %LOCALAPPDATA%\rmrender\fonts, or under XDG_DATA_HOME when set. */
+  char* cache = nullptr;
+  if (s == RMR_OK) {
+    char* directory =
+        g_build_filename(g_get_user_data_dir(), "rmrender", "fonts", nullptr);
+    cache = rmr_font_cache_directory(directory);
+    g_free(directory);
+    if (!cache) {
+      s = RMR_ERR_BACKEND;
+      failure = "font cache directory unavailable or without an ASCII path";
+    }
+  }
+#endif
+
   size_t total = 0;
   for (size_t i = 0; i < sizeof names / sizeof *names && s == RMR_OK; i++) {
     rmr_asset_view v = {0};
@@ -795,24 +823,27 @@ rmr_status rmr_linux_fonts_create(rmr_font_resolve_fn resolve, void* context,
       s = RMR_ERR_UNSUPPORTED;
       break;
     }
-    if (v.size > l.maximum_plan_bytes - total || v.size > SSIZE_MAX) {
+    if (v.size > l.maximum_plan_bytes - total || v.size > PTRDIFF_MAX) {
       s = RMR_ERR_LIMIT;
       break;
     }
     total += v.size;
 
-#ifdef __APPLE__
-    /* Fontconfig reopens files lazily, so keep private named files alive
-     * until the font map is shut down. mkstemp creates mode 0600 files. */
-    snprintf(f->paths[i], sizeof f->paths[i], "/tmp/rmrender-font-XXXXXX");
-    f->fds[i] = mkstemp(f->paths[i]);
-    if (f->fds[i] < 0) f->paths[i][0] = 0;
-    if (f->fds[i] >= 0 && fcntl(f->fds[i], F_SETFD, FD_CLOEXEC) < 0) {
+#ifdef _WIN32
+    /* Fontconfig reopens files lazily and FreeType keeps them mapped, so a
+     * per-map file could never be deleted; reuse the content-addressed one. */
+    f->paths[i] = rmr_font_cache_file(cache, v.bytes, v.size);
+    if (!f->paths[i]) {
       s = RMR_ERR_BACKEND;
       break;
     }
 #else
+#ifdef __linux__
     f->fds[i] = memfd_create(names[i], MFD_CLOEXEC);
+#else
+    /* Fontconfig reopens these files lazily; keep the private file until map
+     * shutdown. The descriptor is GLib's and this libc's alike. */
+    f->fds[i] = g_file_open_tmp("rmrender-font-XXXXXX", &f->paths[i], nullptr);
 #endif
     if (f->fds[i] < 0) {
       s = RMR_ERR_BACKEND;
@@ -830,13 +861,25 @@ rmr_status rmr_linux_fonts_create(rmr_font_resolve_fn resolve, void* context,
       at += (size_t)n;
     }
     if (s != RMR_OK) break;
+#ifndef __linux__
+    /* Named files need only their paths to stay alive after the write. */
+    if (!g_close(f->fds[i], nullptr)) s = RMR_ERR_BACKEND;
+    f->fds[i] = -1;
+    if (s != RMR_OK) break;
+#endif
+#endif
 
+#ifdef __linux__
     char path[64];
-
-#ifdef __APPLE__
-    snprintf(path, sizeof path, "%s", f->paths[i]);
-#else
     snprintf(path, sizeof path, "/proc/self/fd/%d", f->fds[i]);
+#else
+#ifdef _WIN32
+    /* Fontconfig stores FC_FILE with forward slashes. Match that spelling
+     * when identifying the face whose charset drives our calibration. */
+    for (char* c = f->paths[i]; *c; c++)
+      if (*c == '\\') *c = '/';
+#endif
+    const char* path = f->paths[i];
 #endif
 
     if (!FcConfigAppFontAddFile(f->config, (const FcChar8*)path))
@@ -859,7 +902,14 @@ rmr_status rmr_linux_fonts_create(rmr_font_resolve_fn resolve, void* context,
     }
   }
 
+#ifdef __linux__
   f->has_emoji = f->fds[13] >= 0;
+#else
+  f->has_emoji = f->paths[13] != nullptr;
+#endif
+#ifdef _WIN32
+  g_free(cache);
+#endif
   if (s == RMR_OK) {
     f->map = pango_cairo_font_map_new_for_font_type(CAIRO_FONT_TYPE_FT);
     if (!f->map)
@@ -874,7 +924,7 @@ rmr_status rmr_linux_fonts_create(rmr_font_resolve_fn resolve, void* context,
 
   if (s != RMR_OK) {
     rmr_linux_fonts_free(f);
-    return rmr_linux_error(e, s, "font resources could not be loaded");
+    return rmr_linux_error(e, s, failure);
   }
 
   *out = f;

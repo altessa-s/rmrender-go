@@ -10,7 +10,7 @@
 // alike, so that the C names stay as written and the linker sees only the
 // prefixed ones: rmlines-go, rmdoc-go and rmmarks-go compile the same
 // libraries under their own names, and one program may link them all.
-// 472 symbols, read with nm from objects of both backends.
+// 477 symbols, read with nm from objects of both backends.
 
 #ifndef RMRENDER_GO_CLIB_SYMBOLS_H
 #define RMRENDER_GO_CLIB_SYMBOLS_H
@@ -329,6 +329,8 @@
 #define rmr_expression_free rmrgo_rmr_expression_free
 #define rmr_expression_stack_bytes rmrgo_rmr_expression_stack_bytes
 #define rmr_fail rmrgo_rmr_fail
+#define rmr_font_cache_directory rmrgo_rmr_font_cache_directory
+#define rmr_font_cache_file rmrgo_rmr_font_cache_file
 #define rmr_grain_box rmrgo_rmr_grain_box
 #define rmr_grain_mask rmrgo_rmr_grain_mask
 #define rmr_grain_noise rmrgo_rmr_grain_noise
@@ -398,6 +400,9 @@
 #define rmr_linux_text_provider rmrgo_rmr_linux_text_provider
 #define rmr_linux_text_width rmrgo_rmr_linux_text_width
 #define rmr_linux_write rmrgo_rmr_linux_write
+#define rmr_locale_create rmrgo_rmr_locale_create
+#define rmr_locale_free rmrgo_rmr_locale_free
+#define rmr_locale_number rmrgo_rmr_locale_number
 #define rmr_mark_around rmrgo_rmr_mark_around
 #define rmr_mark_sheet_free rmrgo_rmr_mark_sheet_free
 #define rmr_marker_tiles rmrgo_rmr_marker_tiles
