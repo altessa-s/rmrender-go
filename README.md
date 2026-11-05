@@ -41,8 +41,10 @@ library in Finder.
   ```
 
   Ship `libpdfium.so` and the graphics libraries, with their licences, beside a program that uses the Cairo backend.
-- **Windows** (x64): the Cairo backend, built as rmrender-lib builds it on Windows, with the [MSYS2](https://www.msys2.org) **CLANG64**
-  toolchain: its clang is the C23 compiler, and its pkg-config finds the Cairo stack. In a CLANG64 shell:
+- **Windows** (x64 and ARM64): the Cairo backend, built as rmrender-lib builds it on Windows, with the [MSYS2](https://www.msys2.org)
+  **CLANG64** toolchain on x64 or **CLANGARM64** on ARM64: its clang is the C23 compiler, and its pkg-config finds the Cairo stack. On ARM64
+  every `mingw-w64-clang-x86_64-` package below is `mingw-w64-clang-aarch64-`, PDFium is the `win-arm64` SDK, and Go's race detector is not
+  available. In a CLANG64 shell:
 
   ```sh
   pacman -S mingw-w64-clang-x86_64-clang mingw-w64-clang-x86_64-pkgconf mingw-w64-clang-x86_64-python \
