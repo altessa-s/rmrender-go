@@ -3,6 +3,7 @@
  * found in the LICENSE file. */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <glib/gstdio.h>
 #include <hb-ot.h>
 #include <limits.h>
@@ -208,9 +209,9 @@ static gboolean spacing_equal(const PangoAttribute* a,
   return ((const PangoAttrInt*)a)->value == ((const PangoAttrInt*)b)->value;
 }
 
-/* Creates a calibrated-spacing Pango attribute carrying value, registering
- * the attribute class on first use. */
-static PangoAttribute* spacing_new(int value) {
+/* The calibrated-spacing attribute class, registered on first use by any
+ * thread. */
+static const PangoAttrClass* spacing_klass(void) {
   static gsize initialized;
   if (g_once_init_enter(&initialized)) {
     spacing_class =
@@ -218,9 +219,13 @@ static PangoAttribute* spacing_new(int value) {
                          spacing_copy, spacing_destroy, spacing_equal};
     g_once_init_leave(&initialized, 1);
   }
+  return &spacing_class;
+}
 
+/* Creates a calibrated-spacing Pango attribute carrying value. */
+static PangoAttribute* spacing_new(int value) {
   PangoAttrInt* a = g_new0(PangoAttrInt, 1);
-  pango_attribute_init(&a->attr, &spacing_class);
+  pango_attribute_init(&a->attr, spacing_klass());
   a->value = value;
   return &a->attr;
 }
@@ -544,7 +549,7 @@ double rmr_pango_cluster_spacing(PangoLayout* layout, size_t from, size_t to) {
     pango_attr_iterator_range(it, &start, &end);
     while (index >= (size_t)end && pango_attr_iterator_next(it))
       pango_attr_iterator_range(it, &start, &end);
-    PangoAttribute* a = pango_attr_iterator_get(it, spacing_class.type);
+    PangoAttribute* a = pango_attr_iterator_get(it, spacing_klass()->type);
     if (a) spacing = ((PangoAttrInt*)a)->value;
     if (at == text + from) first = spacing;
     uniform &= spacing == first;
@@ -611,7 +616,7 @@ double rmr_pango_caret_adjustment(PangoLayout* layout, size_t index) {
     int start, end;
     pango_attr_iterator_range(it, &start, &end);
     if (start >= 0 && (size_t)start <= at && end >= 0 && at < (size_t)end) {
-      PangoAttribute* a = pango_attr_iterator_get(it, spacing_class.type);
+      PangoAttribute* a = pango_attr_iterator_get(it, spacing_klass()->type);
       if (a)
         adjustment = -(double)((PangoAttrInt*)a)->value / PANGO_SCALE *
                      (index == length ? 1 : .5);
@@ -675,7 +680,7 @@ void rmr_pango_attributes(const rmr_linux_fonts* fonts, PangoAttrList* attrs,
              pango_attr_iterator_next(previous_it))
         pango_attr_iterator_range(previous_it, &from, &to);
       PangoAttribute* previous =
-          pango_attr_iterator_get(previous_it, spacing_class.type);
+          pango_attr_iterator_get(previous_it, spacing_klass()->type);
       if (previous) applied = ((PangoAttrInt*)previous)->value;
     }
 
@@ -790,7 +795,10 @@ rmr_status rmr_linux_fonts_create(rmr_font_resolve_fn resolve, void* context,
   f->config = FcConfigCreate();
   rmr_status s = f->config ? RMR_OK : RMR_ERR_OUT_OF_MEMORY;
 
-  const char* failure = "font resources could not be loaded";
+  /* Names the step that failed, so a failure seen only elsewhere, such as on
+   * a Windows runner, can be told apart. */
+  char failure[sizeof((rmr_error*)0)->message] =
+      "font resources could not be loaded";
 #ifdef _WIN32
   /* %LOCALAPPDATA%\rmrender\fonts, or under XDG_DATA_HOME when set. */
   char* cache = nullptr;
@@ -801,7 +809,8 @@ rmr_status rmr_linux_fonts_create(rmr_font_resolve_fn resolve, void* context,
     g_free(directory);
     if (!cache) {
       s = RMR_ERR_BACKEND;
-      failure = "font cache directory unavailable or without an ASCII path";
+      snprintf(failure, sizeof failure, "%s",
+               "font cache directory unavailable or without an ASCII path");
     }
   }
 #endif
@@ -832,8 +841,12 @@ rmr_status rmr_linux_fonts_create(rmr_font_resolve_fn resolve, void* context,
 #ifdef _WIN32
     /* Fontconfig reopens files lazily and FreeType keeps them mapped, so a
      * per-map file could never be deleted; reuse the content-addressed one. */
-    f->paths[i] = rmr_font_cache_file(cache, v.bytes, v.size);
+    GError* error = nullptr;
+    f->paths[i] = rmr_font_cache_file(cache, v.bytes, v.size, &error);
     if (!f->paths[i]) {
+      snprintf(failure, sizeof failure, "font %s: cache file: %s", names[i],
+               error ? error->message : "unknown failure");
+      g_clear_error(&error);
       s = RMR_ERR_BACKEND;
       break;
     }
@@ -882,9 +895,15 @@ rmr_status rmr_linux_fonts_create(rmr_font_resolve_fn resolve, void* context,
     const char* path = f->paths[i];
 #endif
 
-    if (!FcConfigAppFontAddFile(f->config, (const FcChar8*)path))
+    if (!FcConfigAppFontAddFile(f->config, (const FcChar8*)path)) {
       s = RMR_ERR_BACKEND;
-    else if (i < 5) {
+      /* Fontconfig gives no reason; whether the file opens is the usual one. */
+      int fd = g_open(path, O_RDONLY, 0);
+      int code = errno;
+      if (fd >= 0) g_close(fd, nullptr);
+      snprintf(failure, sizeof failure, "font %s: Fontconfig cannot add it%s%s",
+               names[i], fd >= 0 ? "" : ": ", fd >= 0 ? "" : g_strerror(code));
+    } else if (i < 5) {
       FcFontSet* set = FcConfigGetFonts(f->config, FcSetApplication);
       for (int j = 0; set && j < set->nfont; j++) {
         FcChar8* file = nullptr;
@@ -898,7 +917,12 @@ rmr_status rmr_linux_fonts_create(rmr_font_resolve_fn resolve, void* context,
           break;
         }
       }
-      if (!f->base_characters[i]) s = RMR_ERR_BACKEND;
+      if (!f->base_characters[i]) {
+        snprintf(failure, sizeof failure,
+                 "font %s: no Fontconfig face of that file with a charset",
+                 names[i]);
+        s = RMR_ERR_BACKEND;
+      }
     }
   }
 
@@ -912,9 +936,10 @@ rmr_status rmr_linux_fonts_create(rmr_font_resolve_fn resolve, void* context,
 #endif
   if (s == RMR_OK) {
     f->map = pango_cairo_font_map_new_for_font_type(CAIRO_FONT_TYPE_FT);
-    if (!f->map)
+    if (!f->map) {
+      snprintf(failure, sizeof failure, "%s", "Pango font map unavailable");
       s = RMR_ERR_BACKEND;
-    else {
+    } else {
       pango_fc_font_map_set_config(PANGO_FC_FONT_MAP(f->map), f->config);
       pango_fc_font_map_set_default_substitute(PANGO_FC_FONT_MAP(f->map),
                                                calibrated_pattern, f, nullptr);
