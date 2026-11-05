@@ -1,0 +1,6 @@
+# No end-of-line conversion, whatever core.autocrlf says (Git for Windows
+# sets it): every checkout has the bytes of the repository, so the vendored
+# sources stay byte for byte as scripts/vendor.py copied them, and the
+# embedded templates, the fuzz corpus and the files the tests read are the
+# same on every system.
+* -text

@@ -7,6 +7,7 @@ package rmrender_test
 import (
 	"debug/elf"
 	"debug/macho"
+	"debug/pe"
 	"os"
 	"runtime"
 	"strings"
@@ -14,7 +15,8 @@ import (
 )
 
 // definedSymbols answers the names of the symbols the running executable
-// defines, without the leading underscore of Mach-O.
+// defines, without the leading underscore of Mach-O, read from its Mach-O,
+// ELF or PE (COFF) symbol table.
 func definedSymbols(t *testing.T) []string {
 	t.Helper()
 	path, err := os.Executable()
@@ -50,6 +52,22 @@ func definedSymbols(t *testing.T) []string {
 		}
 		for _, s := range syms {
 			if s.Section != elf.SHN_UNDEF {
+				names = append(names, s.Name)
+			}
+		}
+	case "windows":
+		f, err := pe.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		if len(f.Symbols) == 0 {
+			t.Skip("the executable has no symbol table")
+		}
+		for _, s := range f.Symbols {
+			// External (storage class 2) and defined in a section of
+			// this file; x86-64 COFF names carry no leading underscore.
+			if s.StorageClass == 2 && s.SectionNumber > 0 {
 				names = append(names, s.Name)
 			}
 		}
