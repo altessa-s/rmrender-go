@@ -152,10 +152,12 @@ static bool readable(const char* path, GError** error) {
 }
 #endif
 
-char* rmr_font_cache_file(const char* directory, const uint8_t* bytes,
-                          size_t size, GError** error) {
+/* The path of directory/<SHA-256 of bytes><extension>, holding bytes; see
+ * rmr_font_cache_file. */
+static char* cache(const char* directory, const char* extension,
+                   const uint8_t* bytes, size_t size, GError** error) {
   if (!directory || !bytes || !size || size > G_MAXSSIZE) {
-    g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_INVAL, "invalid font bytes");
+    g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_INVAL, "invalid bytes");
     return nullptr;
   }
   char* digest = g_compute_checksum_for_data(G_CHECKSUM_SHA256, bytes, size);
@@ -163,7 +165,7 @@ char* rmr_font_cache_file(const char* directory, const uint8_t* bytes,
     g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_NOMEM, "no checksum");
     return nullptr;
   }
-  char* name = g_strconcat(digest, ".ttf", nullptr);
+  char* name = g_strconcat(digest, extension, nullptr);
   char* path = g_build_filename(directory, name, nullptr);
   g_free(name);
   g_free(digest);
@@ -204,4 +206,15 @@ char* rmr_font_cache_file(const char* directory, const uint8_t* bytes,
   if (placed != FAILED && readable(path, error)) return path;
   g_free(path);
   return nullptr;
+}
+
+char* rmr_font_cache_file(const char* directory, const uint8_t* bytes,
+                          size_t size, GError** error) {
+  return cache(directory, ".ttf", bytes, size, error);
+}
+
+char* rmr_font_cache_config(const char* directory, GError** error) {
+  static const char config[] = "<?xml version=\"1.0\"?>\n<fontconfig/>\n";
+  return cache(directory, ".conf", (const uint8_t*)config, sizeof config - 1,
+               error);
 }

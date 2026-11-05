@@ -775,6 +775,40 @@ void rmr_linux_fonts_free(rmr_linux_fonts* f) {
   free(f);
 }
 
+#ifdef _WIN32
+/* Points Fontconfig's default configuration at an empty one in cache, once
+ * per process, unless the user configured Fontconfig or its default
+ * fonts.conf is found. Pango loads that default in a thread of its own when
+ * the first font map is created, although rendering only ever uses the
+ * private configuration of each font map. Fontconfig looks for it relative to
+ * its DLL (etc\fonts of an installation tree such as MSYS2's), which an
+ * application shipping only the DLLs lacks, and then prints "Cannot load
+ * default config file" on stderr. This runs before this library's first font
+ * map. FONTCONFIG_FILE only redirects that lookup, and only where it would
+ * fail: unlike FcConfigSetCurrent it replaces no configuration a host
+ * application already loaded or relies on, and once a default is loaded it
+ * has no effect. The Windows C runtime serializes environment access. */
+static void default_config(const char* cache, FcConfig* config) {
+  static gsize initialized;
+  if (!g_once_init_enter(&initialized)) return;
+  /* A sysroot would also prefix the absolute path set here. */
+  if (!g_getenv("FONTCONFIG_FILE") && !g_getenv("FONTCONFIG_PATH") &&
+      !g_getenv("FONTCONFIG_SYSROOT")) {
+    /* A private configuration resolves the name without loading the
+     * default one, which would report the very error being avoided. */
+    FcChar8* found = FcConfigGetFilename(config, nullptr);
+    if (found)
+      FcStrFree(found);
+    else {
+      char* file = rmr_font_cache_config(cache, nullptr);
+      if (file) g_setenv("FONTCONFIG_FILE", file, false);
+      g_free(file);
+    }
+  }
+  g_once_init_leave(&initialized, 1);
+}
+#endif
+
 /* Builds a private Fontconfig/Pango font map from resolve's bundled fonts,
  * including per-face base-character sets used to pick calibration script. */
 rmr_status rmr_linux_fonts_create(rmr_font_resolve_fn resolve, void* context,
@@ -811,7 +845,8 @@ rmr_status rmr_linux_fonts_create(rmr_font_resolve_fn resolve, void* context,
       s = RMR_ERR_BACKEND;
       snprintf(failure, sizeof failure, "%s",
                "font cache directory unavailable or without an ASCII path");
-    }
+    } else
+      default_config(cache, f->config);
   }
 #endif
 
