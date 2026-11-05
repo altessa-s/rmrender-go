@@ -30,4 +30,9 @@ char* rmr_font_cache_directory(const char* directory);
 char* rmr_font_cache_file(const char* directory, const uint8_t* bytes,
                           size_t size, GError** error);
 
+/* Returns the path of an empty Fontconfig configuration, which loads no fonts,
+ * kept in directory as rmr_font_cache_file keeps fonts; nullptr on failure,
+ * with the optional error set. The caller frees the result with g_free. */
+char* rmr_font_cache_config(const char* directory, GError** error);
+
 #endif

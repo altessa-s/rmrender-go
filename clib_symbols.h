@@ -10,7 +10,7 @@
 // alike, so that the C names stay as written and the linker sees only the
 // prefixed ones: rmlines-go, rmdoc-go and rmmarks-go compile the same
 // libraries under their own names, and one program may link them all.
-// 477 symbols, read with nm from objects of both backends; Windows
+// 478 symbols, read with nm from objects of both backends; Windows
 // compiles the Cairo backend's sources, and its _WIN32 branches add no other.
 
 #ifndef RMRENDER_GO_CLIB_SYMBOLS_H
@@ -330,6 +330,7 @@
 #define rmr_expression_free rmrgo_rmr_expression_free
 #define rmr_expression_stack_bytes rmrgo_rmr_expression_stack_bytes
 #define rmr_fail rmrgo_rmr_fail
+#define rmr_font_cache_config rmrgo_rmr_font_cache_config
 #define rmr_font_cache_directory rmrgo_rmr_font_cache_directory
 #define rmr_font_cache_file rmrgo_rmr_font_cache_file
 #define rmr_grain_box rmrgo_rmr_grain_box
