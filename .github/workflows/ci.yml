@@ -102,11 +102,18 @@ jobs:
         run: go -C internal/coexist test -count=1 ./...
 
   windows:
-    name: windows / x64
+    name: windows / ${{ matrix.arch }}
     # The Cairo backend as rmrender-lib's Windows CI builds it: MSYS2 CLANG64
-    # (clang, the Cairo stack, pkg-config) and the PDFium SDK.
-    runs-on: windows-2022
+    # or CLANGARM64 (clang, the Cairo stack, pkg-config) and the PDFium SDK.
+    # Go's race detector has no windows/arm64 port, so arm64 tests without it.
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64, runner: windows-2022, msystem: CLANG64, pkg: mingw-w64-clang-x86_64, race: "-race" }
+          - { arch: arm64, runner: windows-11-arm, msystem: CLANGARM64, pkg: mingw-w64-clang-aarch64, race: "" }
     permissions:
       contents: read
     defaults:
@@ -124,22 +131,22 @@ jobs:
 
       - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
         with:
-          msystem: CLANG64
+          msystem: ${{ matrix.msystem }}
           update: false
-          # The Go that setup-go installed, after CLANG64's clang and
+          # The Go that setup-go installed, after the environment's clang and
           # pkg-config.
           path-type: inherit
           install: >-
-            mingw-w64-clang-x86_64-clang
-            mingw-w64-clang-x86_64-pkgconf
-            mingw-w64-clang-x86_64-python
-            mingw-w64-clang-x86_64-cairo
-            mingw-w64-clang-x86_64-pango
-            mingw-w64-clang-x86_64-fontconfig
-            mingw-w64-clang-x86_64-harfbuzz
-            mingw-w64-clang-x86_64-gdk-pixbuf2
-            mingw-w64-clang-x86_64-zlib
-            mingw-w64-clang-x86_64-ntldd
+            ${{ matrix.pkg }}-clang
+            ${{ matrix.pkg }}-pkgconf
+            ${{ matrix.pkg }}-python
+            ${{ matrix.pkg }}-cairo
+            ${{ matrix.pkg }}-pango
+            ${{ matrix.pkg }}-fontconfig
+            ${{ matrix.pkg }}-harfbuzz
+            ${{ matrix.pkg }}-gdk-pixbuf2
+            ${{ matrix.pkg }}-zlib
+            ${{ matrix.pkg }}-ntldd
 
       - name: Fetch PDFium
         run: |
@@ -148,10 +155,10 @@ jobs:
           # Mixed paths (C:/...): clang, Go and the test binaries are native
           # Windows programs. The script checks the archive's SHA-256.
           pdfium="$(cygpath -m "$RUNNER_TEMP")/pdfium"
-          python internal/clib/rmrender/scripts/fetch-pdfium.py --platform win-x64 --output "$pdfium"
+          python internal/clib/rmrender/scripts/fetch-pdfium.py --platform win-${{ matrix.arch }} --output "$pdfium"
           echo "CGO_CFLAGS=-I$pdfium/include" >> "$GITHUB_ENV"
           echo "CGO_LDFLAGS=-L$pdfium/lib" >> "$GITHUB_ENV"
-          # pdfium.dll is loaded from PATH; CLANG64's bin, with the Cairo
+          # pdfium.dll is loaded from PATH; the environment's bin, with the Cairo
           # stack's DLLs, is already on it.
           echo "PDFIUM_BIN=$(cygpath -u "$pdfium")/bin" >> "$GITHUB_ENV"
 
@@ -161,7 +168,7 @@ jobs:
       - name: Test
         run: |
           export PATH="$PDFIUM_BIN:$PATH"
-          go test -race -count=1 ./...
+          go test ${{ matrix.race }} -count=1 ./...
 
       - name: Test with full cgo pointer checks
         run: |
@@ -178,7 +185,7 @@ jobs:
           export PATH="$PDFIUM_BIN:$PATH"
           go test -c -o rmrender.test.exe .
           # What a program built with the package loads besides Windows's
-          # own: CLANG64's Cairo stack and pdfium.dll.
+          # own: the MSYS2 environment's Cairo stack and pdfium.dll.
           ntldd -R rmrender.test.exe | grep -v -i -E 'windows|system32' | sort
 
   lint:
