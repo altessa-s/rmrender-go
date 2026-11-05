@@ -12,9 +12,10 @@
 // it reads its input with: rmlines-lib for .rm pages, rmdoc-lib for .rmdoc
 // archives and rmmarks-lib for highlights. All four are vendored into this
 // module and compiled by cgo. The drawing backend is native: CoreGraphics
-// and CoreText on darwin, Cairo, Pango and PDFium on linux (and on darwin
-// with the rmrender_cairo build tag). Building needs a C23 compiler; the
-// linux backend also needs the Cairo stack and PDFium, as the README says.
+// and CoreText on darwin, Cairo, Pango and PDFium on linux and windows (and
+// on darwin with the rmrender_cairo build tag). Building needs a C23
+// compiler; the Cairo backend also needs the Cairo stack and PDFium, on
+// windows from MSYS2 CLANG64, as the README says.
 //
 // # Pages
 //

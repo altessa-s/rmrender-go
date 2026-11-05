@@ -7,7 +7,7 @@
 // Compiles the vendored rmrender-lib backends/linux/rmr_page_text.c
 // into this package: cgo builds only the C files of the package directory.
 
-//go:build linux || (darwin && rmrender_cairo)
+//go:build linux || windows || (darwin && rmrender_cairo)
 
 #include "clib_digest.h"
 #ifndef _GNU_SOURCE

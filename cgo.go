@@ -16,9 +16,20 @@ package rmrender
 // links beside rmlines-go, rmdoc-go and rmmarks-go. See scripts/vendor.py.
 //
 // The backend is chosen by GOOS: CoreGraphics and CoreText on darwin, Cairo,
-// Pango and PDFium on linux. On darwin the rmrender_cairo build tag selects
-// the Cairo backend instead. PDFium's headers and library come from
-// CGO_CFLAGS and CGO_LDFLAGS; see the README.
+// Pango and PDFium on linux and windows. On darwin the rmrender_cairo build
+// tag selects the Cairo backend instead. PDFium's headers and library come
+// from CGO_CFLAGS and CGO_LDFLAGS; see the README. The clib_*.c wrappers
+// carry the same constraints (scripts/vendor.py writes them).
+//
+// On windows the libraries are compiled as rmrender-lib's CMake compiles
+// them into a static library: nothing defines RMRENDER_BUILDING or
+// RMRENDER_SHARED (nor the other libraries' *_BUILDING_SHARED and
+// *_USING_SHARED), so their export macros expand to nothing and no symbol
+// is declared dllimport or dllexport; clib_prelude.h refuses them. The
+// sources that include windows.h define WIN32_LEAN_AND_MEAN themselves, and
+// the CMake build adds no other Windows define. The PDFium SDK ships its
+// import library as pdfium.dll.lib, which -lpdfium does not find, hence
+// -l:pdfium.dll.lib; the program then needs pdfium.dll at run time.
 
 /*
 #cgo CFLAGS: -std=c2x -include ${SRCDIR}/clib_prelude.h
@@ -29,12 +40,11 @@ package rmrender
 #cgo LDFLAGS: -lz -lm
 #cgo darwin,!rmrender_cairo CFLAGS: -DRMRGO_APPLE -I${SRCDIR}/internal/clib/rmrender/backends/apple
 #cgo darwin,!rmrender_cairo LDFLAGS: -framework CoreGraphics -framework CoreText -framework CoreFoundation
-#cgo linux CFLAGS: -DRMRGO_CAIRO -I${SRCDIR}/internal/clib/rmrender/backends/linux
-#cgo darwin,rmrender_cairo CFLAGS: -DRMRGO_CAIRO -I${SRCDIR}/internal/clib/rmrender/backends/linux
-#cgo linux pkg-config: cairo pangocairo pangoft2 fontconfig harfbuzz gdk-pixbuf-2.0
-#cgo darwin,rmrender_cairo pkg-config: cairo pangocairo pangoft2 fontconfig harfbuzz gdk-pixbuf-2.0
+#cgo linux windows darwin,rmrender_cairo CFLAGS: -DRMRGO_CAIRO -I${SRCDIR}/internal/clib/rmrender/backends/linux
+#cgo linux windows darwin,rmrender_cairo pkg-config: cairo pangocairo pangoft2 fontconfig harfbuzz gdk-pixbuf-2.0
 #cgo linux LDFLAGS: -lpdfium -lpthread
 #cgo darwin,rmrender_cairo LDFLAGS: -lpdfium
+#cgo windows LDFLAGS: -l:pdfium.dll.lib
 
 #include "bridge.h"
 */

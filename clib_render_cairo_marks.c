@@ -7,7 +7,7 @@
 // Compiles the vendored rmrender-lib backends/linux/rmr_marks.c
 // into this package: cgo builds only the C files of the package directory.
 
-//go:build linux || (darwin && rmrender_cairo)
+//go:build linux || windows || (darwin && rmrender_cairo)
 
 #include "clib_digest.h"
 #include "internal/clib/rmrender/backends/linux/rmr_marks.c"
