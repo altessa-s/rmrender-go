@@ -551,11 +551,10 @@ static rmr_status outline_children(const rmr_apple_pdf_source* s,
   return RMR_OK;
 }
 
-rmr_status rmr_apple_pdf_overlay(const rmr_apple_pdf_source* source,
-                                 const rmr_pdf_page* pages, size_t count,
-                                 const rmr_limits* given, rmr_cancel_fn cancel,
-                                 void* context, rmr_buffer* out,
-                                 rmr_pdf_report* report, rmr_error* e) {
+rmr_status rmr_apple_pdf_overlay_marks(
+    const rmr_apple_pdf_source* source, const rmr_pdf_page* pages, size_t count,
+    const rmr_pdf_marks* marks, const rmr_limits* given, rmr_cancel_fn cancel,
+    void* context, rmr_buffer* out, rmr_pdf_report* report, rmr_error* e) {
   if (!pages || !count || !out)
     return fail(e, RMR_ERR_INVALID_ARGUMENT, "missing PDF output pages");
 
@@ -566,11 +565,11 @@ rmr_status rmr_apple_pdf_overlay(const rmr_apple_pdf_source* source,
   for (size_t i = 0; i < count; i++) {
     const rmr_pdf_page* p = &pages[i];
     rmr_transform t = p->sheet.transform;
-    if (!p->marks || !isfinite(p->sheet.width) || !isfinite(p->sheet.height) ||
-        p->sheet.width <= 0 || p->sheet.height <= 0 ||
-        p->sheet.width > 10000000 || p->sheet.height > 10000000 ||
-        !isfinite(t.a) || t.a <= 0 || t.b != 0 || t.c != 0 || t.d != -t.a ||
-        !isfinite(t.tx) || !isfinite(t.ty))
+    if ((!marks && !p->marks) || !isfinite(p->sheet.width) ||
+        !isfinite(p->sheet.height) || p->sheet.width <= 0 ||
+        p->sheet.height <= 0 || p->sheet.width > 10000000 ||
+        p->sheet.height > 10000000 || !isfinite(t.a) || t.a <= 0 || t.b != 0 ||
+        t.c != 0 || t.d != -t.a || !isfinite(t.tx) || !isfinite(t.ty))
       return fail(e, RMR_ERR_INVALID_ARGUMENT, "invalid output PDF sheet");
     if (p->has_source) {
       rmr_rect r = p->source_rect;
@@ -627,6 +626,7 @@ rmr_status rmr_apple_pdf_overlay(const rmr_apple_pdf_source* source,
   }
 
   rmr_status status = RMR_OK;
+  bool reported = false; /* set once a marks or drawing call has filled e */
   rmr_pdf_report result = {0};
   for (size_t i = 0; i < count; i++) {
     if (cancel && cancel(context)) {
@@ -711,9 +711,17 @@ rmr_status rmr_apple_pdf_overlay(const rmr_apple_pdf_source* source,
                      &result, nullptr);
     }
 
-    if (status == RMR_OK)
-      status = rmr_apple_draw_context(cg, p->marks, &p->sheet, &l, cancel,
-                                      context, e);
+    const rmr_plan* plan = nullptr;
+    if (status == RMR_OK) {
+      status = rmr_pdf_marks_acquire(marks, pages, i, &plan, e);
+      reported = status != RMR_OK;
+    }
+    if (status == RMR_OK) {
+      status =
+          rmr_apple_draw_context(cg, plan, &p->sheet, &l, cancel, context, e);
+      reported = status != RMR_OK;
+      rmr_pdf_marks_release(marks, i);
+    }
 
     CGPDFContextEndPage(cg);
     if (status != RMR_OK || output.status != RMR_OK) break;
@@ -749,16 +757,29 @@ rmr_status rmr_apple_pdf_overlay(const rmr_apple_pdf_source* source,
   CGContextRelease(cg);
   free(targets.items);
 
-  if (status == RMR_OK) status = output.status;
+  const char* message = "PDF overlay failed";
+  if (status == RMR_OK && output.status != RMR_OK) {
+    status = output.status;
+    if (status == RMR_ERR_LIMIT) message = "PDF output byte limit";
+  }
 
   if (status != RMR_OK) {
     free(output.bytes.bytes);
-    return fail(e, status, "PDF overlay failed");
+    return reported ? status : fail(e, status, message);
   }
 
   *out = output.bytes;
   if (report) *report = result;
   return RMR_OK;
+}
+
+rmr_status rmr_apple_pdf_overlay(const rmr_apple_pdf_source* source,
+                                 const rmr_pdf_page* pages, size_t count,
+                                 const rmr_limits* limits, rmr_cancel_fn cancel,
+                                 void* context, rmr_buffer* out,
+                                 rmr_pdf_report* report, rmr_error* e) {
+  return rmr_apple_pdf_overlay_marks(source, pages, count, nullptr, limits,
+                                     cancel, context, out, report, e);
 }
 
 /* The incremental writer edits the page tree it parses itself, while sizes and
@@ -796,10 +817,11 @@ static rmr_status agree(const rmr_apple_pdf_source* source,
   return RMR_OK;
 }
 
-rmr_status rmr_apple_pdf_incremental(
+rmr_status rmr_apple_pdf_incremental_marks(
     const rmr_apple_pdf_source* source, const rmr_pdf_page* pages, size_t count,
-    const rmr_limits* given, rmr_cancel_fn cancel, void* context,
-    rmr_buffer* out, rmr_pdf_incremental_report* report, rmr_error* e) {
+    const rmr_pdf_marks* marks, const rmr_limits* given, rmr_cancel_fn cancel,
+    void* context, rmr_buffer* out, rmr_pdf_incremental_report* report,
+    rmr_error* e) {
   if (!source || !pages || !out || !count)
     return fail(e, RMR_ERR_INVALID_ARGUMENT, "missing incremental pages");
 
@@ -844,25 +866,34 @@ rmr_status rmr_apple_pdf_incremental(
     }
 
     rmr_rect r = p->source_rect;
-    if (!p->marks || !isfinite(r.x) || !isfinite(r.y) || !isfinite(r.width) ||
-        !isfinite(r.height) || r.width <= 0 || r.height <= 0) {
+    if ((!marks && !p->marks) || !isfinite(r.x) || !isfinite(r.y) ||
+        !isfinite(r.width) || !isfinite(r.height) || r.width <= 0 ||
+        r.height <= 0) {
       status = fail(e, RMR_ERR_INVALID_ARGUMENT, "invalid source placement");
       break;
     }
 
-    if (!rmr_plan_count(p->marks)) continue;
+    const rmr_plan* plan = nullptr;
+    status = rmr_pdf_marks_acquire(marks, pages, i, &plan, e);
+    if (status != RMR_OK) break;
+    if (!rmr_plan_count(plan)) {
+      rmr_pdf_marks_release(marks, i);
+      continue;
+    }
 
     CGPDFPageRef original = CGPDFDocumentGetPage(source->document, i + 1);
     CGAffineTransform t = transform(source, p);
     double determinant = t.a * t.d - t.b * t.c;
     if (!isfinite(determinant) || fabs(determinant) < 1e-12) {
+      rmr_pdf_marks_release(marks, i);
       status = fail(e, RMR_ERR_INVALID_ARGUMENT, "singular PDF placement");
       break;
     }
 
     t = CGAffineTransformInvert(t);
-    status = rmr_apple_pdf_sheets(&p->marks, &p->sheet, 1, &limits, cancel,
-                                  context, &pdfs[used], e);
+    status = rmr_apple_pdf_sheets(&plan, &p->sheet, 1, &limits, cancel, context,
+                                  &pdfs[used], e);
+    rmr_pdf_marks_release(marks, i);
 
     if (status != RMR_OK) break;
 
@@ -901,6 +932,14 @@ rmr_status rmr_apple_pdf_incremental(
   free(overlays);
   free(geometry);
   return status;
+}
+
+rmr_status rmr_apple_pdf_incremental(
+    const rmr_apple_pdf_source* source, const rmr_pdf_page* pages, size_t count,
+    const rmr_limits* limits, rmr_cancel_fn cancel, void* context,
+    rmr_buffer* out, rmr_pdf_incremental_report* report, rmr_error* e) {
+  return rmr_apple_pdf_incremental_marks(source, pages, count, nullptr, limits,
+                                         cancel, context, out, report, e);
 }
 
 const uint8_t* rmr_apple_pdf_source_data(const rmr_apple_pdf_source* s) {

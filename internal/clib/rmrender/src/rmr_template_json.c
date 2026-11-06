@@ -823,6 +823,45 @@ static int page_order(const void* a, const void* b) {
                                      : 0;
 }
 
+typedef struct {
+  const char* id;
+  size_t index;
+} page_key;
+
+/* strcmp of page ids a and b, charging the bytes it inspects (the common
+ * prefix plus the deciding byte) to the work budget. */
+static int id_order(parser* p, const char* a, const char* b) {
+  size_t n = 0;
+  while (a[n] && a[n] == b[n]) n++;
+  work(p, n + 1);
+  return (unsigned char)a[n] - (unsigned char)b[n];
+}
+
+/* Stable bottom-up merge sort of n keys by id through scratch, so equal ids
+ * keep their order. Returns whichever buffer holds the result, or null once
+ * the work budget fails; every comparison is charged, so a sort costs at most
+ * n*ceil(log2 n) comparisons of the ids' actual common prefixes. */
+static page_key* sort_ids(parser* p, page_key* keys, page_key* scratch,
+                          size_t n) {
+  for (size_t width = 1; width < n; width *= 2) {
+    for (size_t lo = 0; lo < n; lo += 2 * width) {
+      size_t mid = n - lo > width ? lo + width : n,
+             hi = n - mid > width ? mid + width : n, i = lo, j = mid, k = lo;
+      while (i < mid && j < hi) {
+        bool right = id_order(p, keys[j].id, keys[i].id) < 0;
+        if (p->status != RMR_OK) return nullptr;
+        scratch[k++] = right ? keys[j++] : keys[i++];
+      }
+      while (i < mid) scratch[k++] = keys[i++];
+      while (j < hi) scratch[k++] = keys[j++];
+    }
+    page_key* t = keys;
+    keys = scratch;
+    scratch = t;
+  }
+  return keys;
+}
+
 /* Named field of entry (.content decoding), treating null as absent. */
 static node* content_optional(parser* p, node* entry, const char* key) {
   node* value = optional(p, entry, key);
@@ -1022,23 +1061,31 @@ rmr_status rmr_document_layout_decode(const char* json, size_t length,
         ordered[alive++] = item;
       }
 
-      if (p.status == RMR_OK) {
-        if (crdt && alive > 1)
-          qsort(ordered, alive, sizeof *ordered, page_order);
+      if (p.status == RMR_OK && crdt && alive > 1)
+        qsort(ordered, alive, sizeof *ordered, page_order);
 
-        for (size_t i = 0; i < alive; i++) {
-          bool duplicate = false;
-          for (size_t j = 0; j < d->count; j++) {
-            if (!work(&p, strlen(ordered[i].page.id) + 1)) break;
-            if (!strcmp(d->pages[j].id, ordered[i].page.id)) {
-              duplicate = true;
-              break;
-            }
-          }
+      /* Keep the first entry of each page id in that order: a stable sort by
+       * id puts each id's first entry at the head of its run, and the rest of
+       * the run is dropped. This stays O(n log n) for documents with
+       * thousands of pages, where a pairwise check would exhaust the budget. */
+      page_key *keys = nullptr, *scratch = nullptr;
+      if (p.status == RMR_OK && alive > 1) {
+        keys = allocate(&p, alive, sizeof *keys);
+        scratch = allocate(&p, alive, sizeof *scratch);
+      }
+      if (keys && scratch) {
+        for (size_t i = 0; i < alive; i++)
+          keys[i] = (page_key){ordered[i].page.id, i};
+        keys = sort_ids(&p, keys, scratch, alive);
+        for (size_t i = 1; keys && i < alive; i++) {
+          bool duplicate = !id_order(&p, keys[i - 1].id, keys[i].id);
           if (p.status != RMR_OK) break;
-          if (!duplicate) d->pages[d->count++] = ordered[i].page;
+          if (duplicate) ordered[keys[i].index].page.id = nullptr;
         }
       }
+
+      for (size_t i = 0; p.status == RMR_OK && i < alive; i++)
+        if (ordered[i].page.id) d->pages[d->count++] = ordered[i].page;
     }
   }
 

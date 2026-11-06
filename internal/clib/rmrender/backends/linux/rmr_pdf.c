@@ -171,10 +171,11 @@ static rmr_rect box(rmr_transform t, double w, double h) {
   return (rmr_rect){left, bottom, right - left, top - bottom};
 }
 
-rmr_status rmr_linux_pdf_incremental(
+rmr_status rmr_linux_pdf_incremental_marks(
     const rmr_linux_pdf_source* source, const rmr_pdf_page* pages, size_t count,
-    const rmr_limits* given, rmr_cancel_fn cancel, void* ctx, rmr_buffer* out,
-    rmr_pdf_incremental_report* report, rmr_error* e) {
+    const rmr_pdf_marks* marks, const rmr_limits* given, rmr_cancel_fn cancel,
+    void* ctx, rmr_buffer* out, rmr_pdf_incremental_report* report,
+    rmr_error* e) {
   if (!source || !pages || !count || !out)
     return rmr_linux_error(e, RMR_ERR_INVALID_ARGUMENT, "missing PDF pages");
   if (count != source->count)
@@ -198,6 +199,7 @@ rmr_status rmr_linux_pdf_incremental(
 
   size_t used = 0;
   rmr_status s = RMR_OK;
+  bool reported = false; /* set once a marks or PDF call has filled e */
   for (size_t i = 0; i < count && s == RMR_OK; i++) {
     const rmr_pdf_page* p = &pages[i];
     if (cancel && cancel(ctx)) {
@@ -211,16 +213,26 @@ rmr_status rmr_linux_pdf_incremental(
     }
 
     rmr_rect r = p->source_rect;
-    if (!p->marks || !isfinite(r.x) || !isfinite(r.y) || !isfinite(r.width) ||
-        !isfinite(r.height) || r.width <= 0 || r.height <= 0) {
+    if ((!marks && !p->marks) || !isfinite(r.x) || !isfinite(r.y) ||
+        !isfinite(r.width) || !isfinite(r.height) || r.width <= 0 ||
+        r.height <= 0) {
       s = RMR_ERR_INVALID_ARGUMENT;
       break;
     }
 
-    if (!rmr_plan_count(p->marks)) continue;
+    const rmr_plan* plan = nullptr;
+    s = rmr_pdf_marks_acquire(marks, pages, i, &plan, e);
+    reported = s != RMR_OK;
+    if (s != RMR_OK) break;
+    if (!rmr_plan_count(plan)) {
+      rmr_pdf_marks_release(marks, i);
+      continue;
+    }
     rmr_transform t = inverse(placement(source->geometry[i], p));
-    s = rmr_linux_pdf_sheets(&p->marks, &p->sheet, 1, &l, cancel, ctx,
-                             &pdfs[used], e);
+    s = rmr_linux_pdf_sheets(&plan, &p->sheet, 1, &l, cancel, ctx, &pdfs[used],
+                             e);
+    rmr_pdf_marks_release(marks, i);
+    reported = s != RMR_OK;
     if (s != RMR_OK) break;
     if (pdfs[used].size > l.maximum_plan_bytes) {
       s = RMR_ERR_LIMIT;
@@ -245,7 +257,6 @@ rmr_status rmr_linux_pdf_incremental(
     used++;
   }
 
-  bool reported = false;
   if (s == RMR_OK) {
     s = rmr_pdf_incremental(source->data.bytes, source->data.size, overlays,
                             used, &l, cancel, ctx, out, report, e);
@@ -258,6 +269,14 @@ rmr_status rmr_linux_pdf_incremental(
   return s == RMR_OK || reported
              ? s
              : rmr_linux_error(e, s, "incremental PDF export failed");
+}
+
+rmr_status rmr_linux_pdf_incremental(
+    const rmr_linux_pdf_source* source, const rmr_pdf_page* pages, size_t count,
+    const rmr_limits* limits, rmr_cancel_fn cancel, void* ctx, rmr_buffer* out,
+    rmr_pdf_incremental_report* report, rmr_error* e) {
+  return rmr_linux_pdf_incremental_marks(source, pages, count, nullptr, limits,
+                                         cancel, ctx, out, report, e);
 }
 
 typedef struct {
@@ -456,11 +475,13 @@ static rmr_status navigation_collect(navigation* n, FPDF_DOCUMENT src,
   return RMR_OK;
 }
 
-rmr_status rmr_linux_pdf_overlay(const rmr_linux_pdf_source* source,
-                                 const rmr_pdf_page* pages, size_t count,
-                                 const rmr_limits* given, rmr_cancel_fn cancel,
-                                 void* ctx, rmr_buffer* out,
-                                 rmr_pdf_report* report, rmr_error* e) {
+rmr_status rmr_linux_pdf_overlay_marks(const rmr_linux_pdf_source* source,
+                                       const rmr_pdf_page* pages, size_t count,
+                                       const rmr_pdf_marks* provider,
+                                       const rmr_limits* given,
+                                       rmr_cancel_fn cancel, void* ctx,
+                                       rmr_buffer* out, rmr_pdf_report* report,
+                                       rmr_error* e) {
   if (!pages || !count || !out)
     return rmr_linux_error(e, RMR_ERR_INVALID_ARGUMENT, "missing PDF pages");
 
@@ -470,6 +491,7 @@ rmr_status rmr_linux_pdf_overlay(const rmr_linux_pdf_source* source,
 
   rmr_buffer result = {0};
   rmr_status s = RMR_OK;
+  bool reported = false; /* set once a marks or drawing call has filled e */
   rmr_pdf_report stats = {0};
 
   rmr_pdfium_lock();
@@ -487,15 +509,20 @@ rmr_status rmr_linux_pdf_overlay(const rmr_linux_pdf_source* source,
     }
 
     const rmr_pdf_page* p = &pages[i];
-    if (!p->marks ||
+    if ((!provider && !p->marks) ||
         (p->has_source && (!source || p->source_page >= source->count))) {
       s = RMR_ERR_INVALID_ARGUMENT;
       break;
     }
 
+    const rmr_plan* plan = nullptr;
+    s = rmr_pdf_marks_acquire(provider, pages, i, &plan, e);
+    reported = s != RMR_OK;
+    if (s != RMR_OK) break;
     rmr_buffer overlay = {0};
-    s = rmr_linux_render_pdf(&p->marks, &p->sheet, 1, &l, cancel, ctx, &overlay,
-                             e);
+    s = rmr_linux_render_pdf(&plan, &p->sheet, 1, &l, cancel, ctx, &overlay, e);
+    rmr_pdf_marks_release(provider, i);
+    reported = s != RMR_OK;
     if (s != RMR_OK) break;
 
     FPDF_DOCUMENT marks =
@@ -626,7 +653,18 @@ rmr_status rmr_linux_pdf_overlay(const rmr_linux_pdf_source* source,
     if (report) *report = stats;
   } else
     rmr_buffer_free(&result);
-  return s == RMR_OK ? s : rmr_linux_error(e, s, "PDF composition failed");
+  return s == RMR_OK || reported
+             ? s
+             : rmr_linux_error(e, s, "PDF composition failed");
+}
+
+rmr_status rmr_linux_pdf_overlay(const rmr_linux_pdf_source* source,
+                                 const rmr_pdf_page* pages, size_t count,
+                                 const rmr_limits* limits, rmr_cancel_fn cancel,
+                                 void* ctx, rmr_buffer* out,
+                                 rmr_pdf_report* report, rmr_error* e) {
+  return rmr_linux_pdf_overlay_marks(source, pages, count, nullptr, limits,
+                                     cancel, ctx, out, report, e);
 }
 
 const uint8_t* rmr_linux_pdf_source_data(const rmr_linux_pdf_source* s) {
