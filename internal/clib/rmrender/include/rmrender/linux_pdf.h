@@ -65,4 +65,22 @@ rmr_linux_pdf_source_size(const rmr_linux_pdf_source* source, size_t page,
     const rmr_limits* limits, rmr_cancel_fn cancel, void* context,
     rmr_buffer* out, rmr_error* error);
 
+/* rmr_linux_pdf_overlay, _incremental and _recompose drawing the marks as
+ * options say (see rmr_pdf_options in output.h; null selects the defaults,
+ * which the functions without options use). */
+[[nodiscard]] RMR_API rmr_status rmr_linux_pdf_overlay_with_options(
+    const rmr_linux_pdf_source* source, const rmr_pdf_page* pages, size_t count,
+    const rmr_limits* limits, const rmr_pdf_options* options,
+    rmr_cancel_fn cancel, void* context, rmr_buffer* out,
+    rmr_pdf_report* report, rmr_error* error);
+[[nodiscard]] RMR_API rmr_status rmr_linux_pdf_incremental_with_options(
+    const rmr_linux_pdf_source* source, const rmr_pdf_page* pages, size_t count,
+    const rmr_limits* limits, const rmr_pdf_options* options,
+    rmr_cancel_fn cancel, void* context, rmr_buffer* out,
+    rmr_pdf_incremental_report* report, rmr_error* error);
+[[nodiscard]] RMR_API rmr_status rmr_linux_pdf_recompose_with_options(
+    const rmr_linux_pdf_source* source, const rmr_pdf_page* pages, size_t count,
+    const rmr_limits* limits, const rmr_pdf_options* options,
+    rmr_cancel_fn cancel, void* context, rmr_buffer* out, rmr_error* error);
+
 #endif

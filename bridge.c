@@ -253,7 +253,8 @@ rmr_status rmrgo_page_pdf(const rmrgo_request *r, const rm_page *page, rmr_buffe
         s = pdf_sheet(&l, &sheet, e);
     if (s == RMR_OK) {
         const rmr_plan *plans[] = {l.plan};
-        s = NATIVE(pdf_sheets)(plans, &sheet, 1, &r->limits, cancelled, r->cancel, out, e);
+        s = NATIVE(pdf_sheets_with_options)(plans, &sheet, 1, &r->limits, &r->pdf, cancelled,
+                                            r->cancel, out, e);
     }
     layout_free(&l);
     return s;
@@ -649,16 +650,19 @@ rmr_status rmrgo_document_pdf(const rmrgo_request *r, rmrgo_document *d, uint32_
     rmr_status s;
     switch (mode) {
     case RMRGO_PDF_FRESH:
-        s = NATIVE(document_pdf)(d->document, &res, r->fonts, r->paper, maximum_pages, &r->limits,
-                                 cancelled, r->cancel, out, report, e);
+        s = NATIVE(document_pdf_with_options)(d->document, &res, r->fonts, r->paper, maximum_pages,
+                                              &r->limits, &r->pdf, cancelled, r->cancel, out,
+                                              report, e);
         break;
     case RMRGO_PDF_PRESERVING:
-        s = NATIVE(document_pdf_preserving)(d->document, &res, r->fonts, r->paper, maximum_pages,
-                                            &r->limits, cancelled, r->cancel, out, report, e);
+        s = NATIVE(document_pdf_preserving_with_options)(d->document, &res, r->fonts, r->paper,
+                                                         maximum_pages, &r->limits, &r->pdf,
+                                                         cancelled, r->cancel, out, report, e);
         break;
     case RMRGO_PDF_RECOMPOSED:
-        s = NATIVE(document_pdf_recomposed)(d->document, &res, r->fonts, r->paper, maximum_pages,
-                                            &r->limits, cancelled, r->cancel, out, report, e);
+        s = NATIVE(document_pdf_recomposed_with_options)(d->document, &res, r->fonts, r->paper,
+                                                         maximum_pages, &r->limits, &r->pdf,
+                                                         cancelled, r->cancel, out, report, e);
         break;
     default:
         s = fail(e, RMR_ERR_INVALID_ARGUMENT, "unknown PDF mode");

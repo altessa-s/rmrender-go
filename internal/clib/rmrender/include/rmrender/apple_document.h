@@ -13,8 +13,9 @@
  * and fonts stay explicit. Imported PDF pages use native point sizing; notebook
  * pages use paper. No source file is changed. Parsing errors fail the
  * operation; recoverable parser losses are counted in report. Dependency/native
- * allocations are outside portable plan accounting; aggregate retained plans
- * share limits. */
+ * allocations are outside portable plan accounting. Each page is planned as it
+ * is drawn and its plan freed after, so maximum_plan_bytes bounds one page's
+ * plan rather than the document's. */
 [[nodiscard]] RMR_API rmr_status rmr_apple_document_pdf(
     const rmr_archive_document* document, const rmr_page_resources* resources,
     const rmr_apple_fonts* fonts, rmr_paper paper, size_t maximum_pages,
@@ -55,5 +56,27 @@
     double raster_dpi, const rmr_limits* limits, rmr_cancel_fn cancel,
     void* context, rmr_svg_pages* out, rmr_document_report* report,
     rmr_error* error);
+
+/* rmr_apple_document_pdf, _preserving and _recomposed drawing the marks as
+ * options say (see rmr_pdf_options in output.h; null selects the defaults,
+ * which the functions without options use). */
+[[nodiscard]] RMR_API rmr_status rmr_apple_document_pdf_with_options(
+    const rmr_archive_document* document, const rmr_page_resources* resources,
+    const rmr_apple_fonts* fonts, rmr_paper paper, size_t maximum_pages,
+    const rmr_limits* limits, const rmr_pdf_options* options,
+    rmr_cancel_fn cancel, void* context, rmr_buffer* out,
+    rmr_document_report* report, rmr_error* error);
+[[nodiscard]] RMR_API rmr_status rmr_apple_document_pdf_preserving_with_options(
+    const rmr_archive_document* document, const rmr_page_resources* resources,
+    const rmr_apple_fonts* fonts, rmr_paper paper, size_t maximum_pages,
+    const rmr_limits* limits, const rmr_pdf_options* options,
+    rmr_cancel_fn cancel, void* context, rmr_buffer* out,
+    rmr_document_report* report, rmr_error* error);
+[[nodiscard]] RMR_API rmr_status rmr_apple_document_pdf_recomposed_with_options(
+    const rmr_archive_document* document, const rmr_page_resources* resources,
+    const rmr_apple_fonts* fonts, rmr_paper paper, size_t maximum_pages,
+    const rmr_limits* limits, const rmr_pdf_options* options,
+    rmr_cancel_fn cancel, void* context, rmr_buffer* out,
+    rmr_document_report* report, rmr_error* error);
 
 #endif

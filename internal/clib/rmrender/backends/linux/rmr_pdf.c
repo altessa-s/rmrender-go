@@ -8,6 +8,7 @@
 #include <rmrender/linux_pdf.h>
 
 #include "../../src/rmr_pdf_edit.h"
+#include "../common/rmr_pdf_options.h"
 #include "rmr_linux_internal.h"
 #include "rmr_pdf_platform.h"
 
@@ -173,11 +174,14 @@ static rmr_rect box(rmr_transform t, double w, double h) {
 
 rmr_status rmr_linux_pdf_incremental_marks(
     const rmr_linux_pdf_source* source, const rmr_pdf_page* pages, size_t count,
-    const rmr_pdf_marks* marks, const rmr_limits* given, rmr_cancel_fn cancel,
-    void* ctx, rmr_buffer* out, rmr_pdf_incremental_report* report,
-    rmr_error* e) {
+    const rmr_pdf_marks* marks, const rmr_limits* given,
+    const rmr_pdf_options* given_options, rmr_cancel_fn cancel, void* ctx,
+    rmr_buffer* out, rmr_pdf_incremental_report* report, rmr_error* e) {
   if (!source || !pages || !count || !out)
     return rmr_linux_error(e, RMR_ERR_INVALID_ARGUMENT, "missing PDF pages");
+  rmr_pdf_options options;
+  if (!rmr_pdf_options_read(given_options, &options))
+    return rmr_linux_error(e, RMR_ERR_INVALID_ARGUMENT, "invalid PDF options");
   if (count != source->count)
     return rmr_linux_error(e, RMR_ERR_UNSUPPORTED,
                            "incremental output preserves page count/order");
@@ -229,8 +233,8 @@ rmr_status rmr_linux_pdf_incremental_marks(
       continue;
     }
     rmr_transform t = inverse(placement(source->geometry[i], p));
-    s = rmr_linux_pdf_sheets(&plan, &p->sheet, 1, &l, cancel, ctx, &pdfs[used],
-                             e);
+    s = rmr_linux_pdf_sheets_with_options(&plan, &p->sheet, 1, &l, &options,
+                                          cancel, ctx, &pdfs[used], e);
     rmr_pdf_marks_release(marks, i);
     reported = s != RMR_OK;
     if (s != RMR_OK) break;
@@ -276,7 +280,16 @@ rmr_status rmr_linux_pdf_incremental(
     const rmr_limits* limits, rmr_cancel_fn cancel, void* ctx, rmr_buffer* out,
     rmr_pdf_incremental_report* report, rmr_error* e) {
   return rmr_linux_pdf_incremental_marks(source, pages, count, nullptr, limits,
-                                         cancel, ctx, out, report, e);
+                                         nullptr, cancel, ctx, out, report, e);
+}
+
+rmr_status rmr_linux_pdf_incremental_with_options(
+    const rmr_linux_pdf_source* source, const rmr_pdf_page* pages, size_t count,
+    const rmr_limits* limits, const rmr_pdf_options* options,
+    rmr_cancel_fn cancel, void* ctx, rmr_buffer* out,
+    rmr_pdf_incremental_report* report, rmr_error* e) {
+  return rmr_linux_pdf_incremental_marks(source, pages, count, nullptr, limits,
+                                         options, cancel, ctx, out, report, e);
 }
 
 typedef struct {
@@ -475,15 +488,16 @@ static rmr_status navigation_collect(navigation* n, FPDF_DOCUMENT src,
   return RMR_OK;
 }
 
-rmr_status rmr_linux_pdf_overlay_marks(const rmr_linux_pdf_source* source,
-                                       const rmr_pdf_page* pages, size_t count,
-                                       const rmr_pdf_marks* provider,
-                                       const rmr_limits* given,
-                                       rmr_cancel_fn cancel, void* ctx,
-                                       rmr_buffer* out, rmr_pdf_report* report,
-                                       rmr_error* e) {
+rmr_status rmr_linux_pdf_overlay_marks(
+    const rmr_linux_pdf_source* source, const rmr_pdf_page* pages, size_t count,
+    const rmr_pdf_marks* provider, const rmr_limits* given,
+    const rmr_pdf_options* given_options, rmr_cancel_fn cancel, void* ctx,
+    rmr_buffer* out, rmr_pdf_report* report, rmr_error* e) {
   if (!pages || !count || !out)
     return rmr_linux_error(e, RMR_ERR_INVALID_ARGUMENT, "missing PDF pages");
+  rmr_pdf_options options;
+  if (!rmr_pdf_options_read(given_options, &options))
+    return rmr_linux_error(e, RMR_ERR_INVALID_ARGUMENT, "invalid PDF options");
 
   rmr_limits l = given ? *given : rmr_limits_default();
   if (count > l.maximum_draws || count > INT_MAX)
@@ -520,15 +534,22 @@ rmr_status rmr_linux_pdf_overlay_marks(const rmr_linux_pdf_source* source,
     reported = s != RMR_OK;
     if (s != RMR_OK) break;
     rmr_buffer overlay = {0};
-    s = rmr_linux_render_pdf(&plan, &p->sheet, 1, &l, cancel, ctx, &overlay, e);
+    s = rmr_linux_render_pdf(&plan, &p->sheet, 1, &l, options.grain, cancel,
+                             ctx, &overlay, e);
     rmr_pdf_marks_release(provider, i);
     reported = s != RMR_OK;
     if (s != RMR_OK) break;
 
+    /* The page is composed in a document of its own, then imported: content
+     * generation walks every object of the document holding the page, so
+     * composing it in dest would cost the whole output so far, page after
+     * page. */
     FPDF_DOCUMENT marks =
         FPDF_LoadMemDocument64(overlay.bytes, overlay.size, nullptr);
+    FPDF_DOCUMENT single = FPDF_CreateNewDocument();
     FPDF_PAGE page =
-        FPDFPage_New(dest, (int)i, p->sheet.width, p->sheet.height);
+        single ? FPDFPage_New(single, 0, p->sheet.width, p->sheet.height)
+               : nullptr;
     if (!marks || !page) s = RMR_ERR_BACKEND;
 
     if (s == RMR_OK && p->has_source && p->source_visible) {
@@ -538,7 +559,7 @@ rmr_status rmr_linux_pdf_overlay_marks(const rmr_linux_pdf_source* source,
         s = RMR_ERR_INVALID_ARGUMENT;
       else {
         rmr_transform t = placement(source->geometry[p->source_page], p);
-        s = rmr_pdfium_form(dest, page, src, p->source_page, t);
+        s = rmr_pdfium_form(single, page, src, p->source_page, t);
         FPDF_PAGE original = FPDF_LoadPage(src, (int)p->source_page);
         if (!original)
           s = RMR_ERR_BACKEND;
@@ -615,10 +636,15 @@ rmr_status rmr_linux_pdf_overlay_marks(const rmr_linux_pdf_source* source,
     }
 
     if (s == RMR_OK)
-      s = rmr_pdfium_form(dest, page, marks, 0,
+      s = rmr_pdfium_form(single, page, marks, 0,
                           (rmr_transform){1, 0, 0, 1, 0, 0});
     if (s == RMR_OK && !FPDFPage_GenerateContent(page)) s = RMR_ERR_BACKEND;
     if (page) FPDF_ClosePage(page);
+    int first = 0;
+    if (s == RMR_OK &&
+        !FPDF_ImportPagesByIndex(dest, single, &first, 1, (int)i))
+      s = RMR_ERR_BACKEND;
+    if (single) FPDF_CloseDocument(single);
     if (marks) FPDF_CloseDocument(marks);
     rmr_buffer_free(&overlay);
   }
@@ -664,7 +690,16 @@ rmr_status rmr_linux_pdf_overlay(const rmr_linux_pdf_source* source,
                                  void* ctx, rmr_buffer* out,
                                  rmr_pdf_report* report, rmr_error* e) {
   return rmr_linux_pdf_overlay_marks(source, pages, count, nullptr, limits,
-                                     cancel, ctx, out, report, e);
+                                     nullptr, cancel, ctx, out, report, e);
+}
+
+rmr_status rmr_linux_pdf_overlay_with_options(
+    const rmr_linux_pdf_source* source, const rmr_pdf_page* pages, size_t count,
+    const rmr_limits* limits, const rmr_pdf_options* options,
+    rmr_cancel_fn cancel, void* ctx, rmr_buffer* out, rmr_pdf_report* report,
+    rmr_error* e) {
+  return rmr_linux_pdf_overlay_marks(source, pages, count, nullptr, limits,
+                                     options, cancel, ctx, out, report, e);
 }
 
 const uint8_t* rmr_linux_pdf_source_data(const rmr_linux_pdf_source* s) {

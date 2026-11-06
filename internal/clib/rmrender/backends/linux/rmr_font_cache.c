@@ -14,6 +14,7 @@
 #include <unistd.h>
 #endif
 
+#ifdef _WIN32
 /* Whether path holds only ASCII bytes. */
 static bool ascii(const char* path) {
   for (const char* c = path; *c; c++)
@@ -21,7 +22,6 @@ static bool ascii(const char* path) {
   return true;
 }
 
-#ifdef _WIN32
 /* The 8.3 alias of the existing UTF-8 path in UTF-8, or nullptr when the
  * volume has none. */
 static char* short_path(const char* path) {
@@ -44,13 +44,16 @@ static char* short_path(const char* path) {
 
 char* rmr_font_cache_directory(const char* directory) {
   if (!directory || g_mkdir_with_parents(directory, 0700) != 0) return nullptr;
-  if (ascii(directory)) return g_strdup(directory);
 #ifdef _WIN32
+  if (ascii(directory)) return g_strdup(directory);
   char* alias = short_path(directory);
   if (alias && ascii(alias)) return alias;
   g_free(alias);
-#endif
   return nullptr;
+#else
+  /* Fontconfig and FreeType open POSIX paths as bytes, in any spelling. */
+  return g_strdup(directory);
+#endif
 }
 
 /* Whether path is a regular file of exactly size bytes. */

@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../common/rmr_pdf_options.h"
 #include "rmr_apple_internal.h"
 #include "rmr_pdf_platform.h"
 
@@ -553,10 +554,15 @@ static rmr_status outline_children(const rmr_apple_pdf_source* s,
 
 rmr_status rmr_apple_pdf_overlay_marks(
     const rmr_apple_pdf_source* source, const rmr_pdf_page* pages, size_t count,
-    const rmr_pdf_marks* marks, const rmr_limits* given, rmr_cancel_fn cancel,
-    void* context, rmr_buffer* out, rmr_pdf_report* report, rmr_error* e) {
+    const rmr_pdf_marks* marks, const rmr_limits* given,
+    const rmr_pdf_options* options, rmr_cancel_fn cancel, void* context,
+    rmr_buffer* out, rmr_pdf_report* report, rmr_error* e) {
   if (!pages || !count || !out)
     return fail(e, RMR_ERR_INVALID_ARGUMENT, "missing PDF output pages");
+  /* CoreGraphics draws grain masks straight onto the page either way. */
+  rmr_pdf_options checked;
+  if (!rmr_pdf_options_read(options, &checked))
+    return fail(e, RMR_ERR_INVALID_ARGUMENT, "invalid PDF options");
 
   rmr_limits l = given ? *given : rmr_limits_default();
   if (count > l.maximum_draws || count > INT64_MAX)
@@ -779,7 +785,16 @@ rmr_status rmr_apple_pdf_overlay(const rmr_apple_pdf_source* source,
                                  void* context, rmr_buffer* out,
                                  rmr_pdf_report* report, rmr_error* e) {
   return rmr_apple_pdf_overlay_marks(source, pages, count, nullptr, limits,
-                                     cancel, context, out, report, e);
+                                     nullptr, cancel, context, out, report, e);
+}
+
+rmr_status rmr_apple_pdf_overlay_with_options(
+    const rmr_apple_pdf_source* source, const rmr_pdf_page* pages, size_t count,
+    const rmr_limits* limits, const rmr_pdf_options* options,
+    rmr_cancel_fn cancel, void* context, rmr_buffer* out,
+    rmr_pdf_report* report, rmr_error* e) {
+  return rmr_apple_pdf_overlay_marks(source, pages, count, nullptr, limits,
+                                     options, cancel, context, out, report, e);
 }
 
 /* The incremental writer edits the page tree it parses itself, while sizes and
@@ -819,11 +834,14 @@ static rmr_status agree(const rmr_apple_pdf_source* source,
 
 rmr_status rmr_apple_pdf_incremental_marks(
     const rmr_apple_pdf_source* source, const rmr_pdf_page* pages, size_t count,
-    const rmr_pdf_marks* marks, const rmr_limits* given, rmr_cancel_fn cancel,
-    void* context, rmr_buffer* out, rmr_pdf_incremental_report* report,
-    rmr_error* e) {
+    const rmr_pdf_marks* marks, const rmr_limits* given,
+    const rmr_pdf_options* options, rmr_cancel_fn cancel, void* context,
+    rmr_buffer* out, rmr_pdf_incremental_report* report, rmr_error* e) {
   if (!source || !pages || !out || !count)
     return fail(e, RMR_ERR_INVALID_ARGUMENT, "missing incremental pages");
+  rmr_pdf_options checked;
+  if (!rmr_pdf_options_read(options, &checked))
+    return fail(e, RMR_ERR_INVALID_ARGUMENT, "invalid PDF options");
 
   rmr_limits limits = given ? *given : rmr_limits_default();
   if (count != rmr_apple_pdf_source_count(source))
@@ -939,7 +957,18 @@ rmr_status rmr_apple_pdf_incremental(
     const rmr_limits* limits, rmr_cancel_fn cancel, void* context,
     rmr_buffer* out, rmr_pdf_incremental_report* report, rmr_error* e) {
   return rmr_apple_pdf_incremental_marks(source, pages, count, nullptr, limits,
-                                         cancel, context, out, report, e);
+                                         nullptr, cancel, context, out, report,
+                                         e);
+}
+
+rmr_status rmr_apple_pdf_incremental_with_options(
+    const rmr_apple_pdf_source* source, const rmr_pdf_page* pages, size_t count,
+    const rmr_limits* limits, const rmr_pdf_options* options,
+    rmr_cancel_fn cancel, void* context, rmr_buffer* out,
+    rmr_pdf_incremental_report* report, rmr_error* e) {
+  return rmr_apple_pdf_incremental_marks(source, pages, count, nullptr, limits,
+                                         options, cancel, context, out, report,
+                                         e);
 }
 
 const uint8_t* rmr_apple_pdf_source_data(const rmr_apple_pdf_source* s) {
