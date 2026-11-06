@@ -10,7 +10,7 @@
 #include "export.h"
 #define RMRENDER_VERSION_MAJOR 1
 #define RMRENDER_VERSION_MINOR 4
-#define RMRENDER_VERSION_PATCH 0
+#define RMRENDER_VERSION_PATCH 1
 constexpr double RMR_POINTS_PER_UNIT = 0.317180616;
 
 typedef enum rmr_status : uint32_t {

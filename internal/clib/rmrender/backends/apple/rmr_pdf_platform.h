@@ -9,6 +9,8 @@
 #define RMR_PDF_PLATFORM_H
 #include <rmrender/apple_pdf.h>
 
+#include "../common/rmr_pdf_marks.h"
+
 #define RMR_PDF_NATIVE(name) rmr_apple_##name
 #define RMR_PDF_BYTES rmr_apple_pdf_source_data
 #define RMR_PDF_SIZE rmr_apple_pdf_source_length
@@ -20,5 +22,21 @@ size_t rmr_apple_pdf_source_length(const rmr_apple_pdf_source* s);
 
 /* Fill `e` with `s` and `message`. */
 rmr_status rmr_apple_pdf_fail(rmr_error* e, rmr_status s, const char* message);
+
+/* rmr_apple_pdf_overlay, _incremental and _recompose taking each page's marks
+ * from marks when it is given (pages[i].marks may then be null). */
+RMR_API rmr_status rmr_apple_pdf_overlay_marks(
+    const rmr_apple_pdf_source* source, const rmr_pdf_page* pages, size_t count,
+    const rmr_pdf_marks* marks, const rmr_limits* limits, rmr_cancel_fn cancel,
+    void* context, rmr_buffer* out, rmr_pdf_report* report, rmr_error* error);
+RMR_API rmr_status rmr_apple_pdf_incremental_marks(
+    const rmr_apple_pdf_source* source, const rmr_pdf_page* pages, size_t count,
+    const rmr_pdf_marks* marks, const rmr_limits* limits, rmr_cancel_fn cancel,
+    void* context, rmr_buffer* out, rmr_pdf_incremental_report* report,
+    rmr_error* error);
+RMR_API rmr_status rmr_apple_pdf_recompose_marks(
+    const rmr_apple_pdf_source* source, const rmr_pdf_page* pages, size_t count,
+    const rmr_pdf_marks* marks, const rmr_limits* limits, rmr_cancel_fn cancel,
+    void* context, rmr_buffer* out, rmr_error* error);
 
 #endif

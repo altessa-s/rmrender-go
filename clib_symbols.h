@@ -10,7 +10,7 @@
 // alike, so that the C names stay as written and the linker sees only the
 // prefixed ones: rmlines-go, rmdoc-go and rmmarks-go compile the same
 // libraries under their own names, and one program may link them all.
-// 478 symbols, read with nm from objects of both backends; Windows
+// 484 symbols, read with nm from objects of both backends; Windows
 // compiles the Cairo backend's sources, and its _WIN32 branches add no other.
 
 #ifndef RMRENDER_GO_CLIB_SYMBOLS_H
@@ -281,8 +281,11 @@
 #define rmr_apple_pdf rmrgo_rmr_apple_pdf
 #define rmr_apple_pdf_fail rmrgo_rmr_apple_pdf_fail
 #define rmr_apple_pdf_incremental rmrgo_rmr_apple_pdf_incremental
+#define rmr_apple_pdf_incremental_marks rmrgo_rmr_apple_pdf_incremental_marks
 #define rmr_apple_pdf_overlay rmrgo_rmr_apple_pdf_overlay
+#define rmr_apple_pdf_overlay_marks rmrgo_rmr_apple_pdf_overlay_marks
 #define rmr_apple_pdf_recompose rmrgo_rmr_apple_pdf_recompose
+#define rmr_apple_pdf_recompose_marks rmrgo_rmr_apple_pdf_recompose_marks
 #define rmr_apple_pdf_sheets rmrgo_rmr_apple_pdf_sheets
 #define rmr_apple_pdf_source_count rmrgo_rmr_apple_pdf_source_count
 #define rmr_apple_pdf_source_create rmrgo_rmr_apple_pdf_source_create
@@ -388,8 +391,11 @@
 #define rmr_linux_path_capture rmrgo_rmr_linux_path_capture
 #define rmr_linux_pdf rmrgo_rmr_linux_pdf
 #define rmr_linux_pdf_incremental rmrgo_rmr_linux_pdf_incremental
+#define rmr_linux_pdf_incremental_marks rmrgo_rmr_linux_pdf_incremental_marks
 #define rmr_linux_pdf_overlay rmrgo_rmr_linux_pdf_overlay
+#define rmr_linux_pdf_overlay_marks rmrgo_rmr_linux_pdf_overlay_marks
 #define rmr_linux_pdf_recompose rmrgo_rmr_linux_pdf_recompose
+#define rmr_linux_pdf_recompose_marks rmrgo_rmr_linux_pdf_recompose_marks
 #define rmr_linux_pdf_sheets rmrgo_rmr_linux_pdf_sheets
 #define rmr_linux_pdf_source_count rmrgo_rmr_linux_pdf_source_count
 #define rmr_linux_pdf_source_create rmrgo_rmr_linux_pdf_source_create

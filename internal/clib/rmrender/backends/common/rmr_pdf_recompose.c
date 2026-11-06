@@ -11,18 +11,17 @@
 
 #include "rmr_pdf_platform.h"
 
-rmr_status RMR_PDF_NATIVE(pdf_recompose)(const RMR_PDF_NATIVE(pdf_source) *
-                                             source,
-                                         const rmr_pdf_page* pages,
-                                         size_t count, const rmr_limits* given,
-                                         rmr_cancel_fn cancel, void* context,
-                                         rmr_buffer* out, rmr_error* error) {
+rmr_status RMR_PDF_NATIVE(pdf_recompose_marks)(
+    const RMR_PDF_NATIVE(pdf_source) * source, const rmr_pdf_page* pages,
+    size_t count, const rmr_pdf_marks* marks, const rmr_limits* given,
+    rmr_cancel_fn cancel, void* context, rmr_buffer* out, rmr_error* error) {
   if (!pages || !count || !out)
     return RMR_PDF_FAIL(error, RMR_ERR_INVALID_ARGUMENT,
                         "missing PDF recomposition input");
   if (!source)
-    return RMR_PDF_NATIVE(pdf_overlay)(nullptr, pages, count, given, cancel,
-                                       context, out, nullptr, error);
+    return RMR_PDF_NATIVE(pdf_overlay_marks)(nullptr, pages, count, marks,
+                                             given, cancel, context, out,
+                                             nullptr, error);
 
   rmr_limits limits = given ? *given : rmr_limits_default();
   if (count > limits.maximum_draws ||
@@ -77,9 +76,9 @@ rmr_status RMR_PDF_NATIVE(pdf_recompose)(const RMR_PDF_NATIVE(pdf_source) *
   rmr_buffer_free(&selected);
 
   if (status == RMR_OK)
-    status = RMR_PDF_NATIVE(pdf_incremental)(copy, selected_pages, count,
-                                             &limits, cancel, context, &painted,
-                                             nullptr, error);
+    status = RMR_PDF_NATIVE(pdf_incremental_marks)(
+        copy, selected_pages, count, marks, &limits, cancel, context, &painted,
+        nullptr, error);
   RMR_PDF_NATIVE(pdf_source_free)(copy);
 
   if (status == RMR_OK)
@@ -91,4 +90,14 @@ rmr_status RMR_PDF_NATIVE(pdf_recompose)(const RMR_PDF_NATIVE(pdf_source) *
   free(selected_pages);
   /* Each step has already reported its own failure. */
   return status;
+}
+
+rmr_status RMR_PDF_NATIVE(pdf_recompose)(const RMR_PDF_NATIVE(pdf_source) *
+                                             source,
+                                         const rmr_pdf_page* pages,
+                                         size_t count, const rmr_limits* limits,
+                                         rmr_cancel_fn cancel, void* context,
+                                         rmr_buffer* out, rmr_error* error) {
+  return RMR_PDF_NATIVE(pdf_recompose_marks)(
+      source, pages, count, nullptr, limits, cancel, context, out, error);
 }

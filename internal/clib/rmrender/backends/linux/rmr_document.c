@@ -5,6 +5,7 @@
 #include <rmlines/parser.h>
 #include <rmrender/linux_document.h>
 
+#include "rmr_pdf_platform.h"
 #include "rmr_typography_internal.h"
 
 typedef enum {
@@ -72,6 +73,86 @@ static rmr_status page_svg(const rmr_pdf_page* page, rmr_asset_view pdf,
   return RMR_OK;
 }
 
+/* What a page's marks plan was built from, so it can be rebuilt alike. */
+typedef struct {
+  rmr_point size;
+  rmr_rect viewport;
+} page_shape;
+
+/* Build the marks plan of parsed (a blank sheet when null) at size. Marks over
+ * a source PDF paint no notebook template, as AnnotatedPDFRenderer, and keep a
+ * 5 mm centreline margin; outlines draws typed text as glyph outlines. */
+static rmr_status page_marks(const rm_page* parsed, bool source, bool outlines,
+                             rmr_point size,
+                             const rmr_page_resources* resources,
+                             const rmr_linux_fonts* fonts,
+                             const rmr_limits* limits, rmr_plan** out,
+                             rmr_error* e) {
+  rm_page page = parsed ? *parsed
+                        : (rm_page){.background_visible = true,
+                                    .root_document_visible = true};
+  if (source) page.has_template_name = false;
+  return (outlines ? rmr_linux_page_outline_plan : rmr_linux_page_plan)(
+      &page, size, source ? RMR_EDGE_CENTRELINE : RMR_EDGE_RIBBON,
+      source ? 5 * 72 / 25.4 / RMR_POINTS_PER_UNIT : 0, resources, fonts,
+      limits, out, e);
+}
+
+/* Marks for the PDF writers when some page plans did not fit the document's
+ * plan budget: those pages are parsed and planned again, one at a time, as
+ * they are drawn, from the same inputs as the plan that was dropped, and the
+ * kept plans are freed once drawn, so the writers can use the budget. */
+typedef struct {
+  const rmr_archive_document* document;
+  rmr_pdf_page* pages;
+  const page_shape* shapes;
+  const rmr_page_resources* resources;
+  const rmr_linux_fonts* fonts;
+  const rmr_limits* limits;
+  bool listed, source;
+  rm_page* parsed;
+  rmr_plan* built;
+} rebuild;
+
+/* rmr_pdf_marks acquire: a kept plan, or page i planned again. */
+static rmr_status rebuild_acquire(void* context, size_t i, const rmr_plan** out,
+                                  rmr_error* e) {
+  rebuild* r = context;
+  if (r->pages[i].marks) {
+    *out = r->pages[i].marks;
+    return RMR_OK;
+  }
+
+  rmr_status status =
+      r->listed ? rmr_archive_document_parse_page(r->document, i, &r->parsed, e)
+                : RMR_OK;
+  if (status == RMR_OK)
+    status = page_marks(r->parsed, r->source, false, r->shapes[i].size,
+                        r->resources, r->fonts, r->limits, &r->built, e);
+  rm_page_free(r->parsed);
+  r->parsed = nullptr;
+  if (status != RMR_OK) return status;
+
+  rmr_rect viewport = rmr_plan_viewport(r->built);
+  if (memcmp(&viewport, &r->shapes[i].viewport, sizeof viewport)) {
+    rmr_plan_free(r->built);
+    r->built = nullptr;
+    return rmr_linux_error(e, RMR_ERR_BACKEND,
+                           "page plan changed when rebuilt");
+  }
+  *out = r->built;
+  return RMR_OK;
+}
+
+/* rmr_pdf_marks release: free page i's plan, kept or rebuilt. */
+static void rebuild_release(void* context, size_t i) {
+  rebuild* r = context;
+  rmr_plan_free((rmr_plan*)(uintptr_t)r->pages[i].marks);
+  r->pages[i].marks = nullptr;
+  rmr_plan_free(r->built);
+  r->built = nullptr;
+}
+
 /* Shared implementation behind the three public document-to-PDF entry
  * points and SVG output; lays out every page into a plan and sheet, then
  * dispatches to recompose, incremental, or overlay PDF output according to
@@ -93,7 +174,8 @@ static rmr_status document_pdf(const rmr_archive_document* document,
   rmr_asset_view pdf = rmr_archive_document_pdf(document);
   rmr_linux_pdf_source* source = nullptr;
   rmr_status status = RMR_OK;
-  bool reported = false; /* set once a PDF entry point has filled the error */
+  /* Failures detected here; every inner call has already filled e. */
+  const char* failure = nullptr;
 
   if (pdf.bytes) {
     status =
@@ -107,8 +189,9 @@ static rmr_status document_pdf(const rmr_archive_document* document,
   size_t count = maximum_pages && maximum_pages < total ? maximum_pages : total;
 
   if (!count || count > limits.maximum_draws ||
-      count > limits.maximum_plan_bytes /
-                  (sizeof(rm_page*) + sizeof(rmr_pdf_page))) {
+      count >
+          limits.maximum_plan_bytes /
+              (sizeof(rm_page*) + sizeof(rmr_pdf_page) + sizeof(page_shape))) {
     rmr_linux_pdf_source_free(source);
     return rmr_linux_error(e, count ? RMR_ERR_LIMIT : RMR_ERR_INVALID_ARGUMENT,
                            "document page count invalid");
@@ -116,31 +199,42 @@ static rmr_status document_pdf(const rmr_archive_document* document,
 
   rm_page** parsed = calloc(count, sizeof *parsed);
   rmr_pdf_page* pages = calloc(count, sizeof *pages);
+  page_shape* shapes = calloc(count, sizeof *shapes);
   rmr_buffer* documents =
       mode == SVG_PAGES ? calloc(count, sizeof *documents) : nullptr;
-  if (!parsed || !pages || (mode == SVG_PAGES && !documents)) {
+  if (!parsed || !pages || !shapes || (mode == SVG_PAGES && !documents)) {
     free(parsed);
     free(pages);
+    free(shapes);
     free(documents);
     rmr_linux_pdf_source_free(source);
     return rmr_linux_error(e, RMR_ERR_OUT_OF_MEMORY,
                            "document page allocation failed");
   }
-  remaining.maximum_plan_bytes -= count * (sizeof *parsed + sizeof *pages);
+  remaining.maximum_plan_bytes -=
+      count * (sizeof *parsed + sizeof *pages + sizeof *shapes);
   if (documents) remaining.maximum_plan_bytes -= count * sizeof *documents;
-  size_t produced = 0;
+  /* PDF output keeps page plans while their total fits the plan budget; any
+   * page beyond it is planned again when drawn (see rebuild), so memory stays
+   * bounded by one budget of kept plans plus one page's plan, however long
+   * the document. Each page's plan alone must fit the budget. */
+  size_t produced = 0, kept = 0;
+  bool dropped = false;
+  rebuild again = {};
   rmr_document_report result = {.document_pages = total,
                                 .rendered_pages = count};
 
   for (size_t i = 0; i < count && listed; i++) {
     if (cancel && cancel(context)) {
       status = RMR_ERR_CANCELLED;
+      failure = "document render cancelled";
       goto done;
     }
     status = rmr_archive_document_parse_page(document, i, &parsed[i], e);
     if (status != RMR_OK) goto done;
     if (parsed[i]->skipped_blocks > SIZE_MAX - result.skipped_blocks) {
       status = RMR_ERR_LIMIT;
+      failure = "skipped block count limit";
       goto done;
     }
     result.skipped_blocks += parsed[i]->skipped_blocks;
@@ -163,6 +257,7 @@ static rmr_status document_pdf(const rmr_archive_document* document,
   for (size_t i = 0; i < count; i++) {
     if (cancel && cancel(context)) {
       status = RMR_ERR_CANCELLED;
+      failure = "document render cancelled";
       goto done;
     }
 
@@ -193,23 +288,12 @@ static rmr_status document_pdf(const rmr_archive_document* document,
                            size.y * RMR_POINTS_PER_UNIT};
     }
 
-    // Imported PDF annotations do not paint notebook template backgrounds.
-    // This also applies to inserted sheets, matching AnnotatedPDFRenderer.
-    rm_page annotation = *page;
-    if (source) {
-      annotation.has_template_name = false;
-      page = &annotation;
-    }
-
     rmr_plan* plan = nullptr;
-    status =
-        (mode == SVG_PAGES ? rmr_linux_page_outline_plan : rmr_linux_page_plan)(
-            page, size, source ? RMR_EDGE_CENTRELINE : RMR_EDGE_RIBBON,
-            source ? 5 * 72 / 25.4 / RMR_POINTS_PER_UNIT : 0, &resources, fonts,
-            &remaining, &plan, e);
+    status = page_marks(parsed[i], source, mode == SVG_PAGES, size, &resources,
+                        fonts, &remaining, &plan, e);
     if (status != RMR_OK) goto done;
     pages[i].marks = plan;
-    remaining.maximum_plan_bytes -= rmr_plan_bytes(plan);
+    if (mode == SVG_PAGES) remaining.maximum_plan_bytes -= rmr_plan_bytes(plan);
 
     rmr_rect viewport = rmr_plan_viewport(plan);
     status = source ? rmr_sheet_create(viewport, points.x, points.y,
@@ -238,17 +322,29 @@ static rmr_status document_pdf(const rmr_archive_document* document,
     pages[i].source_page = record.source_page;
     pages[i].has_source = source && record.has_source;
     pages[i].source_visible = page->root_document_visible;
+    shapes[i] = (page_shape){size, viewport};
 
     if (mode == SVG_PAGES) {
       status = page_svg(&pages[i], pdf, raster_dpi, &remaining, produced,
                         cancel, context, &documents[i], e);
-      reported = status != RMR_OK;
       if (status != RMR_OK) goto done;
 
       produced += documents[i].size;
       remaining.maximum_plan_bytes += rmr_plan_bytes(pages[i].marks);
       rmr_plan_free((rmr_plan*)(uintptr_t)pages[i].marks);
       pages[i].marks = nullptr;
+    } else if (rmr_plan_bytes(plan) <= remaining.maximum_plan_bytes - kept) {
+      kept += rmr_plan_bytes(plan);
+    } else {
+      rmr_plan_free(plan);
+      pages[i].marks = nullptr;
+      dropped = true;
+    }
+
+    /* The page is parsed again if its plan has to be rebuilt. */
+    if (mode != SVG_PAGES) {
+      rm_page_free(parsed[i]);
+      parsed[i] = nullptr;
     }
   }
 
@@ -259,16 +355,29 @@ static rmr_status document_pdf(const rmr_archive_document* document,
     goto done;
   }
 
+  /* The writers get what the kept plans leave of the budget, or all of it
+   * when plans are rebuilt, since each plan is then freed once drawn. */
+  rmr_limits output = remaining;
+  if (!dropped) output.maximum_plan_bytes -= kept;
+  again = (rebuild){.document = document,
+                    .pages = pages,
+                    .shapes = shapes,
+                    .resources = &resources,
+                    .fonts = fonts,
+                    .limits = &remaining,
+                    .listed = listed,
+                    .source = source};
+  rmr_pdf_marks provider = {rebuild_acquire, rebuild_release, &again},
+                *marks = dropped ? &provider : nullptr;
   if (mode == PDF_RECOMPOSED && source)
-    status = rmr_linux_pdf_recompose(source, pages, count, &remaining, cancel,
-                                     context, out, e);
+    status = rmr_linux_pdf_recompose_marks(source, pages, count, marks, &output,
+                                           cancel, context, out, e);
   else if (mode == PDF_INCREMENTAL && source)
-    status = rmr_linux_pdf_incremental(source, pages, count, &remaining, cancel,
-                                       context, out, nullptr, e);
+    status = rmr_linux_pdf_incremental_marks(
+        source, pages, count, marks, &output, cancel, context, out, nullptr, e);
   else
-    status = rmr_linux_pdf_overlay(source, pages, count, &remaining, cancel,
-                                   context, out, &result.pdf, e);
-  reported = status != RMR_OK;
+    status = rmr_linux_pdf_overlay_marks(source, pages, count, marks, &output,
+                                         cancel, context, out, &result.pdf, e);
   if (status == RMR_OK && report) *report = result;
 
 done:
@@ -278,12 +387,13 @@ done:
   }
   rmr_svg_pages unused = {documents, documents ? count : 0};
   rmr_svg_pages_free(&unused);
+  rm_page_free(again.parsed);
+  rmr_plan_free(again.built);
   free(parsed);
   free(pages);
+  free(shapes);
   rmr_linux_pdf_source_free(source);
-  return status == RMR_OK || reported
-             ? status
-             : rmr_linux_error(e, status, "document render failed");
+  return failure ? rmr_linux_error(e, status, failure) : status;
 }
 
 rmr_status rmr_linux_document_pdf(
