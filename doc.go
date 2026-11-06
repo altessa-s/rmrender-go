@@ -29,7 +29,8 @@
 // as the document's own PDF lays them out, imported PDF pages beneath their
 // marks, and the whole document as a PDF in each [PDFMode] or as one SVG
 // document per page, with a [Report] of what could not be kept. SVG holds an
-// imported PDF page as a raster, at [Options].PDFRasterDPI.
+// imported PDF page as a raster, at [Options].PDFRasterDPI. A PDF draws
+// grained ink as [Options].PDFGrain says.
 //
 // # Fonts and templates
 //

@@ -24,20 +24,23 @@ const uint8_t* rmr_linux_pdf_source_data(const rmr_linux_pdf_source* s);
  * rmr_linux_pdf_source_data. */
 size_t rmr_linux_pdf_source_length(const rmr_linux_pdf_source* s);
 
-/* rmr_linux_pdf_overlay, _incremental and _recompose taking each page's marks
- * from marks when it is given (pages[i].marks may then be null). */
+/* rmr_linux_pdf_overlay, _incremental and _recompose with options taking each
+ * page's marks from marks when it is given (pages[i].marks may then be
+ * null). */
 RMR_API rmr_status rmr_linux_pdf_overlay_marks(
     const rmr_linux_pdf_source* source, const rmr_pdf_page* pages, size_t count,
-    const rmr_pdf_marks* marks, const rmr_limits* limits, rmr_cancel_fn cancel,
-    void* context, rmr_buffer* out, rmr_pdf_report* report, rmr_error* error);
+    const rmr_pdf_marks* marks, const rmr_limits* limits,
+    const rmr_pdf_options* options, rmr_cancel_fn cancel, void* context,
+    rmr_buffer* out, rmr_pdf_report* report, rmr_error* error);
 RMR_API rmr_status rmr_linux_pdf_incremental_marks(
     const rmr_linux_pdf_source* source, const rmr_pdf_page* pages, size_t count,
-    const rmr_pdf_marks* marks, const rmr_limits* limits, rmr_cancel_fn cancel,
-    void* context, rmr_buffer* out, rmr_pdf_incremental_report* report,
-    rmr_error* error);
+    const rmr_pdf_marks* marks, const rmr_limits* limits,
+    const rmr_pdf_options* options, rmr_cancel_fn cancel, void* context,
+    rmr_buffer* out, rmr_pdf_incremental_report* report, rmr_error* error);
 RMR_API rmr_status rmr_linux_pdf_recompose_marks(
     const rmr_linux_pdf_source* source, const rmr_pdf_page* pages, size_t count,
-    const rmr_pdf_marks* marks, const rmr_limits* limits, rmr_cancel_fn cancel,
-    void* context, rmr_buffer* out, rmr_error* error);
+    const rmr_pdf_marks* marks, const rmr_limits* limits,
+    const rmr_pdf_options* options, rmr_cancel_fn cancel, void* context,
+    rmr_buffer* out, rmr_error* error);
 
 #endif

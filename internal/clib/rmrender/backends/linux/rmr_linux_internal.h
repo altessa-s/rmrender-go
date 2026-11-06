@@ -56,11 +56,12 @@ rmr_status rmr_pdfium_form(FPDF_DOCUMENT dest, FPDF_PAGE page,
                            rmr_transform transform);
 
 /* Renders count plans/sheets into a new multi-page PDF after validating
- * inputs and checking cancel. */
+ * inputs and checking cancel, drawing grained ink as grain says. */
 rmr_status rmr_linux_render_pdf(const rmr_plan* const* plans,
                                 const rmr_sheet* sheets, size_t count,
-                                const rmr_limits* limits, rmr_cancel_fn cancel,
-                                void* context, rmr_buffer* out, rmr_error* e);
+                                const rmr_limits* limits, rmr_pdf_grain grain,
+                                rmr_cancel_fn cancel, void* context,
+                                rmr_buffer* out, rmr_error* e);
 
 /* Builds the single-paragraph Pango layout TEXT commands draw: the fixed
  * sans-serif family at an absolute point size. */

@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../common/rmr_pdf_options.h"
 #include "rmr_apple_internal.h"
 
 /* Fill `e` with `code` and `message`, if non-null; always returns `code`. */
@@ -737,6 +738,31 @@ rmr_status rmr_apple_pdf_sheets(const rmr_plan* const* plans,
                                 void* context, rmr_buffer* out, rmr_error* e) {
   if (!sheets) return error(e, RMR_ERR_INVALID_ARGUMENT, "missing PDF sheets");
   return pdf_impl(plans, sheets, count, 1, limits, cancel, context, out, e);
+}
+
+/* CoreGraphics draws grain masks straight onto the page whatever options say;
+ * they are read only to refuse invalid ones as the Cairo backend does. */
+rmr_status rmr_apple_pdf_with_options(const rmr_plan* const* plans,
+                                      size_t count, double scale,
+                                      const rmr_limits* limits,
+                                      const rmr_pdf_options* options,
+                                      rmr_cancel_fn cancel, void* context,
+                                      rmr_buffer* out, rmr_error* e) {
+  rmr_pdf_options checked;
+  if (!rmr_pdf_options_read(options, &checked))
+    return error(e, RMR_ERR_INVALID_ARGUMENT, "invalid PDF options");
+  return rmr_apple_pdf(plans, count, scale, limits, cancel, context, out, e);
+}
+
+rmr_status rmr_apple_pdf_sheets_with_options(
+    const rmr_plan* const* plans, const rmr_sheet* sheets, size_t count,
+    const rmr_limits* limits, const rmr_pdf_options* options,
+    rmr_cancel_fn cancel, void* context, rmr_buffer* out, rmr_error* e) {
+  rmr_pdf_options checked;
+  if (!rmr_pdf_options_read(options, &checked))
+    return error(e, RMR_ERR_INVALID_ARGUMENT, "invalid PDF options");
+  return rmr_apple_pdf_sheets(plans, sheets, count, limits, cancel, context,
+                              out, e);
 }
 
 rmr_status rmr_apple_draw_context(CGContextRef cg, const rmr_plan* plan,

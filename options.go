@@ -67,6 +67,25 @@ const (
 	PDFRecomposed
 )
 
+// PDFGrain is how PDF output draws grained ink: pencils, brushes and
+// ballpoints, whose 1-bit grain is a stencil mask clipped to the stroke's
+// outline. Translucent ink is drawn in a transparency group either way.
+type PDFGrain int
+
+// The grain drawings. They differ only on the Cairo backend (linux, windows,
+// and darwin with the rmrender_cairo tag); CoreGraphics always draws
+// PDFGrainMask's way and accepts both.
+const (
+	// PDFGrainMask draws opaque ink's stencil straight onto the page: about
+	// half the bytes of PDFGrainGroup, with edges matching the CoreGraphics
+	// backend.
+	PDFGrainMask PDFGrain = iota
+	// PDFGrainGroup wraps each grained stroke in a transparency group of its
+	// own, as the Cairo backend did up to 1.4.1: viewers antialias the
+	// clipped edge twice and draw it lighter.
+	PDFGrainGroup
+)
+
 // Limits bounds what one call may build: counts of points, path elements and
 // draw commands, the bytes of plans, bitmaps and PDFs, the side of a bitmap,
 // and the magnitude of coordinates and widths. They cover memory the C
@@ -165,6 +184,8 @@ type Options struct {
 	// PNG beneath the marks, which stay vectors. Zero means the C library's
 	// default, 150; the most is 10,000, and the bitmap limits apply.
 	PDFRasterDPI float64
+	// PDFGrain is how [PagePDF] and [Document.PDF] draw grained ink.
+	PDFGrain PDFGrain
 	// MaximumPages caps the pages of a document PDF; zero means all.
 	MaximumPages int
 	// Limits bound the work; nil means [DefaultLimits]. MaximumPDFBytes
@@ -188,10 +209,15 @@ func (o *Options) request() (C.rmrgo_request, error) {
 	if o.Edge < EdgeRibbon || o.Edge > EdgeCentreline {
 		return r, errInvalid("unknown edge")
 	}
+	if o.PDFGrain < PDFGrainMask || o.PDFGrain > PDFGrainGroup {
+		return r, errInvalid("unknown PDF grain")
+	}
 	r.paper = C.rmr_paper(o.Paper)
 	r.edge = C.rmr_ink_edge(o.Edge)
 	r.margin = C.double(o.Margin)
 	r.raster_dpi = C.double(o.PDFRasterDPI)
+	r.pdf = C.rmr_pdf_options_default()
+	r.pdf.grain = C.rmr_pdf_grain(o.PDFGrain)
 	r.limits = limits
 	return r, nil
 }

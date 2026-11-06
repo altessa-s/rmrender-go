@@ -8,6 +8,7 @@
 #include <rmrender/pdf.h>
 
 #include "../../src/rmr_pdf_edit.h"
+#include "../common/rmr_pdf_options.h"
 #include "rmr_linux_internal.h"
 
 typedef struct {
@@ -21,6 +22,7 @@ typedef struct {
   rmr_blend blend;
   FPDF_DOCUMENT pdf;
   FPDF_PAGE page;
+  rmr_pdf_grain grain;
   bool dirty, clip_viewport;
 } drawing;
 
@@ -637,14 +639,21 @@ static rmr_status draw(void* ctx, const rmr_draw* d) {
                     d->mask.box.height / (double)mh);
         cairo_pattern_t* pat = cairo_pattern_create_for_surface(mask);
         cairo_pattern_set_filter(pat, CAIRO_FILTER_NEAREST);
-        if (c->pdf) {
+        /* Translucent ink is masked opaque in a group painted at its alpha.
+         * Opaque ink is masked straight onto the page unless grain asks for
+         * the group too: a group repeats the clip inside it, and viewers
+         * antialias the edge twice, lighter than the Apple backend draws it.
+         */
+        bool layered =
+            c->pdf && (d->color.alpha < 1 || c->grain == RMR_PDF_GRAIN_GROUP);
+        if (layered) {
           cairo_push_group(cr);
           cairo_set_source_rgba(cr, d->color.red, d->color.green, d->color.blue,
                                 1);
         }
         cairo_mask(cr, pat);
         cairo_pattern_destroy(pat);
-        if (c->pdf) {
+        if (layered) {
           cairo_pop_group_to_source(cr);
           cairo_paint_with_alpha(cr, d->color.alpha);
         }
@@ -812,8 +821,9 @@ rmr_status rmr_linux_bitmap(const rmr_plan* plan, double scale, rmr_color bg,
 
 rmr_status rmr_linux_render_pdf(const rmr_plan* const* plans,
                                 const rmr_sheet* sheets, size_t count,
-                                const rmr_limits* limits, rmr_cancel_fn cancel,
-                                void* ctx, rmr_buffer* out, rmr_error* e) {
+                                const rmr_limits* limits, rmr_pdf_grain grain,
+                                rmr_cancel_fn cancel, void* ctx,
+                                rmr_buffer* out, rmr_error* e) {
   if (!plans || !sheets || !count || !out)
     return rmr_linux_error(e, RMR_ERR_INVALID_ARGUMENT, "invalid PDF pages");
   if (count > limits->maximum_draws || count > INT_MAX)
@@ -833,9 +843,16 @@ rmr_status rmr_linux_render_pdf(const rmr_plan* const* plans,
       break;
     }
 
-    drawing c = {.limits = *limits, .sheet = sheets[i], .pdf = doc};
-    c.page = FPDFPage_New(doc, (int)i, c.sheet.width, c.sheet.height);
+    /* Pages after the first are composed in a document of their own, then
+     * imported: content generation walks every object of the document
+     * holding the page, which would otherwise grow with each page. */
+    FPDF_DOCUMENT single = i ? FPDF_CreateNewDocument() : doc;
+    drawing c = {
+        .limits = *limits, .sheet = sheets[i], .pdf = single, .grain = grain};
+    c.page = single ? FPDFPage_New(single, 0, c.sheet.width, c.sheet.height)
+                    : nullptr;
     if (!c.page) {
+      if (single && single != doc) FPDF_CloseDocument(single);
       s = RMR_ERR_BACKEND;
       break;
     }
@@ -850,6 +867,13 @@ rmr_status rmr_linux_render_pdf(const rmr_plan* const* plans,
 
     if (s == RMR_OK && !FPDFPage_GenerateContent(c.page)) s = RMR_ERR_BACKEND;
     FPDF_ClosePage(c.page);
+    if (single != doc) {
+      int first = 0;
+      if (s == RMR_OK &&
+          !FPDF_ImportPagesByIndex(doc, single, &first, 1, (int)i))
+        s = RMR_ERR_BACKEND;
+      FPDF_CloseDocument(single);
+    }
   }
 
   if (s == RMR_OK) s = rmr_pdfium_save(doc, limits, out);
@@ -860,22 +884,35 @@ rmr_status rmr_linux_render_pdf(const rmr_plan* const* plans,
 
 /* Serializes count plans/sheets into a single PDF, holding the
  * process-wide PDFium lock for the call. */
-rmr_status rmr_linux_pdf_sheets(const rmr_plan* const* plans,
-                                const rmr_sheet* sheets, size_t count,
-                                const rmr_limits* given, rmr_cancel_fn cancel,
-                                void* ctx, rmr_buffer* out, rmr_error* e) {
+rmr_status rmr_linux_pdf_sheets_with_options(
+    const rmr_plan* const* plans, const rmr_sheet* sheets, size_t count,
+    const rmr_limits* given, const rmr_pdf_options* given_options,
+    rmr_cancel_fn cancel, void* ctx, rmr_buffer* out, rmr_error* e) {
   rmr_limits limits = given ? *given : rmr_limits_default();
+  rmr_pdf_options options;
+  if (!rmr_pdf_options_read(given_options, &options))
+    return rmr_linux_error(e, RMR_ERR_INVALID_ARGUMENT, "invalid PDF options");
   rmr_pdfium_lock();
-  rmr_status s =
-      rmr_linux_render_pdf(plans, sheets, count, &limits, cancel, ctx, out, e);
+  rmr_status s = rmr_linux_render_pdf(plans, sheets, count, &limits,
+                                      options.grain, cancel, ctx, out, e);
   rmr_pdfium_unlock();
   return s;
 }
 
-rmr_status rmr_linux_pdf(const rmr_plan* const* plans, size_t count,
-                         double scale, const rmr_limits* given,
-                         rmr_cancel_fn cancel, void* ctx, rmr_buffer* out,
-                         rmr_error* e) {
+rmr_status rmr_linux_pdf_sheets(const rmr_plan* const* plans,
+                                const rmr_sheet* sheets, size_t count,
+                                const rmr_limits* limits, rmr_cancel_fn cancel,
+                                void* ctx, rmr_buffer* out, rmr_error* e) {
+  return rmr_linux_pdf_sheets_with_options(plans, sheets, count, limits,
+                                           nullptr, cancel, ctx, out, e);
+}
+
+rmr_status rmr_linux_pdf_with_options(const rmr_plan* const* plans,
+                                      size_t count, double scale,
+                                      const rmr_limits* given,
+                                      const rmr_pdf_options* options,
+                                      rmr_cancel_fn cancel, void* ctx,
+                                      rmr_buffer* out, rmr_error* e) {
   if (!plans || !out || !count || !isfinite(scale) || scale <= 0)
     return rmr_linux_error(e, RMR_ERR_INVALID_ARGUMENT, "invalid PDF input");
 
@@ -896,8 +933,16 @@ rmr_status rmr_linux_pdf(const rmr_plan* const* plans, size_t count,
                                           (v.height + v.y) * scale}};
   }
 
-  rmr_status s =
-      rmr_linux_pdf_sheets(plans, sheets, count, &limits, cancel, ctx, out, e);
+  rmr_status s = rmr_linux_pdf_sheets_with_options(
+      plans, sheets, count, &limits, options, cancel, ctx, out, e);
   free(sheets);
   return s;
+}
+
+rmr_status rmr_linux_pdf(const rmr_plan* const* plans, size_t count,
+                         double scale, const rmr_limits* limits,
+                         rmr_cancel_fn cancel, void* ctx, rmr_buffer* out,
+                         rmr_error* e) {
+  return rmr_linux_pdf_with_options(plans, count, scale, limits, nullptr,
+                                    cancel, ctx, out, e);
 }

@@ -5,18 +5,22 @@
 /* Content-addressed font files for Fontconfig, which loads fonts by path. On
  * Windows FreeType and cairo keep loaded files open, so they cannot be deleted
  * while a font map lives; a cache shared by every font map and run keeps the
- * files bounded by the distinct fonts supplied instead. */
+ * files bounded by the distinct fonts supplied instead. Elsewhere only the
+ * empty configuration is kept this way, and only when Fontconfig has no
+ * default one. */
 #ifndef RMR_FONT_CACHE_H
 #define RMR_FONT_CACHE_H
 #include <glib.h>
 #include <stddef.h>
 #include <stdint.h>
 
-/* Creates directory (UTF-8) if missing and returns it in a spelling that
- * Fontconfig and FreeType open through the ANSI file APIs: the path itself
- * when it is ASCII, otherwise its Windows 8.3 alias when that is ASCII. Returns
- * nullptr when the directory cannot be created or has no ASCII spelling. The
- * caller frees the result with g_free. */
+/* Creates directory, with missing parents and mode 0700, and returns it in a
+ * spelling that Fontconfig and FreeType open. On Windows they open UTF-8 paths
+ * through the ANSI file APIs: the path itself when it is ASCII, otherwise its
+ * 8.3 alias when that is ASCII, and nullptr when it has no ASCII spelling.
+ * Elsewhere they open the bytes as given: the path itself. Returns nullptr
+ * when the directory cannot be created. The caller frees the result with
+ * g_free. */
 char* rmr_font_cache_directory(const char* directory);
 
 /* Returns the path of directory/<SHA-256 of bytes>.ttf, which holds bytes. A

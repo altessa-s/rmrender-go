@@ -268,6 +268,11 @@ three modes, which differ only for an imported PDF:
 A page that does not parse fails the call. What could be recovered from is counted in the `Report`: blocks of a page left out, pages that name
 an imported page the PDF does not have, and the links a fresh export could not carry over. `MaximumPages` caps the pages drawn.
 
+`PDFGrain` says how `PDF` and `PagePDF` draw grained ink, pencils, brushes and ballpoints, whose grain is a stencil clipped to the stroke.
+`PDFGrainMask`, the zero value, draws opaque ink's stencil straight onto the page; `PDFGrainGroup` wraps each grained stroke in a transparency
+group of its own, as the Cairo backend did up to 1.4.1, which doubles the PDF's size and draws the edges lighter in most viewers. Translucent
+ink is grouped either way. Only the Cairo backend tells them apart: CoreGraphics always draws the mask way, and its output is the same for both.
+
 ## SVG
 
 ```go
