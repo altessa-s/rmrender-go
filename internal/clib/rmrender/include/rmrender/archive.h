@@ -51,6 +51,17 @@ rmr_archive_document_pdf(const rmr_archive_document* document);
 rmr_archive_document_parse_page(const rmr_archive_document* document,
                                 size_t index, rm_page** out, rmr_error* error);
 
+/* rmr_archive_document_parse_page for a page that may be unreadable (see
+ * rmr_unreadable_policy in output.h): a page whose .rm file RMLines rejects
+ * as malformed, truncated or of an unsupported version is answered as a page
+ * without a blob is, an empty page with its template, and *unreadable
+ * receives the status parsing it failed with (BACKEND or UNSUPPORTED); any
+ * other page leaves RMR_OK there. Allocation failures and limits fail as they
+ * do there. */
+[[nodiscard]] RMR_API rmr_status rmr_archive_document_read_page(
+    const rmr_archive_document* document, size_t index, rm_page** out,
+    rmr_status* unreadable, rmr_error* error);
+
 /* Resolver context for page resources; returns borrowed attachment bytes. */
 RMR_API rmr_status rmr_archive_document_image(void* document, rm_str file,
                                               rmr_asset_view* out);

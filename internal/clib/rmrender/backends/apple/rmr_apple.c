@@ -403,6 +403,14 @@ static rmr_status draw(void* context, const rmr_draw* d) {
     }
   }
 
+  /* Erased away, or no contour to begin with: nothing to paint. Not even a
+   * grain mask: CoreGraphics clips to an empty path as to no path at all, and
+   * would draw the mask's whole rectangle. rmr_pdf_writer.c skips the same. */
+  if (CGPathIsEmpty(path)) {
+    CGPathRelease(path);
+    return RMR_OK;
+  }
+
   CGContextSaveGState(a->cg);
   CGContextSetBlendMode(a->cg, d->blend == RMR_BLEND_DARKEN ? kCGBlendModeDarken
                                : d->blend == RMR_BLEND_MULTIPLY

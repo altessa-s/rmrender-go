@@ -442,9 +442,58 @@ const rmr_document_page *rmrgo_document_page(const rmrgo_document *d, size_t ind
     return rmr_archive_document_page(d->document, index);
 }
 
+// rmr_unreadable_fn: an unreadable page told to the Go callback of the
+// handle in context.
+static void unreadable_page(void *context, size_t page, rmr_status status) {
+    rmrgoUnreadable((uintptr_t)context, page, status);
+}
+
+// The failure of an unreadable page under RMR_UNREADABLE_STRICT, worded and
+// indexed as the document export words and indexes it.
+static rmr_status unreadable_failure(rmr_error *e, rmr_status s, size_t index,
+                                     const rmr_document_page *page) {
+    if (e) {
+        *e = (rmr_error){.code = s, .index = index};
+        snprintf(e->message, sizeof e->message,
+                 "unreadable page %zu (%s): RMLines could not parse it", index,
+                 page && page->id ? page->id : "");
+    }
+    return s;
+}
+
+// *plan with the placeholder's label drawn over the middle of a page of
+// size, as the document export draws it: *plan becomes the two together.
+static rmr_status with_label(const rmrgo_request *r, rmr_point size, bool outlines,
+                             rmr_plan **plan, rmr_error *e) {
+    rmr_rect viewport = rmr_plan_viewport(*plan);
+    rmr_plan *label = nullptr, *both = nullptr;
+    rmr_status s = NATIVE(unreadable_plan)((rmr_rect){-size.x / 2, 0, size.x, size.y}, viewport,
+                                           r->fonts, outlines, &r->limits, &label, e);
+    if (s == RMR_OK) {
+        const rmr_plan *parts[] = {*plan, label};
+        s = rmr_plan_concat(parts, 2, viewport, &r->limits, &both, e);
+    }
+    rmr_plan_free(label);
+    if (s == RMR_OK) {
+        rmr_plan_free(*plan);
+        *plan = both;
+    }
+    return s;
+}
+
+// What the request asks of an unreadable page, and the Go callback of its
+// handle told of each one: the pdf options the document calls are given.
+static rmr_pdf_options told(const rmrgo_request *r) {
+    rmr_pdf_options options = r->pdf;
+    options.on_unreadable = unreadable_page;
+    options.unreadable_context = (void *)r->handle;
+    return options;
+}
+
 // The document's canvas: the first plausible page size in page order, else
 // the declared one. The first page that declares a plausible size decides,
-// so pages are parsed only up to it.
+// so pages are parsed only up to it; an unreadable page declares none, as
+// in the document export.
 static rmr_status document_canvas(rmrgo_document *d, const rmr_limits *limits, rmr_error *e) {
     if (d->has_canvas)
         return RMR_OK;
@@ -453,7 +502,8 @@ static rmr_status document_canvas(rmrgo_document *d, const rmr_limits *limits, r
     size_t listed = rmrgo_document_listed(d);
     for (size_t i = 0; i < listed && !found && s == RMR_OK; i++) {
         rm_page *page = nullptr;
-        s = rmr_archive_document_parse_page(d->document, i, &page, e);
+        rmr_status unreadable = RMR_OK;
+        s = rmr_archive_document_read_page(d->document, i, &page, &unreadable, e);
         if (s != RMR_OK)
             break;
         double w = page->paper_size.width, h = page->paper_size.height;
@@ -477,10 +527,13 @@ static rmr_status document_canvas(rmrgo_document *d, const rmr_limits *limits, r
 
 // One page of a document laid out as the document export lays it out. page
 // receives the parsed page, null for a page with no notebook content.
-// outlines plans typed text as glyph outlines, as the SVG export does.
+// outlines plans typed text as glyph outlines, as the SVG export does. An
+// unreadable page is told to Go and then handled as the request's policy
+// says, as the document export handles it; drawn adds the placeholder's
+// label to the plan, which reading the page's highlights does without.
 static rmr_status document_layout(const rmrgo_request *r, rmrgo_document *d, size_t index,
-                                  bool outlines, rm_page **parsed, rm_page *shown, layout *out,
-                                  rmr_error *e) {
+                                  bool outlines, bool drawn, rm_page **parsed, rm_page *shown,
+                                  layout *out, rmr_error *e) {
     *out = (layout){0};
     *parsed = nullptr;
     if (index >= rmrgo_document_count(d))
@@ -490,13 +543,23 @@ static rmr_status document_layout(const rmrgo_request *r, rmrgo_document *d, siz
         return s;
 
     size_t listed = rmrgo_document_listed(d);
+    rmr_status unreadable = RMR_OK;
     if (listed) {
-        s = rmr_archive_document_parse_page(d->document, index, parsed, e);
+        s = rmr_archive_document_read_page(d->document, index, parsed, &unreadable, e);
         if (s != RMR_OK)
             return s;
     }
+    if (unreadable != RMR_OK) {
+        unreadable_page((void *)r->handle, index, unreadable);
+        if (r->pdf.unreadable == RMR_UNREADABLE_STRICT)
+            return unreadable_failure(e, unreadable, index,
+                                      rmr_archive_document_page(d->document, index));
+    }
+    bool label = unreadable != RMR_OK && r->pdf.unreadable == RMR_UNREADABLE_PLACEHOLDER;
     *shown = *parsed ? **parsed
                      : (rm_page){.background_visible = true, .root_document_visible = true};
+    if (label)
+        shown->has_template_name = false;
 
     rmr_document_page record = listed
                                    ? *rmr_archive_document_page(d->document, index)
@@ -543,6 +606,8 @@ static rmr_status document_layout(const rmrgo_request *r, rmrgo_document *d, siz
         shown, size, d->source ? RMR_EDGE_CENTRELINE : RMR_EDGE_RIBBON,
         d->source ? SOURCE_MARGIN : 0, &res, r->fonts, &r->limits, &out->plan, e);
     rmr_template_document_free(t.document);
+    if (s == RMR_OK && label && drawn)
+        s = with_label(r, size, outlines, &out->plan, e);
     return s;
 }
 
@@ -581,7 +646,7 @@ rmr_status rmrgo_document_bitmap(const rmrgo_request *r, rmrgo_document *d, size
                                  rmr_error *e) {
     rm_page *parsed = nullptr, shown;
     layout l;
-    rmr_status s = document_layout(r, d, index, false, &parsed, &shown, &l, e);
+    rmr_status s = document_layout(r, d, index, false, true, &parsed, &shown, &l, e);
     rmr_sheet sheet;
     if (s == RMR_OK)
         s = bitmap_sheet(&l, scale, &sheet, e);
@@ -603,7 +668,7 @@ rmr_status rmrgo_document_page_svg(const rmrgo_request *r, rmrgo_document *d, si
                                    rmr_buffer *out, rmr_error *e) {
     rm_page *parsed = nullptr, shown;
     layout l;
-    rmr_status s = document_layout(r, d, index, true, &parsed, &shown, &l, e);
+    rmr_status s = document_layout(r, d, index, true, true, &parsed, &shown, &l, e);
     rmr_sheet sheet;
     if (s == RMR_OK)
         s = pdf_sheet(&l, &sheet, e);
@@ -631,7 +696,7 @@ rmr_status rmrgo_document_marks(const rmrgo_request *r, rmrgo_document *d, size_
                                 rmr_page_marks **out, rmr_error *e) {
     rm_page *parsed = nullptr, shown;
     layout l;
-    rmr_status s = document_layout(r, d, index, false, &parsed, &shown, &l, e);
+    rmr_status s = document_layout(r, d, index, false, false, &parsed, &shown, &l, e);
     if (s == RMR_OK) {
         const rmr_document_page *record = rmrgo_document_page(d, index);
         rm_str id = record && record->id ? (rm_str){record->id, strlen(record->id)} : (rm_str){0};
@@ -645,23 +710,24 @@ rmr_status rmrgo_document_marks(const rmrgo_request *r, rmrgo_document *d, size_
 rmr_status rmrgo_document_pdf(const rmrgo_request *r, rmrgo_document *d, uint32_t mode,
                               size_t maximum_pages, rmr_buffer *out, rmr_document_report *report,
                               rmr_error *e) {
+    rmr_pdf_options pdf = told(r);
     templates t;
     rmr_page_resources res = resources(r, &t, d->document);
     rmr_status s;
     switch (mode) {
     case RMRGO_PDF_FRESH:
         s = NATIVE(document_pdf_with_options)(d->document, &res, r->fonts, r->paper, maximum_pages,
-                                              &r->limits, &r->pdf, cancelled, r->cancel, out,
+                                              &r->limits, &pdf, cancelled, r->cancel, out,
                                               report, e);
         break;
     case RMRGO_PDF_PRESERVING:
         s = NATIVE(document_pdf_preserving_with_options)(d->document, &res, r->fonts, r->paper,
-                                                         maximum_pages, &r->limits, &r->pdf,
+                                                         maximum_pages, &r->limits, &pdf,
                                                          cancelled, r->cancel, out, report, e);
         break;
     case RMRGO_PDF_RECOMPOSED:
         s = NATIVE(document_pdf_recomposed_with_options)(d->document, &res, r->fonts, r->paper,
-                                                         maximum_pages, &r->limits, &r->pdf,
+                                                         maximum_pages, &r->limits, &pdf,
                                                          cancelled, r->cancel, out, report, e);
         break;
     default:
@@ -679,6 +745,7 @@ static rmr_status write_output(void *context, const uint8_t *bytes, size_t size)
 rmr_status rmrgo_document_pdf_write(const rmrgo_request *r, rmrgo_document *d, uint32_t mode,
                                     size_t maximum_pages, rmr_document_report *report,
                                     rmr_error *e) {
+    rmr_pdf_options pdf = told(r);
     templates t;
     rmr_page_resources res = resources(r, &t, d->document);
     rmr_output output = {RMR_OUTPUT_ABI, sizeof output, write_output, (void *)r->handle};
@@ -686,17 +753,17 @@ rmr_status rmrgo_document_pdf_write(const rmrgo_request *r, rmrgo_document *d, u
     switch (mode) {
     case RMRGO_PDF_FRESH:
         s = NATIVE(document_pdf_to_output)(d->document, &res, r->fonts, r->paper, maximum_pages,
-                                           &r->limits, &r->pdf, cancelled, r->cancel, &output,
+                                           &r->limits, &pdf, cancelled, r->cancel, &output,
                                            report, e);
         break;
     case RMRGO_PDF_PRESERVING:
         s = NATIVE(document_pdf_preserving_to_output)(d->document, &res, r->fonts, r->paper,
-                                                      maximum_pages, &r->limits, &r->pdf,
+                                                      maximum_pages, &r->limits, &pdf,
                                                       cancelled, r->cancel, &output, report, e);
         break;
     case RMRGO_PDF_RECOMPOSED:
         s = NATIVE(document_pdf_recomposed_to_output)(d->document, &res, r->fonts, r->paper,
-                                                      maximum_pages, &r->limits, &r->pdf,
+                                                      maximum_pages, &r->limits, &pdf,
                                                       cancelled, r->cancel, &output, report, e);
         break;
     default:
@@ -710,9 +777,20 @@ rmr_status rmrgo_document_svg(const rmrgo_request *r, rmrgo_document *d, size_t 
                               rmr_svg_pages *out, rmr_document_report *report, rmr_error *e) {
     templates t;
     rmr_page_resources res = resources(r, &t, d->document);
-    rmr_status s = NATIVE(document_svg)(d->document, &res, r->fonts, r->paper, maximum_pages,
-                                        r->raster_dpi, &r->limits, cancelled, r->cancel, out,
-                                        report, e);
+    rmr_pdf_options pdf = told(r);
+    rmr_status s = NATIVE(document_svg_with_options)(d->document, &res, r->fonts, r->paper,
+                                                     maximum_pages, r->raster_dpi, &r->limits,
+                                                     &pdf, cancelled, r->cancel, out, report, e);
     rmr_template_document_free(t.document);
+    return s;
+}
+
+rmr_status rmrgo_document_check(rmrgo_document *d, size_t index, rmr_status *unreadable,
+                                rmr_error *e) {
+    rm_page *page = nullptr;
+    rmr_status s = rmr_archive_document_read_page(d->document, index, &page, unreadable, e);
+    rm_page_free(page);
+    if (s == RMR_OK && *unreadable != RMR_OK)
+        unreadable_failure(e, *unreadable, index, rmr_archive_document_page(d->document, index));
     return s;
 }

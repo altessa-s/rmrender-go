@@ -10,7 +10,7 @@
 // alike, so that the C names stay as written and the linker sees only the
 // prefixed ones: rmlines-go, rmdoc-go and rmmarks-go compile the same
 // libraries under their own names, and one program may link them all.
-// 557 symbols, read with nm from objects of both backends; Windows
+// 562 symbols, read with nm from objects of both backends; Windows
 // compiles the Cairo backend's sources, and its _WIN32 branches add no other.
 
 #ifndef RMRENDER_GO_CLIB_SYMBOLS_H
@@ -263,6 +263,7 @@
 #define rmr_apple_document_pdf_to_output rmrgo_rmr_apple_document_pdf_to_output
 #define rmr_apple_document_pdf_with_options rmrgo_rmr_apple_document_pdf_with_options
 #define rmr_apple_document_svg rmrgo_rmr_apple_document_svg
+#define rmr_apple_document_svg_with_options rmrgo_rmr_apple_document_svg_with_options
 #define rmr_apple_draw_context rmrgo_rmr_apple_draw_context
 #define rmr_apple_draw_context_range rmrgo_rmr_apple_draw_context_range
 #define rmr_apple_fonts_create rmrgo_rmr_apple_fonts_create
@@ -311,6 +312,7 @@
 #define rmr_apple_text_provider rmrgo_rmr_apple_text_provider
 #define rmr_apple_text_width rmrgo_rmr_apple_text_width
 #define rmr_apple_unit_raster rmrgo_rmr_apple_unit_raster
+#define rmr_apple_unreadable_plan rmrgo_rmr_apple_unreadable_plan
 #define rmr_apple_writer_create rmrgo_rmr_apple_writer_create
 #define rmr_apple_writer_flush rmrgo_rmr_apple_writer_flush
 #define rmr_apple_writer_free rmrgo_rmr_apple_writer_free
@@ -332,6 +334,7 @@
 #define rmr_archive_document_page rmrgo_rmr_archive_document_page
 #define rmr_archive_document_parse_page rmrgo_rmr_archive_document_parse_page
 #define rmr_archive_document_pdf rmrgo_rmr_archive_document_pdf
+#define rmr_archive_document_read_page rmrgo_rmr_archive_document_read_page
 #define rmr_bitmap_free rmrgo_rmr_bitmap_free
 #define rmr_buffer_free rmrgo_rmr_buffer_free
 #define rmr_calloc rmrgo_rmr_calloc
@@ -397,6 +400,7 @@
 #define rmr_linux_document_pdf_to_output rmrgo_rmr_linux_document_pdf_to_output
 #define rmr_linux_document_pdf_with_options rmrgo_rmr_linux_document_pdf_with_options
 #define rmr_linux_document_svg rmrgo_rmr_linux_document_svg
+#define rmr_linux_document_svg_with_options rmrgo_rmr_linux_document_svg_with_options
 #define rmr_linux_error rmrgo_rmr_linux_error
 #define rmr_linux_fonts_create rmrgo_rmr_linux_fonts_create
 #define rmr_linux_fonts_create_directory rmrgo_rmr_linux_fonts_create_directory
@@ -447,6 +451,7 @@
 #define rmr_linux_svg rmrgo_rmr_linux_svg
 #define rmr_linux_text_provider rmrgo_rmr_linux_text_provider
 #define rmr_linux_text_width rmrgo_rmr_linux_text_width
+#define rmr_linux_unreadable_plan rmrgo_rmr_linux_unreadable_plan
 #define rmr_linux_write rmrgo_rmr_linux_write
 #define rmr_locale_create rmrgo_rmr_locale_create
 #define rmr_locale_free rmrgo_rmr_locale_free

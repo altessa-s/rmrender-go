@@ -27,6 +27,38 @@ typedef enum rmr_pdf_grain : uint32_t {
   RMR_PDF_GRAIN_GROUP
 } rmr_pdf_grain;
 
+/* What a document export does with an unreadable page: a page whose .rm file
+ * is in the archive but does not parse, because it is truncated, malformed or
+ * of a version RMLines does not read. A listed page without a .rm file is not
+ * one: the tablet writes none for a page nobody wrote on, and such a page is
+ * always drawn as an empty page on its template. An allocation failure or a
+ * limit met while parsing still fails the export, whatever the policy.
+ *
+ * STRICT, the default, fails the export with the parser's status (BACKEND, or
+ * UNSUPPORTED for a newer version), error.index set to the page's zero-based
+ * place in the document and a message naming it and its ID. BLANK draws the
+ * page as one without a .rm file: an empty page on its template or, over an
+ * imported PDF, the PDF page without marks. PLACEHOLDER draws "Rendering
+ * error" in the middle of the page, dark grey on a light rounded box, its type
+ * 5% of the page's width, in Noto Sans, the face typed text is set in, so that
+ * the label embeds as typed text does: on a plain sheet of the page's size
+ * without its template or, over an imported PDF, on the PDF page without
+ * marks. The label needs the export's fonts; without them the export fails as
+ * a page of typed text does. SVG pages carry it as glyph outlines. */
+typedef enum rmr_unreadable_policy : uint32_t {
+  RMR_UNREADABLE_STRICT,
+  RMR_UNREADABLE_BLANK,
+  RMR_UNREADABLE_PLACEHOLDER
+} rmr_unreadable_policy;
+
+/* Told of an unreadable page by a document export: page is its zero-based
+ * place in the document and status what parsing it failed with. Called once
+ * per unreadable page the export reaches, in page order, on the calling
+ * thread, before the page is drawn or, under STRICT, before the export fails
+ * with it. It must not call back into rmrender. */
+typedef void (*rmr_unreadable_fn)(void* context, size_t page,
+                                  rmr_status status);
+
 /* PDF drawing options for the *_with_options entry points. Start from
  * rmr_pdf_options_default(), which fills abi_version and struct_size, and
  * change the fields needed. A null options pointer selects the defaults. A
@@ -47,9 +79,18 @@ typedef struct {
    * are drawn by CoreGraphics at full precision; the Cairo backend ignores this
    * field. */
   uint32_t decimals;
+  /* Read when struct_size covers them, by the document exports only (PDF in
+   * every mode, and SVG through *_document_svg_with_options): what they do
+   * with an unreadable page (see rmr_unreadable_policy) and, when
+   * on_unreadable is not null, whom they tell of each, with
+   * unreadable_context. */
+  rmr_unreadable_policy unreadable;
+  rmr_unreadable_fn on_unreadable;
+  void* unreadable_context;
 } rmr_pdf_options;
 
-/* {RMR_PDF_OPTIONS_ABI, sizeof(rmr_pdf_options), RMR_PDF_GRAIN_MASK, 0}. */
+/* {RMR_PDF_OPTIONS_ABI, sizeof(rmr_pdf_options), RMR_PDF_GRAIN_MASK, 0,
+ * RMR_UNREADABLE_STRICT, nullptr, nullptr}. */
 RMR_API rmr_pdf_options rmr_pdf_options_default(void);
 
 /* Where the *_to_output entry points write a PDF: write receives the file's

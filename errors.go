@@ -10,6 +10,7 @@ package rmrender
 import "C"
 
 import (
+	"strconv"
 	"strings"
 )
 
@@ -110,6 +111,21 @@ func (e *Error) Unwrap() error {
 		return nil
 	}
 	return e.Err
+}
+
+// UnreadablePageError is the cause of the *Error a call of a [Document]
+// fails with under [UnreadableStrict] when a page's .rm file does not parse:
+// errors.As finds it.
+type UnreadablePageError struct {
+	// Page is the page's place in the document, from 0.
+	Page int
+	// ID is the page's identifier, the name of its .rm file.
+	ID string
+}
+
+// Error names the page.
+func (e *UnreadablePageError) Error() string {
+	return "page " + strconv.Itoa(e.Page) + " (" + e.ID + ") does not parse"
 }
 
 // cError turns a failed C status and the error record beside it into an

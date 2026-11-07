@@ -36,6 +36,10 @@ type call struct {
 	// out receives the file of an export written as it is produced.
 	out *output
 
+	// unreadable holds the pages the call was told do not parse, in the
+	// order it was told of them.
+	unreadable []int
+
 	// err is what the first failed callback failed with.
 	err error
 	// panicked and panicValue keep a callback's panic, recovered before it
@@ -219,6 +223,18 @@ func rmrgoWrite(handle C.uintptr_t, bytes *C.uint8_t, size C.size_t) (status C.r
 		return C.RMR_ERR_BACKEND
 	}
 	return C.RMR_OK
+}
+
+// rmrgoUnreadable is told of a page of a document whose .rm file does not
+// parse, before the call draws it as Options.Unreadable says or fails with
+// it.
+//
+//export rmrgoUnreadable
+func rmrgoUnreadable(handle C.uintptr_t, page C.size_t, _ C.rmr_status) {
+	c := cgo.Handle(handle).Value().(*call)
+	if uint64(page) <= uint64(maxInt) {
+		c.unreadable = append(c.unreadable, int(page))
+	}
 }
 
 // rmrgoImage resolves an image a lone page places, by its file name. A

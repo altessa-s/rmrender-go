@@ -95,4 +95,16 @@ RMR_API rmr_status rmr_linux_page_outline_plan(
     const rmr_page_resources* resources, const rmr_linux_fonts* fonts,
     const rmr_limits* limits, rmr_plan** out, rmr_error* error);
 
+/* The label RMR_UNREADABLE_PLACEHOLDER draws, centred on page (.rm units, y
+ * down) and set in the face typed text is set in at 5% of its width, as a
+ * plan over viewport: its text as an embedded text PDF, as typed text is
+ * drawn, or as glyph outline fills when outlines is set, as SVG output draws
+ * typed text. An empty plan for a page with no area. Exported for the Linux
+ * document library and rmrender-go; not part of the public API. */
+RMR_API rmr_status rmr_linux_unreadable_plan(rmr_rect page, rmr_rect viewport,
+                                             const rmr_linux_fonts* fonts,
+                                             bool outlines,
+                                             const rmr_limits* limits,
+                                             rmr_plan** out, rmr_error* error);
+
 #endif

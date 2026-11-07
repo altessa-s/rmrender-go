@@ -519,11 +519,13 @@ static rmr_status compose_page(void* context, size_t page,
   while (k->next_link < k->nav->link_count &&
          k->nav->links[k->next_link].page == page)
     k->next_link++;
+  /* A page without local links may have no link array to point into. */
+  const rmr_pdf_local_link* links =
+      k->next_link > first ? k->nav->links + first : nullptr;
   if (s == RMR_OK)
     s = rmr_pdf_builder_page(k->builder, page, extra.bytes, extra.size, 0, 0,
-                             marks ? &marks : nullptr, marks ? 1 : 0,
-                             k->nav->links + first, k->next_link - first,
-                             nullptr);
+                             marks ? &marks : nullptr, marks ? 1 : 0, links,
+                             k->next_link - first, nullptr);
   free(extra.bytes);
   return s;
 }

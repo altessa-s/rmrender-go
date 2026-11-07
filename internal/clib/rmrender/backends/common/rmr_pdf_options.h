@@ -28,6 +28,16 @@ static inline bool rmr_pdf_options_read(const rmr_pdf_options* given,
     if (given->decimals > 6) return false;
     out->decimals = given->decimals;
   }
+  if (given->struct_size >=
+      offsetof(rmr_pdf_options, unreadable) + sizeof given->unreadable) {
+    if (given->unreadable > RMR_UNREADABLE_PLACEHOLDER) return false;
+    out->unreadable = given->unreadable;
+  }
+  if (given->struct_size >= offsetof(rmr_pdf_options, unreadable_context) +
+                                sizeof given->unreadable_context) {
+    out->on_unreadable = given->on_unreadable;
+    out->unreadable_context = given->unreadable_context;
+  }
   return true;
 }
 

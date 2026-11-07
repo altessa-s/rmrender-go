@@ -265,8 +265,23 @@ three modes, which differ only for an imported PDF:
 - `PDFRecomposed` writes a new single-revision PDF from the imported one's objects, allowing pages to be reordered, removed or repeated and
   keeping forms and annotations. Existing signatures stop verifying.
 
-A page that does not parse fails the call. What could be recovered from is counted in the `Report`: blocks of a page left out, pages that name
-an imported page the PDF does not have, and the links a fresh export could not carry over. `MaximumPages` caps the pages drawn.
+What could be recovered from is counted in the `Report`: blocks of a page left out, pages that name an imported page the PDF does not have,
+the links a fresh export could not carry over, and unreadable pages. `MaximumPages` caps the pages drawn.
+
+An **unreadable page** is one whose `.rm` file is in the archive but does not parse: truncated, malformed, or of a version the parser does not
+read. (A listed page without a `.rm` file is not one: the tablet writes none for a page nobody wrote on, and it is drawn as an empty page on its
+template.) `Options.Unreadable` says what every call of a `Document` does with it:
+
+| `Unreadable` | Notebook page | Page over an imported PDF | `Report.UnreadablePages` |
+|---|---|---|---|
+| `UnreadableStrict` (zero value) | the call fails with an `*Error` naming the page, its cause an `*UnreadablePageError` | the same | — |
+| `UnreadableBlank` | an empty page on its template, as a page without a `.rm` file | the PDF page without marks | counted |
+| `UnreadablePlaceholder` | a plain sheet of the page's size, no template, "Rendering error" in the middle | the PDF page with the label over it | counted |
+
+The label is dark grey on a light rounded box, its type a twentieth of the page's width, set in Noto Sans, the face typed text is set in, so a
+PDF embeds it as it embeds typed text; it needs `Fonts`. Bitmaps and SVG carry it too, which a text recogniser reads. `CheckPage` answers
+whether one page parses, with the error a strict drawing of it fails with. A page that cannot be parsed for want of memory or past a `Limits`
+bound fails the call whatever the option says.
 
 `WritePDF` writes the same file to an `io.Writer` as it is produced instead of answering it whole, so a long document's PDF need not fit in
 memory twice, or at all: the bytes are those of `PDF`, handed to the writer in order in pieces of at most 4 MiB, on the calling goroutine. A
@@ -438,7 +453,8 @@ such as decoding one image, is not interrupted.
 Every failure is an `*Error` whose `Status` mirrors the C library's, matched with `errors.Is` against the sentinels: `ErrInvalidArgument`,
 `ErrOutOfMemory`, `ErrLimit`, `ErrUnsupported`, `ErrBackend` and `ErrCancelled`. Beside the status, it carries the C library's message, the
 `Index` of the input it concerns where there is one, and in `Err` what reading a font, template or image failed with. A page that does not
-parse is `StatusBackend`, or `StatusUnsupported` for a format generation the parser does not read, as in the document export; an archive that
+parse is `StatusBackend`, or `StatusUnsupported` for a format generation the parser does not read, as in the document export, and a page of a
+`Document` that does not parse has an `*UnreadablePageError` for its cause and its place for `Index`; an archive that
 is not one is `StatusInvalidArgument`. `Limits` bound points, path elements, draw commands, plan, bitmap and PDF bytes, bitmap sides,
 coordinates and widths, and the PDF byte limit bounds SVG output too; `DefaultLimits` answers the C library's defaults, and a call over one
 fails with `StatusLimit`.

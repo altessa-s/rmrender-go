@@ -63,8 +63,13 @@ const char* rmr_status_string(rmr_status s) {
 }
 
 rmr_pdf_options rmr_pdf_options_default(void) {
-  return (rmr_pdf_options){RMR_PDF_OPTIONS_ABI, sizeof(rmr_pdf_options),
-                           RMR_PDF_GRAIN_MASK, 0};
+  return (rmr_pdf_options){RMR_PDF_OPTIONS_ABI,
+                           sizeof(rmr_pdf_options),
+                           RMR_PDF_GRAIN_MASK,
+                           0,
+                           RMR_UNREADABLE_STRICT,
+                           nullptr,
+                           nullptr};
 }
 
 rmr_limits rmr_limits_default(void) {
