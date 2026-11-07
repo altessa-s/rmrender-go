@@ -28,6 +28,13 @@ rmr_status rmr_apple_draw_context_range(
     const rmr_sheet* sheet, const rmr_limits* limits, rmr_apple_mask_fn masks,
     void* masks_context, rmr_cancel_fn cancel, void* context, rmr_error* error);
 
+/* rmr_apple_pdf_sheets for one page drawing draws first to end - 1 of plan
+ * only, with an optional mask hook. */
+rmr_status rmr_apple_pdf_sheet_range(
+    const rmr_plan* plan, size_t first, size_t end, const rmr_sheet* sheet,
+    const rmr_limits* limits, rmr_apple_mask_fn masks, void* masks_context,
+    rmr_cancel_fn cancel, void* context, rmr_buffer* out, rmr_error* error);
+
 /* Builds the Helvetica CoreText line TEXT commands draw, for utf8/size at
  * font_size in color. */
 rmr_status rmr_apple_text_line(const char* utf8, size_t size, double font_size,

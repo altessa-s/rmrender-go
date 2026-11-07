@@ -10,7 +10,7 @@
 // alike, so that the C names stay as written and the linker sees only the
 // prefixed ones: rmlines-go, rmdoc-go and rmmarks-go compile the same
 // libraries under their own names, and one program may link them all.
-// 562 symbols, read with nm from objects of both backends; Windows
+// 569 symbols, read with nm from objects of both backends; Windows
 // compiles the Cairo backend's sources, and its _WIN32 branches add no other.
 
 #ifndef RMRENDER_GO_CLIB_SYMBOLS_H
@@ -297,6 +297,7 @@
 #define rmr_apple_pdf_recompose rmrgo_rmr_apple_pdf_recompose
 #define rmr_apple_pdf_recompose_marks rmrgo_rmr_apple_pdf_recompose_marks
 #define rmr_apple_pdf_recompose_with_options rmrgo_rmr_apple_pdf_recompose_with_options
+#define rmr_apple_pdf_sheet_range rmrgo_rmr_apple_pdf_sheet_range
 #define rmr_apple_pdf_sheets rmrgo_rmr_apple_pdf_sheets
 #define rmr_apple_pdf_sheets_with_options rmrgo_rmr_apple_pdf_sheets_with_options
 #define rmr_apple_pdf_source_count rmrgo_rmr_apple_pdf_source_count
@@ -305,6 +306,7 @@
 #define rmr_apple_pdf_source_free rmrgo_rmr_apple_pdf_source_free
 #define rmr_apple_pdf_source_length rmrgo_rmr_apple_pdf_source_length
 #define rmr_apple_pdf_source_size rmrgo_rmr_apple_pdf_source_size
+#define rmr_apple_pdf_update_marks rmrgo_rmr_apple_pdf_update_marks
 #define rmr_apple_pdf_with_options rmrgo_rmr_apple_pdf_with_options
 #define rmr_apple_svg rmrgo_rmr_apple_svg
 #define rmr_apple_text_error rmrgo_rmr_apple_text_error
@@ -446,6 +448,7 @@
 #define rmr_linux_pdf_source_free rmrgo_rmr_linux_pdf_source_free
 #define rmr_linux_pdf_source_length rmrgo_rmr_linux_pdf_source_length
 #define rmr_linux_pdf_source_size rmrgo_rmr_linux_pdf_source_size
+#define rmr_linux_pdf_update_marks rmrgo_rmr_linux_pdf_update_marks
 #define rmr_linux_pdf_with_options rmrgo_rmr_linux_pdf_with_options
 #define rmr_linux_render_pdf rmrgo_rmr_linux_render_pdf
 #define rmr_linux_svg rmrgo_rmr_linux_svg
@@ -520,6 +523,10 @@
 #define rmr_pdf_text_number rmrgo_rmr_pdf_text_number
 #define rmr_pdf_text_reserve rmrgo_rmr_pdf_text_reserve
 #define rmr_pdf_text_string rmrgo_rmr_pdf_text_string
+#define rmr_pdf_update_create rmrgo_rmr_pdf_update_create
+#define rmr_pdf_update_finish rmrgo_rmr_pdf_update_finish
+#define rmr_pdf_update_free rmrgo_rmr_pdf_update_free
+#define rmr_pdf_update_page rmrgo_rmr_pdf_update_page
 #define rmr_pdfium_form rmrgo_rmr_pdfium_form
 #define rmr_pdfium_lock rmrgo_rmr_pdfium_lock
 #define rmr_pdfium_raw_transform rmrgo_rmr_pdfium_raw_transform

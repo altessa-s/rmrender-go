@@ -538,29 +538,6 @@ void rmr_pdf_pipeline_free(rmr_pdf_pipeline* p) {
   free(p);
 }
 
-/* MurmurHash3's 64-bit finalizer. */
-static uint64_t mix(uint64_t x) {
-  x ^= x >> 33;
-  x *= 0xff51afd7ed558ccdu;
-  x ^= x >> 33;
-  x *= 0xc4ceb9fe1a85ec53u;
-  x ^= x >> 33;
-  return x;
-}
-
-rmr_pdf_digest rmr_pdf_hash(const uint8_t* bytes, size_t size, uint64_t seed) {
-  uint64_t a = mix(seed ^ (uint64_t)size), b = mix(~seed + (uint64_t)size);
-  size_t i = 0;
-  for (; i + 8 <= size; i += 8) {
-    uint64_t w = 0;
-    for (unsigned k = 0; k < 8; k++) w |= (uint64_t)bytes[i + k] << (8 * k);
-    a = mix(a ^ w) + 0x9e3779b97f4a7c15u;
-    b = mix(b + w * 0xbf58476d1ce4e5b9u) ^ (b >> 17);
-  }
-  uint64_t tail = 0;
-  for (unsigned k = 0; i + k < size; k++)
-    tail |= (uint64_t)bytes[i + k] << (8 * k);
-  a = mix(a ^ tail ^ 0x94d049bb133111ebu);
-  b = mix(b + tail * 0x2545f4914f6cdd1du);
-  return (rmr_pdf_digest){a, b};
+rmr_pdf_digest rmr_pdf_hash(const uint8_t* bytes, size_t size) {
+  return rmr_sha256_of(bytes, size);
 }

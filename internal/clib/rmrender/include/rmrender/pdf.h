@@ -41,12 +41,14 @@ typedef struct {
  * structures and non-unit /UserUnit. Never silently redraws. New revisions are
  * not signed. Input and result each bounded by maximum_pdf_bytes; parser/import
  * scratch by maximum_plan_bytes, object/work count by maximum_elements, pages
- * by maximum_draws. Inputs are borrowed only for this call. Zero overlays
- * returns an exact copy. Overlay PDFs need a single unrotated page with one
- * content stream (an indirect /Length is supported); objects packed in object
- * streams are imported. Overlay PDFs must be trusted renderer output, not
- * arbitrary third-party files; their object graph is imported, including
- * actions if present. */
+ * by maximum_draws. The source's parse and each overlay's import are bounded
+ * separately, each overlay's released once it is written, so that a long
+ * document costs no more per page than its own overlay. Inputs are borrowed
+ * only for this call. Zero overlays returns an exact copy. Overlay PDFs need a
+ * single unrotated page with one content stream (an indirect /Length is
+ * supported); objects packed in object streams are imported. Overlay PDFs must
+ * be trusted renderer output, not arbitrary third-party files; the objects
+ * their page draws with are imported, including actions if present. */
 [[nodiscard]] RMR_API rmr_status rmr_pdf_incremental(
     const uint8_t* source, size_t size, const rmr_pdf_overlay* overlays,
     size_t count, const rmr_limits* limits, rmr_cancel_fn cancel, void* context,

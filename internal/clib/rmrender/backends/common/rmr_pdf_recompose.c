@@ -71,7 +71,7 @@ rmr_status RMR_PDF_NATIVE(pdf_recompose_marks)(
             : "PDF recomposition needs a visible source page on every page");
   }
 
-  rmr_buffer selected = {0}, painted = {0};
+  rmr_buffer selected = {0};
   RMR_PDF_NATIVE(pdf_source)* copy = nullptr;
   status =
       rmr_pdf_select_pages(RMR_PDF_BYTES(source), RMR_PDF_SIZE(source), indices,
@@ -81,18 +81,14 @@ rmr_status RMR_PDF_NATIVE(pdf_recompose_marks)(
                                                &limits, &copy, error);
   rmr_buffer_free(&selected);
 
+  /* The selection rewritten with each page's overlays as they are drawn, as
+   * rmr_pdf_rewrite would rewrite its incremental update, without ever
+   * holding that update: the file goes to output as it is written. */
   if (status == RMR_OK)
-    status = RMR_PDF_NATIVE(pdf_incremental_marks)(
+    status = RMR_PDF_NATIVE(pdf_update_marks)(
         copy, selected_pages, count, marks, &limits, options, cancel, context,
-        nullptr, &painted, nullptr, error);
+        true, output, out, nullptr, error);
   RMR_PDF_NATIVE(pdf_source_free)(copy);
-
-  /* Only the rewrite goes to output as it is written: it reads the whole
-   * painted file, which reads the whole selection. */
-  if (status == RMR_OK)
-    status = rmr_pdf_rewrite_output(painted.bytes, painted.size, &limits,
-                                    cancel, context, output, out, error);
-  rmr_buffer_free(&painted);
 
   free(indices);
   free(selected_pages);
