@@ -13,6 +13,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "../../src/rmr_sha256.h"
+
 /* Room for any number rmr_pdf_number or rmr_pdf_decimal writes. */
 enum { RMR_PDF_NUMBER_SIZE = 400 };
 
@@ -111,10 +113,8 @@ rmr_pdf_batch* rmr_pdf_pipeline_next(rmr_pdf_pipeline* p, bool wait);
  * the workers. Null is a no-op. */
 void rmr_pdf_pipeline_free(rmr_pdf_pipeline* p);
 
-/* 128-bit content hash for deduplicating identical images. */
-typedef struct {
-  uint64_t a, b;
-} rmr_pdf_digest;
-rmr_pdf_digest rmr_pdf_hash(const uint8_t* bytes, size_t size, uint64_t seed);
+/* SHA-256 of size bytes, the key for deduplicating identical images. */
+typedef rmr_sha256_digest rmr_pdf_digest;
+rmr_pdf_digest rmr_pdf_hash(const uint8_t* bytes, size_t size);
 
 #endif

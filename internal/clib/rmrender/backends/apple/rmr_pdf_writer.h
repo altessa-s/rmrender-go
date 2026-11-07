@@ -35,8 +35,9 @@ void rmr_apple_writer_output(rmr_apple_writer* w, const rmr_output* output,
 
 /* Where the writable tail of plan starts: after its last draw only
  * CoreGraphics can serialize (text, images, embedded PDFs, transparency
- * groups), 0 when it has none. A page typically draws its text layer and
- * template labels first and its ink after them. */
+ * groups) that may paint, 0 when it has none. A page typically draws its text
+ * layer and template labels first and its ink after them; a text layer
+ * without glyphs paints nothing, and the writer leaves it out. */
 size_t rmr_apple_writer_split(const rmr_plan* plan);
 
 /* Merged documents: serializes draws first onwards of plan for base page
@@ -48,10 +49,12 @@ rmr_status rmr_apple_writer_page(rmr_apple_writer* w, size_t page,
                                  const rmr_sheet* sheet, rmr_cancel_fn cancel,
                                  void* context, rmr_error* error);
 
-/* Merged documents: the rmr_apple_mask_fn hook for the masks CoreGraphics
- * draws. It records each mask's bytes as the writer's do, in drawing order,
- * so that both give a mask the dimensions first seen with its bytes, as
- * CoreGraphics' image deduplication alone would. context is the writer. */
+/* The rmr_apple_mask_fn hook for the masks CoreGraphics draws. It records
+ * each mask's bytes as the writer's do, in drawing order, so that both give a
+ * mask the dimensions first seen with its bytes, as CoreGraphics' image
+ * deduplication alone would: across a merged document, or across the two
+ * shares of an overlay page, until rmr_apple_writer_overlay takes them.
+ * context is the writer. */
 bool rmr_apple_writer_mask(void* context, const rmr_mask_view* mask,
                            rmr_mask_view* out);
 
@@ -71,11 +74,14 @@ size_t rmr_apple_writer_pages(const rmr_apple_writer* w);
 rmr_status rmr_apple_writer_merge(rmr_apple_writer* w, const uint8_t* base,
                                   size_t size, rmr_buffer* out);
 
-/* Overlays: serializes plan, which rmr_apple_writer_split must start at 0,
- * as a one-page PDF clipped to sheet, as rmr_apple_pdf_sheets draws it, and
- * queues it under tag. */
+/* Overlays: serializes draws first onwards of plan, from where
+ * rmr_apple_writer_split starts, as a one-page PDF clipped to sheet, as
+ * rmr_apple_pdf_sheets draws them, and queues it under tag. When CoreGraphics
+ * drew the draws before first as a page of their own, with
+ * rmr_apple_writer_mask as its mask hook, the two pages drawn one over the
+ * other paint what CoreGraphics' page of the whole plan paints. */
 rmr_status rmr_apple_writer_overlay(rmr_apple_writer* w, size_t tag,
-                                    const rmr_plan* plan,
+                                    const rmr_plan* plan, size_t first,
                                     const rmr_sheet* sheet,
                                     rmr_cancel_fn cancel, void* context,
                                     rmr_error* error);

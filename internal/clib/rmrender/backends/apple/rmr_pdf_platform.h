@@ -40,6 +40,15 @@ RMR_API rmr_status rmr_apple_pdf_incremental_marks(
     const rmr_pdf_options* options, rmr_cancel_fn cancel, void* context,
     const rmr_output* output, rmr_buffer* out,
     rmr_pdf_incremental_report* report, rmr_error* error);
+/* rmr_apple_pdf_incremental_marks, or with fresh set, a fresh rewrite of
+ * the source carrying the same overlays (as rmr_pdf_rewrite would rewrite the
+ * update), each page's overlay written as soon as it is drawn. */
+RMR_API rmr_status rmr_apple_pdf_update_marks(
+    const rmr_apple_pdf_source* source, const rmr_pdf_page* pages, size_t count,
+    const rmr_pdf_marks* marks, const rmr_limits* limits,
+    const rmr_pdf_options* options, rmr_cancel_fn cancel, void* context,
+    bool fresh, const rmr_output* output, rmr_buffer* out,
+    rmr_pdf_incremental_report* report, rmr_error* error);
 RMR_API rmr_status rmr_apple_pdf_recompose_marks(
     const rmr_apple_pdf_source* source, const rmr_pdf_page* pages, size_t count,
     const rmr_pdf_marks* marks, const rmr_limits* limits,

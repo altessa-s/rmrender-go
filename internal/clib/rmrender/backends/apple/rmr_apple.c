@@ -625,11 +625,20 @@ static size_t write_pdf(void* info, const void* bytes, size_t n) {
   return n;
 }
 
-/* Shared implementation behind rmr_apple_pdf and rmr_apple_pdf_sheets. */
+/* Draws first to end - 1 of a page's plan, with a grain mask hook. */
+typedef struct {
+  size_t first, end;
+  rmr_apple_mask_fn masks;
+  void* masks_context;
+} page_range;
+
+/* Shared implementation behind rmr_apple_pdf, rmr_apple_pdf_sheets and
+ * rmr_apple_pdf_sheet_range, which draws range of its one plan. */
 static rmr_status pdf_impl(const rmr_plan* const* plans,
                            const rmr_sheet* sheets, size_t count, double scale,
-                           const rmr_limits* given, rmr_cancel_fn cancel,
-                           void* context, rmr_buffer* out, rmr_error* e) {
+                           const page_range* range, const rmr_limits* given,
+                           rmr_cancel_fn cancel, void* context, rmr_buffer* out,
+                           rmr_error* e) {
   rmr_limits l = given ? *given : rmr_limits_default();
   if (!plans || !count || !out || !isfinite(scale) || scale <= 0)
     return error(e, RMR_ERR_INVALID_ARGUMENT, "invalid PDF arguments");
@@ -692,12 +701,17 @@ static rmr_status pdf_impl(const rmr_plan* const* plans,
 
     CGPDFContextBeginPage(cg, info);
     CFRelease(info);
-    apple_context state = {.cg = cg,
-                           .scale = scale,
-                           .limits = l,
-                           .sheet = sheets ? &sheets[i] : nullptr};
+    apple_context state = {
+        .cg = cg,
+        .scale = scale,
+        .limits = l,
+        .sheet = sheets ? &sheets[i] : nullptr,
+        .masks = range ? range->masks : nullptr,
+        .masks_context = range ? range->masks_context : nullptr};
     rmr_backend b = backend(&state);
-    status = rmr_plan_execute(plans[i], &b, cancel, context, e);
+    status = range ? rmr_plan_execute_range(plans[i], range->first, range->end,
+                                            &b, cancel, context, e)
+                   : rmr_plan_execute(plans[i], &b, cancel, context, e);
     CGPDFContextEndPage(cg);
 
     if (status != RMR_OK || sink.status != RMR_OK) break;
@@ -741,8 +755,8 @@ rmr_status rmr_apple_pdf(const rmr_plan* const* plans, size_t count,
                          double scale, const rmr_limits* limits,
                          rmr_cancel_fn cancel, void* context, rmr_buffer* out,
                          rmr_error* e) {
-  return pdf_impl(plans, nullptr, count, scale, limits, cancel, context, out,
-                  e);
+  return pdf_impl(plans, nullptr, count, scale, nullptr, limits, cancel,
+                  context, out, e);
 }
 
 rmr_status rmr_apple_pdf_sheets(const rmr_plan* const* plans,
@@ -750,7 +764,20 @@ rmr_status rmr_apple_pdf_sheets(const rmr_plan* const* plans,
                                 const rmr_limits* limits, rmr_cancel_fn cancel,
                                 void* context, rmr_buffer* out, rmr_error* e) {
   if (!sheets) return error(e, RMR_ERR_INVALID_ARGUMENT, "missing PDF sheets");
-  return pdf_impl(plans, sheets, count, 1, limits, cancel, context, out, e);
+  return pdf_impl(plans, sheets, count, 1, nullptr, limits, cancel, context,
+                  out, e);
+}
+
+rmr_status rmr_apple_pdf_sheet_range(
+    const rmr_plan* plan, size_t first, size_t end, const rmr_sheet* sheet,
+    const rmr_limits* limits, rmr_apple_mask_fn masks, void* masks_context,
+    rmr_cancel_fn cancel, void* context, rmr_buffer* out, rmr_error* e) {
+  if (!sheet) return error(e, RMR_ERR_INVALID_ARGUMENT, "missing PDF sheets");
+  if (plan && (first > end || end > rmr_plan_count(plan)))
+    return error(e, RMR_ERR_INVALID_ARGUMENT, "invalid PDF draw range");
+  page_range range = {first, end, masks, masks_context};
+  const rmr_plan* plans[] = {plan};
+  return pdf_impl(plans, sheet, 1, 1, &range, limits, cancel, context, out, e);
 }
 
 /* CoreGraphics draws grain masks straight onto the page whatever options say;

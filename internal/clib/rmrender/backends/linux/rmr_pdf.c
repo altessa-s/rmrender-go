@@ -172,11 +172,11 @@ static rmr_rect box(rmr_transform t, double w, double h) {
   return (rmr_rect){left, bottom, right - left, top - bottom};
 }
 
-rmr_status rmr_linux_pdf_incremental_marks(
+rmr_status rmr_linux_pdf_update_marks(
     const rmr_linux_pdf_source* source, const rmr_pdf_page* pages, size_t count,
     const rmr_pdf_marks* marks, const rmr_limits* given,
     const rmr_pdf_options* given_options, rmr_cancel_fn cancel, void* ctx,
-    const rmr_output* output, rmr_buffer* out,
+    bool fresh, const rmr_output* output, rmr_buffer* out,
     rmr_pdf_incremental_report* report, rmr_error* e) {
   if (!source || !pages || !count || (!out && !output))
     return rmr_linux_error(e, RMR_ERR_INVALID_ARGUMENT, "missing PDF pages");
@@ -188,23 +188,16 @@ rmr_status rmr_linux_pdf_incremental_marks(
                            "incremental output preserves page count/order");
 
   rmr_limits l = given ? *given : rmr_limits_default();
-  if (count > l.maximum_draws ||
-      count >
-          l.maximum_plan_bytes / (sizeof(rmr_pdf_overlay) + sizeof(rmr_buffer)))
+  if (count > l.maximum_draws)
     return rmr_linux_error(e, RMR_ERR_LIMIT, "PDF allocation limit");
 
-  rmr_pdf_overlay* overlays = calloc(count, sizeof *overlays);
-  rmr_buffer* pdfs = calloc(count, sizeof *pdfs);
-  if (!overlays || !pdfs) {
-    free(overlays);
-    free(pdfs);
-    return rmr_linux_error(e, RMR_ERR_OUT_OF_MEMORY, "allocation failed");
-  }
-  l.maximum_plan_bytes -= count * (sizeof *overlays + sizeof *pdfs);
-
-  size_t used = 0;
-  rmr_status s = RMR_OK;
-  bool reported = false; /* set once a marks or PDF call has filled e */
+  /* Each page's overlay goes into the update as soon as it is drawn and is
+   * freed then: one overlay is held at a time, however long the document. */
+  rmr_pdf_update* update = nullptr;
+  rmr_status s =
+      rmr_pdf_update_create(source->data.bytes, source->data.size, fresh, &l,
+                            cancel, ctx, output, &update, e);
+  bool reported = s != RMR_OK; /* set once a marks or PDF call has filled e */
   for (size_t i = 0; i < count && s == RMR_OK; i++) {
     const rmr_pdf_page* p = &pages[i];
     if (cancel && cancel(ctx)) {
@@ -234,47 +227,51 @@ rmr_status rmr_linux_pdf_incremental_marks(
       continue;
     }
     rmr_transform t = inverse(placement(source->geometry[i], p));
+    rmr_buffer pdf = {0};
     s = rmr_linux_pdf_sheets_with_options(&plan, &p->sheet, 1, &l, &options,
-                                          cancel, ctx, &pdfs[used], e);
+                                          cancel, ctx, &pdf, e);
     rmr_pdf_marks_release(marks, i);
     reported = s != RMR_OK;
     if (s != RMR_OK) break;
-    if (pdfs[used].size > l.maximum_plan_bytes) {
-      s = RMR_ERR_LIMIT;
-      break;
-    }
-    l.maximum_plan_bytes -= pdfs[used].size;
 
     rmr_rect b = box(t, p->sheet.width, p->sheet.height),
              m = source->geometry[i].media;
     double left = fmin(b.x, m.x), bottom = fmin(b.y, m.y),
            right = fmax(b.x + b.width, m.x + m.width),
            top = fmax(b.y + b.height, m.y + m.height);
-    overlays[used] =
-        (rmr_pdf_overlay){.page = i,
-                          .pdf = pdfs[used].bytes,
-                          .size = pdfs[used].size,
-                          .transform = t,
-                          .replace_box = b.x < m.x - .01 || b.y < m.y - .01 ||
-                                         b.x + b.width > m.x + m.width + .01 ||
-                                         b.y + b.height > m.y + m.height + .01,
-                          .box = {left, bottom, right - left, top - bottom}};
-    used++;
+    rmr_pdf_overlay overlay = {
+        .page = i,
+        .pdf = pdf.bytes,
+        .size = pdf.size,
+        .transform = t,
+        .replace_box = b.x < m.x - .01 || b.y < m.y - .01 ||
+                       b.x + b.width > m.x + m.width + .01 ||
+                       b.y + b.height > m.y + m.height + .01,
+        .box = {left, bottom, right - left, top - bottom}};
+    s = rmr_pdf_update_page(update, &overlay, 1, e);
+    reported = s != RMR_OK;
+    rmr_buffer_free(&pdf);
   }
 
   if (s == RMR_OK) {
-    s = rmr_pdf_incremental_output(source->data.bytes, source->data.size,
-                                   overlays, used, &l, cancel, ctx, output, out,
-                                   report, e);
+    s = rmr_pdf_update_finish(update, out, report, e);
     reported = s != RMR_OK;
   }
-
-  for (size_t i = 0; i < count; i++) rmr_buffer_free(&pdfs[i]);
-  free(pdfs);
-  free(overlays);
+  rmr_pdf_update_free(update);
   return s == RMR_OK || reported
              ? s
              : rmr_linux_error(e, s, "incremental PDF export failed");
+}
+
+rmr_status rmr_linux_pdf_incremental_marks(
+    const rmr_linux_pdf_source* source, const rmr_pdf_page* pages, size_t count,
+    const rmr_pdf_marks* marks, const rmr_limits* limits,
+    const rmr_pdf_options* options, rmr_cancel_fn cancel, void* ctx,
+    const rmr_output* output, rmr_buffer* out,
+    rmr_pdf_incremental_report* report, rmr_error* e) {
+  return rmr_linux_pdf_update_marks(source, pages, count, marks, limits,
+                                    options, cancel, ctx, false, output, out,
+                                    report, e);
 }
 
 rmr_status rmr_linux_pdf_incremental(

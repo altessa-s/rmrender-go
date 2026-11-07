@@ -884,50 +884,76 @@ static rmr_status agree(const rmr_apple_pdf_source* source,
   return RMR_OK;
 }
 
-/* Charges a retained overlay PDF to the plan budget, as an overlay made by
- * rmr_apple_pdf_sheets is. */
-static rmr_status retain(const rmr_buffer* pdf, rmr_limits* limits,
-                         rmr_error* e) {
-  if (pdf->size > limits->maximum_plan_bytes)
-    return fail(e, RMR_ERR_LIMIT, "retained overlay PDF limit");
-  limits->maximum_plan_bytes -= pdf->size;
+/* A page of an update whose overlay is being made: CoreGraphics' share, drawn
+ * at once (empty when it has none), and whether the writer's share is queued
+ * behind it. */
+typedef struct {
+  rmr_pdf_overlay overlay;
+  rmr_buffer native;
+  bool written;
+} pending_page;
+
+/* Pages pending in order, at most window + 1 of them, the oldest at head. */
+typedef struct {
+  pending_page* items;
+  size_t head, count, capacity;
+} pending_pages;
+
+enum { PENDING_WINDOW = 16 };
+
+/* Hands the oldest pending pages to the update, each once its writer's share
+ * is back: every page when all is set, otherwise while more than the window
+ * are pending and then those already back. Failures report as
+ * rmr_apple_pdf_sheets reports them. */
+static rmr_status settle(pending_pages* q, rmr_apple_writer* writer,
+                         rmr_pdf_update* update, bool all, rmr_error* e) {
+  while (q->count) {
+    pending_page* item = &q->items[q->head];
+    rmr_buffer written = {0};
+    if (item->written) {
+      bool wait = all || q->count > PENDING_WINDOW;
+      size_t tag = 0;
+      rmr_status status = RMR_OK;
+      if (!rmr_apple_writer_next_overlay(writer, wait, &written, &tag,
+                                         &status)) {
+        if (status == RMR_OK && !wait) return RMR_OK;
+        return fail(e, status == RMR_OK ? RMR_ERR_BACKEND : status,
+                    "PDF output memory limit or allocation failure");
+      }
+      if (tag != item->overlay.page) {
+        rmr_buffer_free(&written);
+        return fail(e, RMR_ERR_BACKEND, "PDF overlay out of order");
+      }
+    }
+
+    rmr_pdf_overlay parts[2];
+    size_t count = 0;
+    if (item->native.size) {
+      parts[count] = item->overlay;
+      parts[count].pdf = item->native.bytes;
+      parts[count++].size = item->native.size;
+    }
+    if (written.size) {
+      parts[count] = item->overlay;
+      parts[count].pdf = written.bytes;
+      parts[count++].size = written.size;
+    }
+    rmr_status status =
+        count ? rmr_pdf_update_page(update, parts, count, e) : RMR_OK;
+    rmr_buffer_free(&written);
+    rmr_buffer_free(&item->native);
+    q->head = (q->head + 1) % q->capacity;
+    q->count--;
+    if (status != RMR_OK) return status;
+  }
   return RMR_OK;
 }
 
-/* Takes the writer's finished overlays into their slots, oldest first,
- * waiting while more than window are queued; failures report as
- * rmr_apple_pdf_sheets reports them. */
-static rmr_status collect(rmr_apple_writer* writer, rmr_buffer* pdfs,
-                          rmr_pdf_overlay* overlays, size_t window,
-                          rmr_limits* limits, rmr_error* e) {
-  for (;;) {
-    size_t pending = rmr_apple_writer_pending(writer), slot = 0;
-    if (!pending) return RMR_OK;
-    rmr_buffer pdf = {0};
-    rmr_status status = RMR_OK;
-    if (!rmr_apple_writer_next_overlay(writer, pending > window, &pdf, &slot,
-                                       &status)) {
-      if (status == RMR_OK) return RMR_OK;
-      return fail(e, status, "PDF output memory limit or allocation failure");
-    }
-    if (pdf.size > limits->maximum_pdf_bytes) {
-      rmr_buffer_free(&pdf);
-      return fail(e, RMR_ERR_LIMIT,
-                  "PDF output memory limit or allocation failure");
-    }
-    pdfs[slot] = pdf;
-    overlays[slot].pdf = pdf.bytes;
-    overlays[slot].size = pdf.size;
-    status = retain(&pdfs[slot], limits, e);
-    if (status != RMR_OK) return status;
-  }
-}
-
-rmr_status rmr_apple_pdf_incremental_marks(
+rmr_status rmr_apple_pdf_update_marks(
     const rmr_apple_pdf_source* source, const rmr_pdf_page* pages, size_t count,
     const rmr_pdf_marks* marks, const rmr_limits* given,
     const rmr_pdf_options* options, rmr_cancel_fn cancel, void* context,
-    const rmr_output* output, rmr_buffer* out,
+    bool fresh, const rmr_output* output, rmr_buffer* out,
     rmr_pdf_incremental_report* report, rmr_error* e) {
   if (!source || !pages || (!out && !output) || !count)
     return fail(e, RMR_ERR_INVALID_ARGUMENT, "missing incremental pages");
@@ -941,31 +967,35 @@ rmr_status rmr_apple_pdf_incremental_marks(
                 "incremental output preserves page count/order");
 
   if (count > limits.maximum_draws ||
-      count > limits.maximum_plan_bytes /
-                  (sizeof(rmr_pdf_overlay) + sizeof(rmr_buffer) +
-                   sizeof(rmr_pdf_page_geometry)))
+      count > limits.maximum_plan_bytes / sizeof(rmr_pdf_page_geometry))
     return fail(e, RMR_ERR_LIMIT, "incremental page limit");
 
-  rmr_pdf_overlay* overlays = calloc(count, sizeof *overlays);
-  rmr_buffer* pdfs = calloc(count, sizeof *pdfs);
   rmr_pdf_page_geometry* geometry = calloc(count, sizeof *geometry);
-  if (!overlays || !pdfs || !geometry) {
-    free(overlays);
-    free(pdfs);
+  pending_pages queue = {.capacity = PENDING_WINDOW + 2};
+  queue.items = calloc(queue.capacity, sizeof *queue.items);
+  if (!geometry || !queue.items) {
     free(geometry);
+    free(queue.items);
     return fail(e, RMR_ERR_OUT_OF_MEMORY, "incremental page allocation");
   }
 
-  limits.maximum_plan_bytes -=
-      count * (sizeof *overlays + sizeof *pdfs + sizeof *geometry);
-  size_t used = 0;
+  limits.maximum_plan_bytes -= count * sizeof *geometry;
   rmr_status status = agree(source, geometry, count, &limits, e);
-  /* Overlays the writer can serialize come back from it in order, each into
-   * its slot; CoreGraphics renders the others in place. */
+  /* Each page's overlay goes into the update once made, so that at most a
+   * window of them is held however long the document. Of a page's marks,
+   * CoreGraphics draws what only it can, up to the last such draw that
+   * paints, and the writer the rest, in order, on its own page over
+   * CoreGraphics'; a page whose text layer has no glyphs is the writer's
+   * alone. */
   rmr_apple_writer* writer = nullptr;
+  rmr_pdf_update* update = nullptr;
   if (status == RMR_OK && rmr_apple_writer_create(&limits, checked.decimals,
                                                   false, &writer) != RMR_OK)
     status = fail(e, RMR_ERR_OUT_OF_MEMORY, "incremental page allocation");
+  if (status == RMR_OK)
+    status = rmr_pdf_update_create(
+        CFDataGetBytePtr(source->data), (size_t)CFDataGetLength(source->data),
+        fresh, &limits, cancel, context, output, &update, e);
 
   for (size_t i = 0; status == RMR_OK && i < count; i++) {
     const rmr_pdf_page* p = &pages[i];
@@ -1007,18 +1037,6 @@ rmr_status rmr_apple_pdf_incremental_marks(
     }
 
     t = CGAffineTransformInvert(t);
-    bool queued = !rmr_apple_writer_split(plan);
-    status = queued ? rmr_apple_writer_overlay(writer, used, plan, &p->sheet,
-                                               cancel, context, e)
-                    : rmr_apple_pdf_sheets(&plan, &p->sheet, 1, &limits, cancel,
-                                           context, &pdfs[used], e);
-    rmr_pdf_marks_release(marks, i);
-
-    if (status != RMR_OK) break;
-    status = queued ? collect(writer, pdfs, overlays, 16, &limits, e)
-                    : retain(&pdfs[used], &limits, e);
-    if (status != RMR_OK) break;
-
     CGRect box = CGRectApplyAffineTransform(
         CGRectMake(0, 0, p->sheet.width, p->sheet.height), t);
     CGRect media = CGPDFPageGetBoxRect(original, kCGPDFMediaBox);
@@ -1028,29 +1046,57 @@ rmr_status rmr_apple_pdf_incremental_marks(
                   CGRectGetMaxY(box) > CGRectGetMaxY(media) + 0.01;
     box = CGRectUnion(box, media);
 
-    overlays[used] = (rmr_pdf_overlay){
-        .page = i,
-        .pdf = pdfs[used].bytes,
-        .size = pdfs[used].size,
-        .transform = {t.a, t.b, t.c, t.d, t.tx, t.ty},
-        .replace_box = expand,
-        .box = {box.origin.x, box.origin.y, box.size.width, box.size.height}};
-    used++;
+    pending_page* item =
+        &queue.items[(queue.head + queue.count) % queue.capacity];
+    *item = (pending_page){
+        .overlay = {.page = i,
+                    .transform = {t.a, t.b, t.c, t.d, t.tx, t.ty},
+                    .replace_box = expand,
+                    .box = {box.origin.x, box.origin.y, box.size.width,
+                            box.size.height}}};
+    size_t split = rmr_apple_writer_split(plan), all = rmr_plan_count(plan);
+    if (split)
+      status = rmr_apple_pdf_sheet_range(
+          plan, 0, split, &p->sheet, &limits,
+          split < all ? rmr_apple_writer_mask : nullptr, writer, cancel,
+          context, &item->native, e);
+    if (status == RMR_OK && split < all) {
+      status = rmr_apple_writer_overlay(writer, i, plan, split, &p->sheet,
+                                        cancel, context, e);
+      item->written = status == RMR_OK;
+    }
+    rmr_pdf_marks_release(marks, i);
+    if (status != RMR_OK) {
+      rmr_buffer_free(&item->native);
+      break;
+    }
+    queue.count++;
+    status = settle(&queue, writer, update, false, e);
   }
 
-  if (status == RMR_OK) status = collect(writer, pdfs, overlays, 0, &limits, e);
+  if (status == RMR_OK) status = settle(&queue, writer, update, true, e);
+  for (; queue.count; queue.count--) {
+    rmr_buffer_free(&queue.items[queue.head].native);
+    queue.head = (queue.head + 1) % queue.capacity;
+  }
   rmr_apple_writer_free(writer);
 
-  if (status == RMR_OK)
-    status = rmr_pdf_incremental_output(
-        CFDataGetBytePtr(source->data), (size_t)CFDataGetLength(source->data),
-        overlays, used, &limits, cancel, context, output, out, report, e);
-
-  for (size_t i = 0; i < count; i++) rmr_buffer_free(&pdfs[i]);
-  free(pdfs);
-  free(overlays);
+  if (status == RMR_OK) status = rmr_pdf_update_finish(update, out, report, e);
+  rmr_pdf_update_free(update);
+  free(queue.items);
   free(geometry);
   return status;
+}
+
+rmr_status rmr_apple_pdf_incremental_marks(
+    const rmr_apple_pdf_source* source, const rmr_pdf_page* pages, size_t count,
+    const rmr_pdf_marks* marks, const rmr_limits* limits,
+    const rmr_pdf_options* options, rmr_cancel_fn cancel, void* context,
+    const rmr_output* output, rmr_buffer* out,
+    rmr_pdf_incremental_report* report, rmr_error* e) {
+  return rmr_apple_pdf_update_marks(source, pages, count, marks, limits,
+                                    options, cancel, context, false, output,
+                                    out, report, e);
 }
 
 rmr_status rmr_apple_pdf_incremental(

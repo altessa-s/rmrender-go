@@ -142,13 +142,15 @@ static uint32_t color_space(page* p) {
     CFDataRef icc = p->writer->profile;
     size_t size = (size_t)CFDataGetLength(icc);
     uint32_t profile = number(p), space = number(p);
-    rmr_pdf_object* stream = rmr_pdf_batch_add(p->batch, profile, true);
-    rmr_pdf_object* array = rmr_pdf_batch_add(p->batch, space, false);
-    uint8_t* data = stream ? malloc(size) : nullptr;
-    if (!profile || !space || !array || !data) {
-      free(data);
-      return 0;
-    }
+    /* Adding an object may move those added before it. */
+    size_t at = p->batch->count;
+    bool added = profile && space &&
+                 rmr_pdf_batch_add(p->batch, profile, true) &&
+                 rmr_pdf_batch_add(p->batch, space, false);
+    rmr_pdf_object* stream = added ? &p->batch->objects[at] : nullptr;
+    rmr_pdf_object* array = added ? &p->batch->objects[at + 1] : nullptr;
+    uint8_t* data = added ? malloc(size) : nullptr;
+    if (!data) return 0;
     memcpy(data, CFDataGetBytePtr(icc), size);
     stream->data = data;
     stream->size = size;
@@ -443,19 +445,25 @@ static rmr_status erased_path(const rmr_draw* d, CGPathRef* out) {
   return RMR_ERR_UNSUPPORTED;
 }
 
+/* The first eight bytes of a digest, where the image table starts looking. */
+static size_t slot(const rmr_pdf_digest* d) {
+  uint64_t v = 0;
+  for (unsigned k = 0; k < 8; k++) v |= (uint64_t)d->bytes[k] << (8 * k);
+  return (size_t)v;
+}
+
 /* The entry for the mask's bytes, added with its dimensions when they were
  * not seen before (*found false); null on allocation failure. */
 static image_entry* image_lookup(catalog* c, const rmr_mask_view* m,
                                  bool* found) {
-  rmr_pdf_digest digest =
-      rmr_pdf_hash(m->bytes, m->stride * m->height, 0x5245414c4d41534bu);
+  rmr_pdf_digest digest = rmr_pdf_hash(m->bytes, m->stride * m->height);
   if (c->image_count + 1 > c->image_capacity / 4 * 3) {
     size_t capacity = c->image_capacity ? c->image_capacity * 2 : 256;
     image_entry* grown = calloc(capacity, sizeof *grown);
     if (!grown) return nullptr;
     for (size_t i = 0; i < c->image_capacity; i++)
       if (c->images[i].width) {
-        size_t at = c->images[i].digest.a & (capacity - 1);
+        size_t at = slot(&c->images[i].digest) & (capacity - 1);
         while (grown[at].width) at = (at + 1) & (capacity - 1);
         grown[at] = c->images[i];
       }
@@ -464,10 +472,10 @@ static image_entry* image_lookup(catalog* c, const rmr_mask_view* m,
     c->image_capacity = capacity;
   }
 
-  size_t at = digest.a & (c->image_capacity - 1);
+  size_t at = slot(&digest) & (c->image_capacity - 1);
   for (; c->images[at].width; at = (at + 1) & (c->image_capacity - 1))
-    if (c->images[at].digest.a == digest.a &&
-        c->images[at].digest.b == digest.b) {
+    if (!memcmp(c->images[at].digest.bytes, digest.bytes,
+                sizeof digest.bytes)) {
       *found = true;
       return &c->images[at];
     }
@@ -554,10 +562,15 @@ static rmr_status begin(void* context, rmr_rect viewport) {
   return RMR_OK;
 }
 
+static bool native_only(const rmr_draw* d);
+static bool paints(const rmr_draw* d);
+
 /* rmr_backend draw: one fill, stroke, combined fill and stroke or grain mask,
- * after its erasers. */
+ * after its erasers; a draw only CoreGraphics can write is left out when it
+ * paints nothing, and refused otherwise. */
 static rmr_status draw(void* context, const rmr_draw* d) {
   page* p = context;
+  if (native_only(d)) return paints(d) ? RMR_ERR_UNSUPPORTED : RMR_OK;
   CGPathRef erased = nullptr;
   if (d->eraser_count) {
     rmr_status s = erased_path(d, &erased);
@@ -665,9 +678,55 @@ static bool native_only(const rmr_draw* d) {
          d->mode == RMR_PDF;
 }
 
+/* CGPDFScanner callback: an operator that paints was met. */
+static void painting(CGPDFScannerRef scanner, void* info) {
+  (void)scanner;
+  *(bool*)info = true;
+}
+
+/* Whether a draw only CoreGraphics can write may paint. An embedded PDF
+ * page whose content holds no painting operator (no stroke or fill, text,
+ * XObject, shading or inline image) paints nothing, whatever its graphics
+ * state or clip: a text layer without glyphs is one. Anything else, and any
+ * page that does not scan, may. */
+static bool paints(const rmr_draw* d) {
+  if (d->mode != RMR_PDF || d->group || !d->image.bytes || !d->image.size ||
+      d->pdf_page == SIZE_MAX)
+    return true;
+  CGDataProviderRef provider = CGDataProviderCreateWithData(
+      nullptr, d->image.bytes, d->image.size, nullptr);
+  CGPDFDocumentRef document =
+      provider ? CGPDFDocumentCreateWithProvider(provider) : nullptr;
+  if (provider) CGDataProviderRelease(provider);
+  CGPDFPageRef page = document && !CGPDFDocumentIsEncrypted(document)
+                          ? CGPDFDocumentGetPage(document, d->pdf_page + 1)
+                          : nullptr;
+  bool painted = true;
+  CGPDFOperatorTableRef table = page ? CGPDFOperatorTableCreate() : nullptr;
+  CGPDFContentStreamRef content =
+      table ? CGPDFContentStreamCreateWithPage(page) : nullptr;
+  if (content) {
+    static const char* const operators[] = {
+        "S",  "s",  "f",  "F", "f*", "B",  "B*", "b",  "b*", "sh",
+        "Do", "Tj", "TJ", "'", "\"", "BI", "EI", "d0", "d1"};
+    for (size_t i = 0; i < sizeof operators / sizeof *operators; i++)
+      CGPDFOperatorTableSetCallback(table, operators[i], painting);
+    painted = false;
+    CGPDFScannerRef scanner = CGPDFScannerCreate(content, table, &painted);
+    if (!scanner || !CGPDFScannerScan(scanner)) painted = true;
+    if (scanner) CGPDFScannerRelease(scanner);
+    CGPDFContentStreamRelease(content);
+  }
+  if (table) CGPDFOperatorTableRelease(table);
+  if (document) CGPDFDocumentRelease(document);
+  return painted;
+}
+
 size_t rmr_apple_writer_split(const rmr_plan* plan) {
-  for (size_t i = rmr_plan_count(plan); i-- > 0;)
-    if (native_only(rmr_plan_draw(plan, i))) return i + 1;
+  for (size_t i = rmr_plan_count(plan); i-- > 0;) {
+    const rmr_draw* d = rmr_plan_draw(plan, i);
+    if (native_only(d) && paints(d)) return i + 1;
+  }
   return 0;
 }
 
@@ -865,7 +924,7 @@ rmr_status rmr_apple_writer_merge(rmr_apple_writer* w, const uint8_t* base,
 }
 
 rmr_status rmr_apple_writer_overlay(rmr_apple_writer* w, size_t tag,
-                                    const rmr_plan* plan,
+                                    const rmr_plan* plan, size_t first,
                                     const rmr_sheet* sheet,
                                     rmr_cancel_fn cancel, void* context,
                                     rmr_error* e) {
@@ -891,27 +950,43 @@ rmr_status rmr_apple_writer_overlay(rmr_apple_writer* w, size_t tag,
             .width = sheet->width,
             .height = sheet->height,
             .decimals = w->decimals};
+  /* The masks CoreGraphics drew of this page so far: a mask of the same
+   * bytes takes the dimensions they were first seen with, as it would were
+   * CoreGraphics drawing the whole page. */
+  p.local.images = w->shared.images;
+  p.local.image_count = w->shared.image_count;
+  p.local.image_capacity = w->shared.image_capacity;
+  w->shared.images = nullptr;
+  w->shared.image_count = w->shared.image_capacity = 0;
   p.resources = &p.local;
   p.inverse = CGAffineTransformInvert(p.ctm);
-  if (!p.batch)
+  if (!p.batch) {
+    page_free(&p);
     return fail(e, RMR_ERR_OUT_OF_MEMORY,
                 "PDF output memory limit or allocation failure");
+  }
 
-  s = serialize(&p, plan, 0, cancel, context, e);
+  s = serialize(&p, plan, first, cancel, context, e);
   if (s != RMR_OK) {
     page_free(&p);
     return s;
   }
 
-  rmr_pdf_object* catalog = rmr_pdf_batch_add(p.batch, 1, false);
-  rmr_pdf_object* tree = rmr_pdf_batch_add(p.batch, 2, false);
-  rmr_pdf_object* leaf = rmr_pdf_batch_add(p.batch, 3, false);
-  rmr_pdf_object* content = rmr_pdf_batch_add(p.batch, 4, true);
-  if (!catalog || !tree || !leaf || !content || p.content.failed) {
+  /* Adding an object may move those added before it. */
+  size_t at = p.batch->count;
+  bool added = rmr_pdf_batch_add(p.batch, 1, false) &&
+               rmr_pdf_batch_add(p.batch, 2, false) &&
+               rmr_pdf_batch_add(p.batch, 3, false) &&
+               rmr_pdf_batch_add(p.batch, 4, true);
+  if (!added || p.content.failed) {
     page_free(&p);
     return fail(e, RMR_ERR_OUT_OF_MEMORY,
                 "PDF output memory limit or allocation failure");
   }
+  rmr_pdf_object *catalog = &p.batch->objects[at],
+                 *tree = &p.batch->objects[at + 1],
+                 *leaf = &p.batch->objects[at + 2],
+                 *content = &p.batch->objects[at + 3];
   rmr_pdf_text_string(&catalog->dict, "<< /Type /Catalog /Pages 2 0 R >>");
   rmr_pdf_text_string(&tree->dict,
                       "<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>");

@@ -22,6 +22,51 @@ RMR_API rmr_status rmr_pdf_rewrite_output(const uint8_t* source, size_t size,
                                           const rmr_output* output,
                                           rmr_buffer* out, rmr_error* error);
 
+/* An incremental update (or, fresh, a rewrite as rmr_pdf_rewrite makes) of a
+ * source PDF, its pages given their overlays one at a time as they are made,
+ * so that no overlay outlives its own page. The source is parsed once under
+ * the limits; each page's overlays are parsed and imported under scratch
+ * (maximum_plan_bytes) and work (maximum_elements) budgets of their own,
+ * released once written, so that neither grows with the page count; the
+ * file as a whole stays within maximum_pdf_bytes, the overlaid pages within
+ * maximum_draws. With output set (checked by the caller) the file goes there
+ * as it is written: the source first for an update, every source object
+ * other than the pages first for a rewrite. An object a page's overlays
+ * import identical, down to the objects it refers to, to one an earlier
+ * page's imported (a grain mask, a color profile) refers to that one instead
+ * of being written again; pages, their content and forms, annotations,
+ * optional content and objects in reference cycles are always each page's
+ * own. */
+typedef struct rmr_pdf_update rmr_pdf_update;
+
+RMR_API rmr_status rmr_pdf_update_create(const uint8_t* source, size_t size,
+                                         bool fresh, const rmr_limits* limits,
+                                         rmr_cancel_fn cancel, void* context,
+                                         const rmr_output* output,
+                                         rmr_pdf_update** out,
+                                         rmr_error* error);
+
+/* Draws the count (at most 8) one-page overlay PDFs of parts over page
+ * parts[0].page, in order, each imported as a form of its own (its own
+ * resources) under parts[0]'s transform, whose replace_box and box apply as
+ * rmr_pdf_incremental applies them. Each part names the same page, each page
+ * is given overlays once. On failure the update can only be freed. */
+RMR_API rmr_status rmr_pdf_update_page(rmr_pdf_update* update,
+                                       const rmr_pdf_overlay* parts,
+                                       size_t count, rmr_error* error);
+
+/* Completes the file: a rewrite's pages not given overlays, then the
+ * cross-reference section (none for an update of no pages, an exact copy).
+ * On success out owns the file unless output was set; the update is spent
+ * either way and must still be freed. */
+RMR_API rmr_status rmr_pdf_update_finish(rmr_pdf_update* update,
+                                         rmr_buffer* out,
+                                         rmr_pdf_incremental_report* report,
+                                         rmr_error* error);
+
+/* Releases the update and any output it still holds; null is a no-op. */
+RMR_API void rmr_pdf_update_free(rmr_pdf_update* update);
+
 /* Appends an incremental update clipping a one-page PDF's content to path,
  * mapped through transform. */
 RMR_API rmr_status rmr_pdf_clip(const uint8_t* pdf, size_t size,
