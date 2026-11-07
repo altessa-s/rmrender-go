@@ -4,6 +4,7 @@
 
 #include <limits.h>
 
+#include "../common/rmr_unreadable.h"
 #include "rmr_typography_internal.h"
 
 typedef struct {
@@ -1179,4 +1180,103 @@ rmr_status rmr_linux_text_width(rm_str text, double size, rmr_type_face face,
   g_object_unref(p);
   *out = width;
   return RMR_OK;
+}
+
+rmr_status rmr_linux_unreadable_plan(rmr_rect page, rmr_rect viewport,
+                                     const rmr_linux_fonts* fonts,
+                                     bool outlines, const rmr_limits* given,
+                                     rmr_plan** out, rmr_error* e) {
+  if (!out)
+    return rmr_linux_error(e, RMR_ERR_INVALID_ARGUMENT, "missing label output");
+  rmr_limits limits = given ? *given : rmr_limits_default();
+  double size = rmr_unreadable_size(page);
+  if (!(size > 0) || !isfinite(size))
+    return rmr_plan_create(nullptr, 0, viewport, &limits, out, e);
+  if (!fonts)
+    return rmr_linux_error(e, RMR_ERR_UNSUPPORTED,
+                           "document font provider required");
+
+  rm_str label = {RMR_UNREADABLE_LABEL, sizeof RMR_UNREADABLE_LABEL - 1};
+  PangoLayout* text =
+      rmr_pango_layout(fonts, label, size, RMR_FACE_SANS, false, false);
+  pango_layout_set_single_paragraph_mode(text, TRUE);
+  rmr_status s = rmr_pango_calibrate(text, &limits);
+  if (s != RMR_OK) {
+    g_object_unref(text);
+    return rmr_linux_error(e, s, "label calibration limit");
+  }
+  PangoRectangle logical;
+  pango_layout_get_extents(text, nullptr, &logical);
+  double ascent = (double)(pango_layout_get_baseline(text) - logical.y) /
+                  PANGO_SCALE,
+         descent = (double)logical.height / PANGO_SCALE - ascent;
+  rmr_unreadable_layout place = rmr_unreadable_place(
+      page, size, (double)logical.width / PANGO_SCALE, ascent, descent);
+  PangoLayoutLine* line = pango_layout_get_line_readonly(text, 0);
+  rmr_rect box = place.box;
+  rmr_element outline[10];
+  rmr_unreadable_outline(box, size, outline);
+  rmr_element clip[] = {
+      {.kind = RMR_MOVE, .end = {box.x, box.y}},
+      {.kind = RMR_LINE, .end = {box.x + box.width, box.y}},
+      {.kind = RMR_LINE, .end = {box.x + box.width, box.y + box.height}},
+      {.kind = RMR_LINE, .end = {box.x, box.y + box.height}},
+      {.kind = RMR_CLOSE}};
+  rmr_draw draws[2] = {rmr_unreadable_box(outline, size)};
+  rmr_path glyphs = {0};
+  layout_sink output = {.sink.maximum = limits.maximum_pdf_bytes <
+                                                limits.maximum_plan_bytes / 2
+                                            ? limits.maximum_pdf_bytes
+                                            : limits.maximum_plan_bytes / 2};
+
+  /* Recording surfaces, like PDF surfaces, keep glyph outlines unhinted. The
+   * text alone becomes a PDF of the box, imported as typed text is, so the
+   * output embeds its face the same way. */
+  cairo_surface_t* surface =
+      outlines
+          ? cairo_recording_surface_create(CAIRO_CONTENT_COLOR_ALPHA, nullptr)
+          : cairo_pdf_surface_create_for_stream(layout_write, &output,
+                                                box.width, box.height);
+  cairo_t* cr = cairo_create(surface);
+  if (!outlines) cairo_translate(cr, -box.x, -box.y);
+  cairo_set_source_rgb(cr, RMR_UNREADABLE_GREY, RMR_UNREADABLE_GREY,
+                       RMR_UNREADABLE_GREY);
+  cairo_move_to(cr, place.origin.x, place.origin.y);
+  if (outlines) {
+    pango_cairo_layout_line_path(cr, line);
+    s = rmr_linux_path_capture(cr, &limits, &glyphs);
+  } else {
+    pango_cairo_show_layout_line(cr, line);
+    cairo_show_page(cr);
+  }
+  cairo_status_t cs = cairo_status(cr);
+  cairo_destroy(cr);
+  cairo_surface_finish(surface);
+  if (cs == CAIRO_STATUS_SUCCESS) cs = cairo_surface_status(surface);
+  cairo_surface_destroy(surface);
+  g_object_unref(text);
+  if (s == RMR_OK && output.sink.status != RMR_OK) s = output.sink.status;
+  if (s == RMR_OK && cs != CAIRO_STATUS_SUCCESS) s = RMR_ERR_BACKEND;
+
+  draws[1] =
+      outlines
+          ? (rmr_draw){.mode = RMR_FILL,
+                       .path = {glyphs.elements, glyphs.count},
+                       .color = {RMR_UNREADABLE_GREY, RMR_UNREADABLE_GREY,
+                                 RMR_UNREADABLE_GREY, 1}}
+          : (rmr_draw){.mode = RMR_PDF,
+                       .path = {clip, 5},
+                       .color = {0, 0, 0, 1},
+                       .image = {output.sink.data.bytes,
+                                 output.sink.data.size,
+                                 {box.width, 0, 0, box.height, box.x, box.y}}};
+  if (s == RMR_OK) {
+    limits.maximum_plan_bytes -= output.sink.data.size;
+    s = rmr_plan_create(draws, 2, viewport, &limits, out, e);
+  } else {
+    rmr_linux_error(e, s, "label drawing failed");
+  }
+  rmr_path_free(&glyphs);
+  rmr_buffer_free(&output.sink.data);
+  return s;
 }

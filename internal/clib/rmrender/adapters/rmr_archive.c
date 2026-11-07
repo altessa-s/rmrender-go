@@ -349,19 +349,10 @@ rmr_asset_view rmr_archive_document_pdf(const rmr_archive_document* d) {
   return d ? d->pdf : (rmr_asset_view){0};
 }
 
-rmr_status rmr_archive_document_parse_page(const rmr_archive_document* d,
-                                           size_t i, rm_page** out,
-                                           rmr_error* e) {
-  if (!d || i >= d->count || !out)
-    return fail(e, RMR_ERR_INVALID_ARGUMENT, "archive page index out of range");
-
-  const uint8_t* bytes = (const uint8_t*)RM_HEADER;
-  size_t size = RM_HEADER_LENGTH;
-  if (d->files[i] != SIZE_MAX) {
-    rmd_bytes data = d->archive->files[d->files[i]].data;
-    bytes = data.bytes;
-    size = data.size;
-  }
+/* Page i of d parsed from size bytes, with its template set. */
+static rmr_status parse(const rmr_archive_document* d, size_t i,
+                        const uint8_t* bytes, size_t size, rm_page** out,
+                        rmr_error* e) {
   if (size > d->limits.maximum_plan_bytes)
     return fail(e, RMR_ERR_LIMIT, "page input byte limit");
 
@@ -383,6 +374,38 @@ rmr_status rmr_archive_document_parse_page(const rmr_archive_document* d,
 
   *out = page;
   return RMR_OK;
+}
+
+rmr_status rmr_archive_document_parse_page(const rmr_archive_document* d,
+                                           size_t i, rm_page** out,
+                                           rmr_error* e) {
+  if (!d || i >= d->count || !out)
+    return fail(e, RMR_ERR_INVALID_ARGUMENT, "archive page index out of range");
+  if (d->files[i] == SIZE_MAX)
+    return parse(d, i, (const uint8_t*)RM_HEADER, RM_HEADER_LENGTH, out, e);
+  rmd_bytes data = d->archive->files[d->files[i]].data;
+  return parse(d, i, data.bytes, data.size, out, e);
+}
+
+rmr_status rmr_archive_document_read_page(const rmr_archive_document* d,
+                                          size_t i, rm_page** out,
+                                          rmr_status* unreadable,
+                                          rmr_error* e) {
+  if (!d || i >= d->count || !out || !unreadable)
+    return fail(e, RMR_ERR_INVALID_ARGUMENT, "archive page index out of range");
+  rmr_error parsing = {0};
+  rmr_status status = rmr_archive_document_parse_page(d, i, out, &parsing);
+  /* Only the parser's own refusals are the page's; a template name that
+   * cannot be stored fails with OUT_OF_MEMORY, never these. */
+  if (status != RMR_ERR_BACKEND && status != RMR_ERR_UNSUPPORTED) {
+    if (status != RMR_OK && e) *e = parsing;
+    if (status == RMR_OK) *unreadable = RMR_OK;
+    return status;
+  }
+  rmr_status blank =
+      parse(d, i, (const uint8_t*)RM_HEADER, RM_HEADER_LENGTH, out, e);
+  if (blank == RMR_OK) *unreadable = status;
+  return blank;
 }
 
 rmr_status rmr_archive_document_image(void* context, rm_str file,

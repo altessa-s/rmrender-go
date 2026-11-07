@@ -4,6 +4,7 @@
 
 #include <rmlines/parser.h>
 #include <rmrender/linux_document.h>
+#include <stdio.h>
 
 #include "../common/rmr_pdf_options.h"
 #include "../common/rmr_pdf_output.h"
@@ -105,6 +106,44 @@ static rmr_status page_marks(const rm_page* parsed, bool source, bool outlines,
       &page, size, edge, margin, resources, fonts, limits, out, e);
 }
 
+/* *plan with the label of an unreadable page of size drawn over it, as
+ * RMR_UNREADABLE_PLACEHOLDER asks: *plan is replaced by the two together, over
+ * its own viewport. outlines sets the label's text as glyph outlines, as the
+ * SVG pages set typed text. */
+static rmr_status with_label(rmr_point size, bool outlines,
+                             const rmr_linux_fonts* fonts,
+                             const rmr_limits* limits, rmr_plan** plan,
+                             rmr_error* e) {
+  rmr_rect viewport = rmr_plan_viewport(*plan);
+  rmr_plan *label = nullptr, *both = nullptr;
+  rmr_status s =
+      rmr_linux_unreadable_plan((rmr_rect){-size.x / 2, 0, size.x, size.y},
+                                viewport, fonts, outlines, limits, &label, e);
+  if (s == RMR_OK) {
+    const rmr_plan* parts[] = {*plan, label};
+    s = rmr_plan_concat(parts, 2, viewport, limits, &both, e);
+  }
+  rmr_plan_free(label);
+  if (s == RMR_OK) {
+    rmr_plan_free(*plan);
+    *plan = both;
+  }
+  return s;
+}
+
+/* Fails with unreadable page index, as RMR_UNREADABLE_STRICT asks: the
+ * parser's status s, the page's index and a message naming it and its id. */
+static rmr_status unreadable_page(rmr_error* e, rmr_status s, size_t index,
+                                  const rmr_document_page* page) {
+  if (e) {
+    *e = (rmr_error){.code = s, .index = index};
+    snprintf(e->message, sizeof e->message,
+             "unreadable page %zu (%s): RMLines could not parse it", index,
+             page && page->id ? page->id : "");
+  }
+  return s;
+}
+
 /* Marks for the PDF writers: each page is parsed and planned as it is drawn,
  * at the shape measured for its sheet, and its plan is freed once drawn, so
  * the export holds one page's plan at a time however long the document. */
@@ -114,7 +153,7 @@ typedef struct {
   const rmr_page_resources* resources;
   const rmr_linux_fonts* fonts;
   const rmr_limits* limits;
-  bool listed, source;
+  bool listed, source, placeholder;
   rmr_plan* built;
 } planner;
 
@@ -123,13 +162,19 @@ static rmr_status plan_acquire(void* context, size_t i, const rmr_plan** out,
                                rmr_error* e) {
   planner* p = context;
   rm_page* parsed = nullptr;
-  rmr_status status =
-      p->listed ? rmr_archive_document_parse_page(p->document, i, &parsed, e)
-                : RMR_OK;
+  rmr_status unreadable = RMR_OK;
+  rmr_status status = p->listed ? rmr_archive_document_read_page(
+                                      p->document, i, &parsed, &unreadable, e)
+                                : RMR_OK;
+  bool label = unreadable != RMR_OK && p->placeholder;
+  if (status == RMR_OK && label) parsed->has_template_name = false;
   if (status == RMR_OK)
     status =
         page_marks(parsed, p->source, false, p->shapes[i].size, p->resources,
                    p->fonts, p->limits, nullptr, &p->built, e);
+  if (status == RMR_OK && label)
+    status =
+        with_label(p->shapes[i].size, false, p->fonts, p->limits, &p->built, e);
   rm_page_free(parsed);
   if (status != RMR_OK) return status;
 
@@ -170,6 +215,7 @@ static rmr_status document_pdf(
   rmr_pdf_options checked;
   if (!rmr_pdf_options_read(options, &checked))
     return rmr_linux_error(e, RMR_ERR_INVALID_ARGUMENT, "invalid PDF options");
+  bool placeholder = checked.unreadable == RMR_UNREADABLE_PLACEHOLDER;
   /* The export writes through guard, so that a failure of output's own is
    * reported as one however deep in the export it happens. */
   rmr_output_guard guard = {0};
@@ -240,8 +286,19 @@ static rmr_status document_pdf(
       failure = "document render cancelled";
       goto done;
     }
-    status = rmr_archive_document_parse_page(document, i, &parsed, e);
+    rmr_status unreadable = RMR_OK;
+    status =
+        rmr_archive_document_read_page(document, i, &parsed, &unreadable, e);
     if (status != RMR_OK) goto done;
+    if (unreadable != RMR_OK) {
+      if (checked.on_unreadable)
+        checked.on_unreadable(checked.unreadable_context, i, unreadable);
+      if (checked.unreadable == RMR_UNREADABLE_STRICT) {
+        status = unreadable_page(e, unreadable, i,
+                                 rmr_archive_document_page(document, i));
+        goto done;
+      }
+    }
     if (parsed->skipped_blocks > SIZE_MAX - result.skipped_blocks) {
       status = RMR_ERR_LIMIT;
       failure = "skipped block count limit";
@@ -274,10 +331,15 @@ static rmr_status document_pdf(
       failure = "document render cancelled";
       goto done;
     }
+    /* Under PLACEHOLDER, an unreadable page is a plain sheet: no template. */
+    rmr_status unreadable = RMR_OK;
     if (listed) {
-      status = rmr_archive_document_parse_page(document, i, &parsed, e);
+      status =
+          rmr_archive_document_read_page(document, i, &parsed, &unreadable, e);
       if (status != RMR_OK) goto done;
     }
+    bool label = unreadable != RMR_OK && placeholder;
+    if (label) parsed->has_template_name = false;
 
     rm_page blank = {.background_visible = true, .root_document_visible = true};
     const rm_page* page = parsed ? parsed : &blank;
@@ -312,7 +374,12 @@ static rmr_status document_pdf(
       rmr_plan* plan = nullptr;
       status = page_marks(parsed, source, true, size, &resources, fonts,
                           &remaining, nullptr, &plan, e);
-      if (status != RMR_OK) goto done;
+      if (status == RMR_OK && label)
+        status = with_label(size, true, fonts, &remaining, &plan, e);
+      if (status != RMR_OK) {
+        rmr_plan_free(plan);
+        goto done;
+      }
       pages[i].marks = plan;
       remaining.maximum_plan_bytes -= rmr_plan_bytes(plan);
       viewport = rmr_plan_viewport(plan);
@@ -379,7 +446,8 @@ static rmr_status document_pdf(
                             .fonts = fonts,
                             .limits = &remaining,
                             .listed = listed,
-                            .source = source};
+                            .source = source,
+                            .placeholder = placeholder};
   rmr_pdf_marks marks = {plan_acquire, plan_release, &marks_planner};
   if (mode == PDF_RECOMPOSED && source)
     status =
@@ -527,5 +595,16 @@ rmr_status rmr_linux_document_svg(
     rmr_error* error) {
   return document_pdf(document, resources, fonts, paper, maximum_pages, limits,
                       nullptr, cancel, context, nullptr, nullptr, report, error,
+                      SVG_PAGES, raster_dpi, out);
+}
+
+rmr_status rmr_linux_document_svg_with_options(
+    const rmr_archive_document* document, const rmr_page_resources* resources,
+    const rmr_linux_fonts* fonts, rmr_paper paper, size_t maximum_pages,
+    double raster_dpi, const rmr_limits* limits, const rmr_pdf_options* options,
+    rmr_cancel_fn cancel, void* context, rmr_svg_pages* out,
+    rmr_document_report* report, rmr_error* error) {
+  return document_pdf(document, resources, fonts, paper, maximum_pages, limits,
+                      options, cancel, context, nullptr, nullptr, report, error,
                       SVG_PAGES, raster_dpi, out);
 }

@@ -11,6 +11,7 @@ import "C"
 
 import (
 	"context"
+	"errors"
 	"image"
 	"io"
 	"sync"
@@ -56,6 +57,9 @@ type Report struct {
 	// a fresh export carried over and could not. The other modes keep the
 	// original annotations whole and count none.
 	LinksPreserved, LinksDropped int
+	// UnreadablePages is how many pages did not parse and were drawn as
+	// [Options.Unreadable] says.
+	UnreadablePages int
 }
 
 // Document is a .rmdoc archive opened for drawing: its pages in order, their
@@ -170,6 +174,54 @@ func (d *Document) index(i int) (C.size_t, error) {
 	return C.size_t(i), nil
 }
 
+// CheckPage reports whether page i parses: nil when it does, or when it has
+// no .rm file to parse, as a page nobody wrote on has none. When its .rm
+// file does not parse, it answers the error a call under [UnreadableStrict]
+// fails with drawing it, whose cause is an *UnreadablePageError.
+func (d *Document) CheckPage(i int) error {
+	index, err := d.index(i)
+	if err != nil {
+		return err
+	}
+	return d.use(func(c *C.rmrgo_document) error {
+		if i >= len(d.pages) {
+			return nil
+		}
+		var unreadable C.rmr_status
+		var cerr C.rmr_error
+		if status := C.rmrgo_document_check(c, index, &unreadable, &cerr); status != C.RMR_OK {
+			return cError(status, &cerr)
+		}
+		if unreadable == C.RMR_OK {
+			return nil
+		}
+		e := cError(unreadable, &cerr)
+		e.Err = &UnreadablePageError{Page: i, ID: d.pages[i].ID}
+		return e
+	})
+}
+
+// explain gives err, the failure of call c made with o, the page it failed
+// on as its cause, when it failed under UnreadableStrict on a page that does
+// not parse: the last such page c was told of, which the failure indexes.
+func (d *Document) explain(err error, o *Options, c *call) error {
+	var e *Error
+	if (o != nil && o.Unreadable != UnreadableStrict) || len(c.unreadable) == 0 ||
+		!errors.As(err, &e) || e.Err != nil {
+		return err
+	}
+	page := c.unreadable[len(c.unreadable)-1]
+	if e.Index != page {
+		return err
+	}
+	cause := &UnreadablePageError{Page: page}
+	if page < len(d.pages) {
+		cause.ID = d.pages[page].ID
+	}
+	e.Err = cause
+	return err
+}
+
 // PageImage draws page i as the document's PDF lays it out, at scale pixels
 // per .rm unit, with its template, attachments and, beneath, its page of the
 // imported PDF.
@@ -180,13 +232,14 @@ func (d *Document) PageImage(ctx context.Context, i int, scale float64, o *Optio
 	}
 	background := cColor(o.background())
 	var out C.rmr_bitmap
+	told := &call{}
 	err = d.use(func(c *C.rmrgo_document) error {
-		return render(ctx, o, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
+		return renderCall(ctx, o, told, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
 			return C.rmrgo_document_bitmap(r, c, index, C.double(scale), background, &out, cerr)
 		})
 	})
 	if err != nil {
-		return nil, err
+		return nil, d.explain(err, o, told)
 	}
 	return takeBitmap(&out)
 }
@@ -224,13 +277,14 @@ func (d *Document) PageSVG(ctx context.Context, i int, o *Options) ([]byte, erro
 		return nil, err
 	}
 	var out C.rmr_buffer
+	told := &call{}
 	err = d.use(func(c *C.rmrgo_document) error {
-		return render(ctx, o, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
+		return renderCall(ctx, o, told, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
 			return C.rmrgo_document_page_svg(r, c, index, &out, cerr)
 		})
 	})
 	if err != nil {
-		return nil, err
+		return nil, d.explain(err, o, told)
 	}
 	return takeBuffer(&out)
 }
@@ -249,19 +303,20 @@ func (d *Document) SVG(ctx context.Context, o *Options) ([][]byte, Report, error
 	}
 	var out C.rmr_svg_pages
 	var cr C.rmr_document_report
+	told := &call{}
 	err = d.use(func(c *C.rmrgo_document) error {
-		return render(ctx, o, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
+		return renderCall(ctx, o, told, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
 			return C.rmrgo_document_svg(r, c, C.size_t(maximum), &out, &cr, cerr)
 		})
 	})
 	if err != nil {
-		return nil, Report{}, err
+		return nil, Report{}, d.explain(err, o, told)
 	}
 	pages, err := takeSVGPages(&out)
 	if err != nil {
 		return nil, Report{}, err
 	}
-	report, err := reportOf(&cr)
+	report, err := reportOf(&cr, told)
 	if err != nil {
 		return nil, Report{}, err
 	}
@@ -276,21 +331,23 @@ func (d *Document) PageMarks(i int, o *Options) (*Marks, error) {
 		return nil, err
 	}
 	var out *C.rmr_page_marks
+	told := &call{}
 	err = d.use(func(c *C.rmrgo_document) error {
-		return render(context.Background(), o, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
+		return renderCall(context.Background(), o, told, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
 			return C.rmrgo_document_marks(r, c, index, &out, cerr)
 		})
 	})
 	if err != nil {
-		return nil, err
+		return nil, d.explain(err, o, told)
 	}
 	defer C.rmr_page_marks_free(out)
 	return marksOf(C.rmr_page_marks_view(out))
 }
 
 // PDF draws the whole document as one PDF, in the given mode: notebook pages
-// on o.Paper, imported pages at their own size. Pages that fail to parse
-// fail the call; what was recovered from is counted in the report.
+// on o.Paper, imported pages at their own size. A page that does not parse
+// is drawn, or fails the call, as o.Unreadable says; what was recovered from
+// is counted in the report.
 func (d *Document) PDF(ctx context.Context, mode PDFMode, o *Options) ([]byte, Report, error) {
 	var report Report
 	cmode, err := mode.c()
@@ -303,19 +360,20 @@ func (d *Document) PDF(ctx context.Context, mode PDFMode, o *Options) ([]byte, R
 	}
 	var out C.rmr_buffer
 	var cr C.rmr_document_report
+	told := &call{}
 	err = d.use(func(c *C.rmrgo_document) error {
-		return render(ctx, o, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
+		return renderCall(ctx, o, told, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
 			return C.rmrgo_document_pdf(r, c, cmode, C.size_t(maximum), &out, &cr, cerr)
 		})
 	})
 	if err != nil {
-		return nil, report, err
+		return nil, report, d.explain(err, o, told)
 	}
 	pdf, err := takeBuffer(&out)
 	if err != nil {
 		return nil, report, err
 	}
-	if report, err = reportOf(&cr); err != nil {
+	if report, err = reportOf(&cr, told); err != nil {
 		return nil, Report{}, err
 	}
 	return pdf, report, nil
@@ -355,9 +413,9 @@ func (d *Document) WritePDF(ctx context.Context, w io.Writer, mode PDFMode, o *O
 		})
 	})
 	if err != nil {
-		return Report{}, err
+		return Report{}, d.explain(err, o, c)
 	}
-	return reportOf(&cr)
+	return reportOf(&cr, c)
 }
 
 // c answers the mode for C, refusing one this package does not name.
@@ -384,9 +442,10 @@ func (o *Options) maximumPages() (int, error) {
 	return o.MaximumPages, nil
 }
 
-// reportOf answers the C library's report of a document export.
-func reportOf(cr *C.rmr_document_report) (Report, error) {
-	var report Report
+// reportOf answers the C library's report of a document export, and the
+// unreadable pages call c was told of.
+func reportOf(cr *C.rmr_document_report, c *call) (Report, error) {
+	report := Report{UnreadablePages: len(c.unreadable)}
 	for _, f := range []struct {
 		to   *int
 		from C.size_t

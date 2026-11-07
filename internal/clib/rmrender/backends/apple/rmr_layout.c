@@ -4,6 +4,7 @@
 
 #include <limits.h>
 
+#include "../common/rmr_unreadable.h"
 #include "rmr_alphabetic.h"
 #include "rmr_apple_internal.h"
 #include "rmr_typography_internal.h"
@@ -1151,4 +1152,116 @@ rmr_status rmr_apple_text_width(rm_str text, double size, rmr_type_face face,
 
   *out = width;
   return RMR_OK;
+}
+
+rmr_status rmr_apple_unreadable_plan(rmr_rect page, rmr_rect viewport,
+                                     const rmr_apple_fonts* fonts,
+                                     bool outlines, const rmr_limits* given,
+                                     rmr_plan** out, rmr_error* e) {
+  if (!out)
+    return rmr_apple_text_error(e, RMR_ERR_INVALID_ARGUMENT,
+                                "missing label output");
+  rmr_limits limits = given ? *given : rmr_limits_default();
+  double size = rmr_unreadable_size(page);
+  if (!(size > 0) || !isfinite(size))
+    return rmr_plan_create(nullptr, 0, viewport, &limits, out, e);
+  if (!fonts)
+    return rmr_apple_text_error(e, RMR_ERR_UNSUPPORTED,
+                                "document font provider required");
+
+  CTFontRef font = rmr_ct_font(fonts, size, RMR_FACE_SANS, false, false, -1);
+  if (!font)
+    return rmr_apple_text_error(e, RMR_ERR_UNSUPPORTED,
+                                "label font unavailable");
+  const void* keys[] = {kCTFontAttributeName,
+                        kCTForegroundColorFromContextAttributeName};
+  const void* values[] = {font, kCFBooleanTrue};
+  CFDictionaryRef style = CFDictionaryCreate(kCFAllocatorDefault, keys, values,
+                                             2, &kCFTypeDictionaryKeyCallBacks,
+                                             &kCFTypeDictionaryValueCallBacks);
+  CFRelease(font);
+  CFAttributedStringRef text =
+      style ? CFAttributedStringCreate(kCFAllocatorDefault,
+                                       CFSTR(RMR_UNREADABLE_LABEL), style)
+            : nullptr;
+  if (style) CFRelease(style);
+  CTLineRef line = text ? CTLineCreateWithAttributedString(text) : nullptr;
+  if (text) CFRelease(text);
+  if (!line)
+    return rmr_apple_text_error(e, RMR_ERR_OUT_OF_MEMORY,
+                                "label allocation failed");
+
+  CGFloat ascent = 0, descent = 0;
+  double width = CTLineGetTypographicBounds(line, &ascent, &descent, nullptr);
+  rmr_unreadable_layout place =
+      rmr_unreadable_place(page, size, width, ascent, descent);
+  rmr_rect box = place.box;
+  rmr_element outline[10];
+  rmr_unreadable_outline(box, size, outline);
+  rmr_element clip[] = {
+      {.kind = RMR_MOVE, .end = {box.x, box.y}},
+      {.kind = RMR_LINE, .end = {box.x + box.width, box.y}},
+      {.kind = RMR_LINE, .end = {box.x + box.width, box.y + box.height}},
+      {.kind = RMR_LINE, .end = {box.x, box.y + box.height}},
+      {.kind = RMR_CLOSE}};
+  rmr_draw draws[2] = {rmr_unreadable_box(outline, size)};
+  rmr_path glyphs = {0};
+  pdf_bytes data = {.maximum = limits.maximum_pdf_bytes};
+  if (data.maximum > limits.maximum_plan_bytes / 2)
+    data.maximum = limits.maximum_plan_bytes / 2;
+  rmr_status s = RMR_OK;
+
+  if (outlines) {
+    /* Line space has its baseline origin at zero and y up. */
+    s = rmr_apple_line_outline(
+        line,
+        CGAffineTransformMake(1, 0, 0, -1, place.origin.x, place.origin.y),
+        &limits, &glyphs);
+    draws[1] = (rmr_draw){.mode = RMR_FILL,
+                          .path = {glyphs.elements, glyphs.count},
+                          .color = {RMR_UNREADABLE_GREY, RMR_UNREADABLE_GREY,
+                                    RMR_UNREADABLE_GREY, 1}};
+  } else {
+    /* The text alone as a PDF of the box, imported as typed text is, so the
+     * output embeds its face the same way. */
+    CGDataConsumerCallbacks callbacks = {put_pdf, nullptr};
+    CGDataConsumerRef consumer = CGDataConsumerCreate(&data, &callbacks);
+    CGRect media = CGRectMake(0, 0, box.width, box.height);
+    CGContextRef cg =
+        consumer ? CGPDFContextCreate(consumer, &media, nullptr) : nullptr;
+    if (consumer) CGDataConsumerRelease(consumer);
+    if (!cg) {
+      s = RMR_ERR_BACKEND;
+    } else {
+      CGPDFContextBeginPage(cg, nullptr);
+      CGContextSetTextMatrix(cg, CGAffineTransformIdentity);
+      CGContextSetGrayFillColor(cg, RMR_UNREADABLE_GREY, 1);
+      CGContextSetTextPosition(cg, place.origin.x - box.x,
+                               box.y + box.height - place.origin.y);
+      CTLineDraw(line, cg);
+      CGPDFContextEndPage(cg);
+      CGPDFContextClose(cg);
+      CGContextRelease(cg);
+      s = data.status;
+    }
+    draws[1] =
+        (rmr_draw){.mode = RMR_PDF,
+                   .path = {clip, 5},
+                   .color = {0, 0, 0, 1},
+                   .image = {data.buffer.bytes,
+                             data.buffer.size,
+                             {box.width, 0, 0, box.height, box.x, box.y}}};
+  }
+  CFRelease(line);
+
+  if (s == RMR_OK) {
+    rmr_limits remaining = limits;
+    remaining.maximum_plan_bytes -= data.capacity;
+    s = rmr_plan_create(draws, 2, viewport, &remaining, out, e);
+  } else {
+    rmr_apple_text_error(e, s, "label drawing failed");
+  }
+  rmr_path_free(&glyphs);
+  free(data.buffer.bytes);
+  return s;
 }

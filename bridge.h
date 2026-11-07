@@ -49,7 +49,8 @@ void rmrgo_fonts_free(rmrgo_fonts *fonts);
 // templates and, for a lone page, images; cancel is a flag or null.
 // raster_dpi is the resolution SVG output rasterizes imported PDF pages at,
 // in pixels per inch of sheet, zero for the library's default; pdf is how PDF
-// output draws.
+// output draws, and what a document's calls do with an unreadable page,
+// which they tell the Go callback of handle of.
 typedef struct {
     const rmrgo_fonts *fonts;
     uintptr_t handle;
@@ -97,6 +98,12 @@ rmr_status rmrgo_document_page_svg(const rmrgo_request *request, rmrgo_document 
                                    size_t index, rmr_buffer *out, rmr_error *error);
 rmr_status rmrgo_document_marks(const rmrgo_request *request, rmrgo_document *document,
                                 size_t index, rmr_page_marks **out, rmr_error *error);
+
+// Whether listed page index parses: unreadable receives RMR_OK, or the
+// status parsing it fails with, error then worded as a strict drawing of
+// the page fails.
+rmr_status rmrgo_document_check(rmrgo_document *document, size_t index, rmr_status *unreadable,
+                                rmr_error *error);
 
 // The three document exports, as the library names them: fresh, preserving
 // (an incremental update) and recomposed.

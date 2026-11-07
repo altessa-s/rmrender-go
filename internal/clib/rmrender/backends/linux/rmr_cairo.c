@@ -747,6 +747,22 @@ static rmr_status draw(void* ctx, const rmr_draw* d) {
     /* Restore the page matrix after masks, then remove earlier ink only. */
     cairo_identity_matrix(cr);
     setup(c);
+    if (d->mask.bytes) {
+      /* Not under the outline a grain mask is clipped to: where its edge
+       * covers c of a pixel the cut would take only c of the ink, and leave
+       * (1 - c) * c of a mark erased whole as a faint outline. Under its
+       * extents instead, whole device units: the cut reaches no further than
+       * the mask, so a PDF rasterizes the group over the area it did and
+       * what an eraser leaves is drawn as before. That raster is finer than
+       * a unit, so in a PDF an edge of the outline lying within one of its
+       * pixels of the extents keeps a fringe, a few percent at most; an
+       * unclipped cut would remove it and rasterize the rest anew. */
+      double x1, y1, x2, y2;
+      cairo_clip_extents(cr, &x1, &y1, &x2, &y2);
+      cairo_reset_clip(cr);
+      cairo_rectangle(cr, x1, y1, x2 - x1, y2 - y1);
+      cairo_clip(cr);
+    }
     cairo_set_operator(cr, CAIRO_OPERATOR_DEST_OUT);
     cairo_set_source_rgba(cr, 0, 0, 0, 1);
     for (size_t i = 0; i < d->eraser_count; i++) {
