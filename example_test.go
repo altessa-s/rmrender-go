@@ -13,9 +13,11 @@ import (
 	"image/color"
 	"image/jpeg"
 	"image/png"
+	"io"
 	"io/fs"
 	"log"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/altessa-s/rmrender-go"
@@ -190,6 +192,58 @@ func ExampleOpenDocument() {
 	// 2 p3 P Lines medium
 	// %PDF- 3 pages, 0 blocks skipped
 	// 140 199
+}
+
+func ExampleDocument_WritePDF() {
+	data, err := os.ReadFile("testdata/pages/Notes.rmdoc")
+	if err != nil {
+		log.Fatal(err)
+	}
+	f, err := rmrender.NewFonts(fonts.FS)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer f.Close()
+	doc, err := rmrender.OpenDocument(data, nil)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer doc.Close()
+	dir, err := os.MkdirTemp("", "notes")
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer os.RemoveAll(dir)
+	// The file is written as it is produced, into a temporary file renamed
+	// once it is whole.
+	out, err := os.CreateTemp(dir, "notes-*.pdf")
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	opts := &rmrender.Options{Fonts: f}
+	report, err := doc.WritePDF(context.Background(), out, rmrender.PDFFresh, opts)
+	if closeErr := out.Close(); err == nil {
+		err = closeErr
+	}
+	pdf := filepath.Join(dir, "notes.pdf")
+	if err == nil {
+		err = os.Rename(out.Name(), pdf)
+	}
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	head := make([]byte, 5)
+	if file, err := os.Open(pdf); err == nil {
+		_, _ = io.ReadFull(file, head)
+		file.Close()
+	}
+	fmt.Println(string(head), report.RenderedPages, "pages")
+	// Output:
+	// %PDF- 3 pages
 }
 
 func ExampleDocument_SVG() {

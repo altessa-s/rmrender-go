@@ -23,6 +23,11 @@ static inline bool rmr_pdf_options_read(const rmr_pdf_options* given,
       given->grain > RMR_PDF_GRAIN_GROUP)
     return false;
   out->grain = given->grain;
+  if (given->struct_size >=
+      offsetof(rmr_pdf_options, decimals) + sizeof given->decimals) {
+    if (given->decimals > 6) return false;
+    out->decimals = given->decimals;
+  }
   return true;
 }
 

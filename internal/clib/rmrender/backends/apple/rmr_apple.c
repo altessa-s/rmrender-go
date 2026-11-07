@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../../src/rmr_pdf_edit.h"
 #include "../common/rmr_pdf_options.h"
 #include "rmr_apple_internal.h"
 
@@ -32,6 +33,8 @@ typedef struct {
   rmr_limits limits;
   const rmr_sheet* sheet;
   bool unclipped;
+  rmr_apple_mask_fn masks;
+  void* masks_context;
 } apple_context;
 
 /* rmr_backend begin: save graphics state, derive and apply the page-to-
@@ -426,6 +429,8 @@ static rmr_status draw(void* context, const rmr_draw* d) {
                              1);
     if (d->mask.bytes) {
       const rmr_mask_view* m = &d->mask;
+      rmr_mask_view seen;
+      if (a->masks && a->masks(a->masks_context, m, &seen)) m = &seen;
       CGDataProviderRef provider =
           owned_provider(m->bytes, m->stride * m->height);
       CGImageRef image =
@@ -770,13 +775,24 @@ rmr_status rmr_apple_draw_context(CGContextRef cg, const rmr_plan* plan,
                                   const rmr_limits* limits,
                                   rmr_cancel_fn cancel, void* context,
                                   rmr_error* e) {
+  return rmr_apple_draw_context_range(cg, plan, 0, rmr_plan_count(plan), sheet,
+                                      limits, nullptr, nullptr, cancel, context,
+                                      e);
+}
+
+rmr_status rmr_apple_draw_context_range(
+    CGContextRef cg, const rmr_plan* plan, size_t first, size_t end,
+    const rmr_sheet* sheet, const rmr_limits* limits, rmr_apple_mask_fn masks,
+    void* masks_context, rmr_cancel_fn cancel, void* context, rmr_error* e) {
   if (!cg || !sheet || !valid_sheet(sheet, false))
     return error(e, RMR_ERR_INVALID_ARGUMENT, "invalid native output sheet");
   apple_context state = {.cg = cg,
                          .scale = 1,
                          .limits = limits ? *limits : rmr_limits_default(),
                          .sheet = sheet,
-                         .unclipped = true};
+                         .unclipped = true,
+                         .masks = masks,
+                         .masks_context = masks_context};
   rmr_backend b = backend(&state);
-  return rmr_plan_execute(plan, &b, cancel, context, e);
+  return rmr_plan_execute_range(plan, first, end, &b, cancel, context, e);
 }

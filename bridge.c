@@ -671,6 +671,41 @@ rmr_status rmrgo_document_pdf(const rmrgo_request *r, rmrgo_document *d, uint32_
     return s;
 }
 
+// rmr_output write: the bytes go to the Go writer of the handle in context.
+static rmr_status write_output(void *context, const uint8_t *bytes, size_t size) {
+    return rmrgoWrite((uintptr_t)context, (uint8_t *)bytes, size);
+}
+
+rmr_status rmrgo_document_pdf_write(const rmrgo_request *r, rmrgo_document *d, uint32_t mode,
+                                    size_t maximum_pages, rmr_document_report *report,
+                                    rmr_error *e) {
+    templates t;
+    rmr_page_resources res = resources(r, &t, d->document);
+    rmr_output output = {RMR_OUTPUT_ABI, sizeof output, write_output, (void *)r->handle};
+    rmr_status s;
+    switch (mode) {
+    case RMRGO_PDF_FRESH:
+        s = NATIVE(document_pdf_to_output)(d->document, &res, r->fonts, r->paper, maximum_pages,
+                                           &r->limits, &r->pdf, cancelled, r->cancel, &output,
+                                           report, e);
+        break;
+    case RMRGO_PDF_PRESERVING:
+        s = NATIVE(document_pdf_preserving_to_output)(d->document, &res, r->fonts, r->paper,
+                                                      maximum_pages, &r->limits, &r->pdf,
+                                                      cancelled, r->cancel, &output, report, e);
+        break;
+    case RMRGO_PDF_RECOMPOSED:
+        s = NATIVE(document_pdf_recomposed_to_output)(d->document, &res, r->fonts, r->paper,
+                                                      maximum_pages, &r->limits, &r->pdf,
+                                                      cancelled, r->cancel, &output, report, e);
+        break;
+    default:
+        s = fail(e, RMR_ERR_INVALID_ARGUMENT, "unknown PDF mode");
+    }
+    rmr_template_document_free(t.document);
+    return s;
+}
+
 rmr_status rmrgo_document_svg(const rmrgo_request *r, rmrgo_document *d, size_t maximum_pages,
                               rmr_svg_pages *out, rmr_document_report *report, rmr_error *e) {
     templates t;

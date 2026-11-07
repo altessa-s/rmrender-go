@@ -11,17 +11,19 @@
 #include "../common/rmr_pdf_options.h"
 #include "rmr_linux_internal.h"
 
+/* parts, set for PDF output, receives each finished segment as part `tag`'s
+ * marks; sink is the segment's, on the heap so that a worker can finish it. */
 typedef struct {
   cairo_t* cr;
   cairo_surface_t* surface;
-  rmr_sink sink;
+  rmr_sink* sink;
   rmr_limits limits;
   rmr_sheet sheet;
   uint64_t group;
   double alpha;
   rmr_blend blend;
-  FPDF_DOCUMENT pdf;
-  FPDF_PAGE page;
+  rmr_linux_parts* parts;
+  size_t tag;
   rmr_pdf_grain grain;
   bool dirty, clip_viewport;
 } drawing;
@@ -101,45 +103,120 @@ static void setup(drawing* c) {
   cairo_transform(c->cr, &m);
 }
 
-/* Begins a new single-page Cairo PDF surface writing into c's sink, with
- * the sheet transform already applied. */
+struct rmr_linux_parts {
+  rmr_pdf_builder* builder;
+  rmr_pdf_pipeline* pipeline;
+  size_t window;
+  rmr_linux_page_fn done;
+  void* context;
+  uint32_t* forms;
+  size_t count, capacity;
+};
+
+/* A segment handed to a worker: its context, surface and sink. */
+typedef struct {
+  cairo_t* cr;
+  cairo_surface_t* surface;
+  rmr_sink* sink;
+} segment;
+
+/* Begins a new single-page Cairo PDF surface writing into a new sink, with
+ * the sheet transform already applied. A failed sink allocation leaves an
+ * error surface. */
 static void segment_start(drawing* c) {
-  c->sink = (rmr_sink){.maximum = c->limits.maximum_pdf_bytes};
-  c->surface = cairo_pdf_surface_create_for_stream(
-      rmr_linux_write, &c->sink, c->sheet.width, c->sheet.height);
+  c->sink = calloc(1, sizeof *c->sink);
+  if (c->sink) *c->sink = (rmr_sink){.maximum = c->limits.maximum_pdf_bytes};
+  c->surface =
+      c->sink ? cairo_pdf_surface_create_for_stream(
+                    rmr_linux_write, c->sink, c->sheet.width, c->sheet.height)
+              : cairo_image_surface_create(CAIRO_FORMAT_INVALID, 0, 0);
   c->cr = cairo_create(c->surface);
   setup(c);
   c->dirty = false;
 }
 
-/* Closes the current page's Cairo PDF surface and, if anything was
- * drawn, loads the resulting PDF bytes and forms them as a page object
- * into the destination page. Returns the first failure encountered. */
+/* Shows, finishes and destroys a segment's page; its bytes or failure. */
+static rmr_status segment_finish(segment* g, rmr_buffer* out) {
+  cairo_show_page(g->cr);
+  cairo_status_t cs = cairo_status(g->cr);
+  cairo_destroy(g->cr);
+  cairo_surface_finish(g->surface);
+  if (cs == CAIRO_STATUS_SUCCESS) cs = cairo_surface_status(g->surface);
+  cairo_surface_destroy(g->surface);
+
+  rmr_status s = g->sink ? g->sink->status : RMR_ERR_OUT_OF_MEMORY;
+  if (s == RMR_OK && cs != CAIRO_STATUS_SUCCESS) s = RMR_ERR_BACKEND;
+  if (s == RMR_OK)
+    *out = g->sink->data;
+  else if (g->sink)
+    free(g->sink->data.bytes);
+  free(g->sink);
+  return s;
+}
+
+/* Worker: Cairo's serialization of a segment, into the batch's chunk. */
+static void part_run(rmr_pdf_batch* b) {
+  segment* g = b->work;
+  rmr_buffer bytes = {0};
+  b->status = segment_finish(g, &bytes);
+  b->chunk = (rmr_pdf_text){bytes.bytes, bytes.size, bytes.size, false};
+  free(g);
+  b->work = nullptr;
+}
+
+/* A segment never finished: its Cairo objects and sink are released. */
+static void part_discard(rmr_pdf_batch* b) {
+  segment* g = b->work;
+  rmr_buffer bytes = {0};
+  if (segment_finish(g, &bytes) == RMR_OK) free(bytes.bytes);
+  free(g);
+  b->work = nullptr;
+}
+
+/* Queues a part of page tag: a segment to finish, or ready bytes. */
+static rmr_status part_submit(rmr_linux_parts* parts, size_t tag, segment* g,
+                              rmr_buffer ready) {
+  rmr_pdf_batch* b = calloc(1, sizeof *b);
+  if (!b) {
+    if (g) {
+      rmr_buffer bytes = {0};
+      if (segment_finish(g, &bytes) == RMR_OK) free(bytes.bytes);
+      free(g);
+    }
+    free(ready.bytes);
+    return RMR_ERR_OUT_OF_MEMORY;
+  }
+  b->tag = tag;
+  if (g) {
+    b->work = g;
+    b->run = part_run;
+    b->discard = part_discard;
+  } else
+    b->chunk = (rmr_pdf_text){ready.bytes, ready.size, ready.size, false};
+  rmr_pdf_pipeline_submit(parts->pipeline, b);
+  return RMR_OK;
+}
+
+/* Ends the current segment: a segment something was drawn on is queued to be
+ * finished on a worker as the page's next part; an empty one is finished
+ * here and dropped. Returns the first failure encountered. */
 static rmr_status segment_end(drawing* c) {
   group_end(c);
-  cairo_show_page(c->cr);
-  cairo_status_t cs = cairo_status(c->cr);
-  cairo_destroy(c->cr);
+  segment g = {c->cr, c->surface, c->sink};
   c->cr = nullptr;
-  cairo_surface_finish(c->surface);
-  if (cs == CAIRO_STATUS_SUCCESS) cs = cairo_surface_status(c->surface);
-  cairo_surface_destroy(c->surface);
   c->surface = nullptr;
-
-  rmr_status s = c->sink.status;
-  if (s == RMR_OK && cs != CAIRO_STATUS_SUCCESS) s = RMR_ERR_BACKEND;
-
-  if (s == RMR_OK && c->dirty) {
-    FPDF_DOCUMENT doc =
-        FPDF_LoadMemDocument64(c->sink.data.bytes, c->sink.data.size, nullptr);
-    s = doc ? rmr_pdfium_form(c->pdf, c->page, doc, 0,
-                              (rmr_transform){1, 0, 0, 1, 0, 0})
-            : RMR_ERR_BACKEND;
-    if (doc) FPDF_CloseDocument(doc);
+  c->sink = nullptr;
+  if (c->dirty && g.sink) {
+    segment* moved = malloc(sizeof *moved);
+    if (moved) {
+      *moved = g;
+      return part_submit(c->parts, c->tag, moved, (rmr_buffer){0});
+    }
   }
-
-  rmr_buffer_free(&c->sink.data);
-  return s;
+  rmr_buffer bytes = {0};
+  rmr_status s = segment_finish(&g, &bytes);
+  free(bytes.bytes);
+  return s == RMR_OK && c->dirty ? RMR_ERR_OUT_OF_MEMORY : s;
 }
 
 PangoLayout* rmr_linux_label(cairo_t* cr, const char* text, size_t size,
@@ -285,7 +362,7 @@ static rmr_status paint_pdf_locked(drawing* c, const rmr_draw* d) {
                      ? RMR_OK
                      : RMR_ERR_BACKEND;
 
-  if (s == RMR_OK && c->pdf) {
+  if (s == RMR_OK && c->parts) {
     size_t count = 0;
     rmr_pdf_page_geometry* geometry = nullptr;
     if (s == RMR_OK)
@@ -366,13 +443,10 @@ static rmr_status paint_pdf_locked(drawing* c, const rmr_draw* d) {
             s = rmr_pdf_clip(raw.bytes, raw.size, d->path, q, &c->limits,
                              &clipped);
 
+          /* The clipped page becomes the page's next part. */
           if (s == RMR_OK) {
-            FPDF_DOCUMENT clipped_doc =
-                FPDF_LoadMemDocument64(clipped.bytes, clipped.size, nullptr);
-            s = clipped_doc ? rmr_pdfium_form(c->pdf, c->page, clipped_doc, 0,
-                                              (rmr_transform){1, 0, 0, 1, 0, 0})
-                            : RMR_ERR_BACKEND;
-            if (clipped_doc) FPDF_CloseDocument(clipped_doc);
+            s = part_submit(c->parts, c->tag, nullptr, clipped);
+            clipped = (rmr_buffer){0};
           }
 
           rmr_buffer_free(&clipped);
@@ -563,7 +637,7 @@ static rmr_status draw(void* ctx, const rmr_draw* d) {
     }
   }
 
-  if (d->mode == RMR_PDF && c->pdf) return paint_pdf(c, d);
+  if (d->mode == RMR_PDF && c->parts) return paint_pdf(c, d);
 
   cairo_t* cr = c->cr;
   cairo_save(cr);
@@ -645,7 +719,7 @@ static rmr_status draw(void* ctx, const rmr_draw* d) {
          * antialias the edge twice, lighter than the Apple backend draws it.
          */
         bool layered =
-            c->pdf && (d->color.alpha < 1 || c->grain == RMR_PDF_GRAIN_GROUP);
+            c->parts && (d->color.alpha < 1 || c->grain == RMR_PDF_GRAIN_GROUP);
         if (layered) {
           cairo_push_group(cr);
           cairo_set_source_rgba(cr, d->color.red, d->color.green, d->color.blue,
@@ -819,6 +893,112 @@ rmr_status rmr_linux_bitmap(const rmr_plan* plan, double scale, rmr_color bg,
   return bitmap_on_sheet(plan, &sh, true, bg, limits, cancel, ctx, out, e);
 }
 
+rmr_status rmr_linux_parts_create(rmr_pdf_builder* builder,
+                                  rmr_linux_page_fn done, void* context,
+                                  rmr_linux_parts** out) {
+  rmr_linux_parts* p = calloc(1, sizeof *p);
+  if (!p) return RMR_ERR_OUT_OF_MEMORY;
+  size_t workers = rmr_pdf_pipeline_workers();
+  *p = (rmr_linux_parts){.builder = builder,
+                         .pipeline = rmr_pdf_pipeline_create(workers),
+                         .window = 2 * workers + 2,
+                         .done = done,
+                         .context = context};
+  if (!p->pipeline) {
+    free(p);
+    return RMR_ERR_OUT_OF_MEMORY;
+  }
+  *out = p;
+  return RMR_OK;
+}
+
+void rmr_linux_parts_free(rmr_linux_parts* p) {
+  if (!p) return;
+  rmr_pdf_pipeline_free(p->pipeline);
+  free(p->forms);
+  free(p);
+}
+
+rmr_status rmr_linux_parts_draw(rmr_linux_parts* parts, size_t page,
+                                const rmr_plan* plan, const rmr_sheet* sheet,
+                                const rmr_limits* limits, rmr_pdf_grain grain,
+                                rmr_cancel_fn cancel, void* context,
+                                rmr_error* e) {
+  drawing c = {.limits = *limits,
+               .sheet = *sheet,
+               .parts = parts,
+               .tag = page,
+               .grain = grain};
+  segment_start(&c);
+  rmr_backend b = backend(&c);
+  rmr_status s = rmr_plan_execute(plan, &b, cancel, context, e);
+  if (c.cr) {
+    rmr_status finish = segment_end(&c);
+    if (s == RMR_OK) s = finish;
+  }
+  return s;
+}
+
+rmr_status rmr_linux_parts_close(rmr_linux_parts* parts, size_t page,
+                                 rmr_buffer extra) {
+  rmr_pdf_batch* b = calloc(1, sizeof *b);
+  if (!b) {
+    free(extra.bytes);
+    return RMR_ERR_OUT_OF_MEMORY;
+  }
+  *b = (rmr_pdf_batch){.tag = page, .last = true, .extra = extra};
+  rmr_pdf_pipeline_submit(parts->pipeline, b);
+  return RMR_OK;
+}
+
+rmr_status rmr_linux_parts_collect(rmr_linux_parts* p, bool all) {
+  for (;;) {
+    size_t pending = rmr_pdf_pipeline_pending(p->pipeline);
+    if (!pending) return RMR_OK;
+    rmr_pdf_batch* b =
+        rmr_pdf_pipeline_next(p->pipeline, all || pending > p->window);
+    if (!b) return RMR_OK;
+    rmr_status s = b->status;
+    if (s == RMR_OK && b->last) {
+      s = p->done(p->context, b->tag, p->forms, p->count, b->extra);
+      b->extra = (rmr_buffer){0};
+      p->count = 0;
+    } else if (s == RMR_OK) {
+      if (p->count == p->capacity) {
+        size_t capacity = p->capacity ? p->capacity * 2 : 8;
+        void* grown = realloc(p->forms, capacity * sizeof *p->forms);
+        if (grown) {
+          p->forms = grown;
+          p->capacity = capacity;
+        }
+      }
+      if (p->count == p->capacity)
+        s = RMR_ERR_OUT_OF_MEMORY;
+      else
+        s = rmr_pdf_builder_form(p->builder, b->chunk.bytes, b->chunk.size,
+                                 &p->forms[p->count++], nullptr);
+    }
+    rmr_pdf_batch_free(b);
+    if (s != RMR_OK) return s;
+  }
+}
+
+typedef struct {
+  rmr_pdf_builder* builder;
+  const rmr_sheet* sheets;
+} sheets_output;
+
+/* rmr_linux_page_fn for rmr_linux_render_pdf: a page of its sheet's size
+ * drawing the parts, as PDFium sized it (single precision). */
+static rmr_status sheet_page(void* context, size_t page, const uint32_t* forms,
+                             size_t count, rmr_buffer extra) {
+  sheets_output* o = context;
+  free(extra.bytes);
+  return rmr_pdf_builder_page(
+      o->builder, page, nullptr, 0, (double)(float)o->sheets[page].width,
+      (double)(float)o->sheets[page].height, forms, count, nullptr, 0, nullptr);
+}
+
 rmr_status rmr_linux_render_pdf(const rmr_plan* const* plans,
                                 const rmr_sheet* sheets, size_t count,
                                 const rmr_limits* limits, rmr_pdf_grain grain,
@@ -832,53 +1012,34 @@ rmr_status rmr_linux_render_pdf(const rmr_plan* const* plans,
     if (!plans[i] || !sheet_valid(&sheets[i]))
       return rmr_linux_error(e, RMR_ERR_INVALID_ARGUMENT, "invalid PDF sheet");
 
-  FPDF_DOCUMENT doc = FPDF_CreateNewDocument();
-  if (!doc)
-    return rmr_linux_error(e, RMR_ERR_OUT_OF_MEMORY, "allocation failed");
+  /* Each page's Cairo segments become forms of the page, as PDFium formed
+   * them, written straight into the output as they are finished. */
+  rmr_pdf_builder* builder = nullptr;
+  rmr_linux_parts* parts = nullptr;
+  sheets_output output = {.sheets = sheets};
+  rmr_status s = rmr_pdf_builder_create(limits, nullptr, nullptr, &builder);
+  if (s == RMR_OK) {
+    output.builder = builder;
+    if (!rmr_pdf_builder_pages(builder, count)) s = RMR_ERR_LIMIT;
+  }
+  if (s == RMR_OK)
+    s = rmr_linux_parts_create(builder, sheet_page, &output, &parts);
 
-  rmr_status s = RMR_OK;
   for (size_t i = 0; i < count && s == RMR_OK; i++) {
     if (cancel && cancel(ctx)) {
       s = RMR_ERR_CANCELLED;
       break;
     }
-
-    /* Pages after the first are composed in a document of their own, then
-     * imported: content generation walks every object of the document
-     * holding the page, which would otherwise grow with each page. */
-    FPDF_DOCUMENT single = i ? FPDF_CreateNewDocument() : doc;
-    drawing c = {
-        .limits = *limits, .sheet = sheets[i], .pdf = single, .grain = grain};
-    c.page = single ? FPDFPage_New(single, 0, c.sheet.width, c.sheet.height)
-                    : nullptr;
-    if (!c.page) {
-      if (single && single != doc) FPDF_CloseDocument(single);
-      s = RMR_ERR_BACKEND;
-      break;
-    }
-
-    segment_start(&c);
-    rmr_backend b = backend(&c);
-    s = rmr_plan_execute(plans[i], &b, cancel, ctx, e);
-    if (c.cr) {
-      rmr_status finish = segment_end(&c);
-      if (s == RMR_OK) s = finish;
-    }
-
-    if (s == RMR_OK && !FPDFPage_GenerateContent(c.page)) s = RMR_ERR_BACKEND;
-    FPDF_ClosePage(c.page);
-    if (single != doc) {
-      int first = 0;
-      if (s == RMR_OK &&
-          !FPDF_ImportPagesByIndex(doc, single, &first, 1, (int)i))
-        s = RMR_ERR_BACKEND;
-      FPDF_CloseDocument(single);
-    }
+    s = rmr_linux_parts_draw(parts, i, plans[i], &sheets[i], limits, grain,
+                             cancel, ctx, e);
+    if (s == RMR_OK) s = rmr_linux_parts_close(parts, i, (rmr_buffer){0});
+    if (s == RMR_OK) s = rmr_linux_parts_collect(parts, false);
   }
-
-  if (s == RMR_OK) s = rmr_pdfium_save(doc, limits, out);
-
-  FPDF_CloseDocument(doc);
+  if (s == RMR_OK) s = rmr_linux_parts_collect(parts, true);
+  rmr_linux_parts_free(parts);
+  if (s == RMR_OK)
+    s = rmr_pdf_builder_finish(builder, nullptr, 0, out, nullptr);
+  rmr_pdf_builder_free(builder);
   return s == RMR_OK ? s : rmr_linux_error(e, s, "Linux PDF rendering failed");
 }
 

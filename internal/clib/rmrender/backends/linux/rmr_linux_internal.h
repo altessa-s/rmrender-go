@@ -18,6 +18,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../../src/rmr_pdf_edit.h"
+#include "../common/rmr_pdf_stream.h"
+
 typedef struct {
   rmr_buffer data;
   size_t capacity, maximum;
@@ -62,6 +65,40 @@ rmr_status rmr_linux_render_pdf(const rmr_plan* const* plans,
                                 const rmr_limits* limits, rmr_pdf_grain grain,
                                 rmr_cancel_fn cancel, void* context,
                                 rmr_buffer* out, rmr_error* e);
+
+/* Called for each page of a parts writer once its marks are imported: forms
+ * are the page's Cairo segments and clipped embedded PDFs, in drawing order,
+ * as Form XObjects; extra is what rmr_linux_parts_close was given. */
+typedef rmr_status (*rmr_linux_page_fn)(void* context, size_t page,
+                                        const uint32_t* forms, size_t count,
+                                        rmr_buffer extra);
+
+/* Pages' marks drawn by Cairo, each page into one PDF per segment (a segment
+ * ends where an embedded PDF is drawn, which becomes a part of its own);
+ * the segments are finished, Cairo's own serialization, on worker threads,
+ * and every part is imported into builder in drawing order. */
+typedef struct rmr_linux_parts rmr_linux_parts;
+
+rmr_status rmr_linux_parts_create(rmr_pdf_builder* builder,
+                                  rmr_linux_page_fn done, void* context,
+                                  rmr_linux_parts** out);
+void rmr_linux_parts_free(rmr_linux_parts* parts);
+
+/* Draws plan on sheet as page `page`'s parts and queues their finishing; the
+ * PDFium lock must be held. Fails as rmr_plan_execute does. */
+rmr_status rmr_linux_parts_draw(rmr_linux_parts* parts, size_t page,
+                                const rmr_plan* plan, const rmr_sheet* sheet,
+                                const rmr_limits* limits, rmr_pdf_grain grain,
+                                rmr_cancel_fn cancel, void* context,
+                                rmr_error* error);
+
+/* Ends page `page`, handing extra (owned) to the page callback. */
+rmr_status rmr_linux_parts_close(rmr_linux_parts* parts, size_t page,
+                                 rmr_buffer extra);
+
+/* Imports finished parts and completes pages, oldest first: all of them
+ * when all is set, otherwise waiting only while too many are queued. */
+rmr_status rmr_linux_parts_collect(rmr_linux_parts* parts, bool all);
 
 /* Builds the single-paragraph Pango layout TEXT commands draw: the fixed
  * sans-serif family at an absolute point size. */

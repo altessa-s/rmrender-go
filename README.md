@@ -268,6 +268,63 @@ three modes, which differ only for an imported PDF:
 A page that does not parse fails the call. What could be recovered from is counted in the `Report`: blocks of a page left out, pages that name
 an imported page the PDF does not have, and the links a fresh export could not carry over. `MaximumPages` caps the pages drawn.
 
+`WritePDF` writes the same file to an `io.Writer` as it is produced instead of answering it whole, so a long document's PDF need not fit in
+memory twice, or at all: the bytes are those of `PDF`, handed to the writer in order in pieces of at most 4 MiB, on the calling goroutine. A
+fresh export writes each page as it is finished; a preserving one writes the imported PDF and then the update, and a recomposed one its
+final rewrite, as they go. `Limits.MaximumPDFBytes` still bounds the file, 256 MiB by default: raise it for larger ones. The writer's
+failure stops the export with `StatusBackend` and the writer's error as its cause; on any failure the writer has received part of a file,
+so write to a temporary file and rename it once `WritePDF` succeeds.
+
+```go
+data, err := os.ReadFile("testdata/pages/Notes.rmdoc")
+if err != nil {
+	log.Fatal(err)
+}
+f, err := rmrender.NewFonts(fonts.FS)
+if err != nil {
+	log.Fatal(err)
+}
+defer f.Close()
+doc, err := rmrender.OpenDocument(data, nil)
+if err != nil {
+	fmt.Println(err)
+	return
+}
+defer doc.Close()
+dir, err := os.MkdirTemp("", "notes")
+if err != nil {
+	fmt.Println(err)
+	return
+}
+defer os.RemoveAll(dir)
+// The file is written as it is produced, into a temporary file renamed
+// once it is whole.
+out, err := os.CreateTemp(dir, "notes-*.pdf")
+if err != nil {
+	fmt.Println(err)
+	return
+}
+opts := &rmrender.Options{Fonts: f}
+report, err := doc.WritePDF(context.Background(), out, rmrender.PDFFresh, opts)
+if closeErr := out.Close(); err == nil {
+	err = closeErr
+}
+pdf := filepath.Join(dir, "notes.pdf")
+if err == nil {
+	err = os.Rename(out.Name(), pdf)
+}
+if err != nil {
+	fmt.Println(err)
+	return
+}
+head := make([]byte, 5)
+if file, err := os.Open(pdf); err == nil {
+	_, _ = io.ReadFull(file, head)
+	file.Close()
+}
+fmt.Println(string(head), report.RenderedPages, "pages")
+```
+
 `PDFGrain` says how `PDF` and `PagePDF` draw grained ink, pencils, brushes and ballpoints, whose grain is a stencil clipped to the stroke.
 `PDFGrainMask`, the zero value, draws opaque ink's stencil straight onto the page; `PDFGrainGroup` wraps each grained stroke in a transparency
 group of its own, as the Cairo backend did up to 1.4.1, which doubles the PDF's size and draws the edges lighter in most viewers. Translucent

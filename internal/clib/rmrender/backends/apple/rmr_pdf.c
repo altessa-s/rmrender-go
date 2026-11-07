@@ -9,9 +9,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../../src/rmr_pdf_edit.h"
 #include "../common/rmr_pdf_options.h"
 #include "rmr_apple_internal.h"
 #include "rmr_pdf_platform.h"
+#include "rmr_pdf_writer.h"
 
 struct rmr_apple_pdf_source {
   CFDataRef data;
@@ -556,10 +558,11 @@ rmr_status rmr_apple_pdf_overlay_marks(
     const rmr_apple_pdf_source* source, const rmr_pdf_page* pages, size_t count,
     const rmr_pdf_marks* marks, const rmr_limits* given,
     const rmr_pdf_options* options, rmr_cancel_fn cancel, void* context,
-    rmr_buffer* out, rmr_pdf_report* report, rmr_error* e) {
-  if (!pages || !count || !out)
+    const rmr_output* output, rmr_buffer* out, rmr_pdf_report* report,
+    rmr_error* e) {
+  if (!pages || !count || (!out && !output))
     return fail(e, RMR_ERR_INVALID_ARGUMENT, "missing PDF output pages");
-  /* CoreGraphics draws grain masks straight onto the page either way. */
+  /* Grain masks go straight onto the page either way. */
   rmr_pdf_options checked;
   if (!rmr_pdf_options_read(options, &checked))
     return fail(e, RMR_ERR_INVALID_ARGUMENT, "invalid PDF options");
@@ -615,10 +618,18 @@ rmr_status rmr_apple_pdf_overlay_marks(
     qsort(targets.items, targets.count, sizeof *targets.items,
           destination_order);
   size_t next_target = 0;
-  sink output = {.limit = l.maximum_pdf_bytes};
+  /* Pages whose marks the writer can serialize get them from it, merged into
+   * CoreGraphics' output once it is closed; CoreGraphics draws the rest. */
+  rmr_apple_writer* writer = nullptr;
+  if (rmr_apple_writer_create(&l, checked.decimals, true, &writer) != RMR_OK) {
+    free(targets.items);
+    return fail(e, RMR_ERR_OUT_OF_MEMORY, "PDF sink allocation failed");
+  }
+  sink drawn = {.limit = l.maximum_pdf_bytes};
   CGDataConsumerCallbacks callbacks = {put, nullptr};
-  CGDataConsumerRef consumer = CGDataConsumerCreate(&output, &callbacks);
+  CGDataConsumerRef consumer = CGDataConsumerCreate(&drawn, &callbacks);
   if (!consumer) {
+    rmr_apple_writer_free(writer);
     free(targets.items);
     return fail(e, RMR_ERR_OUT_OF_MEMORY, "PDF sink allocation failed");
   }
@@ -626,13 +637,20 @@ rmr_status rmr_apple_pdf_overlay_marks(
   CGContextRef cg = CGPDFContextCreate(consumer, nullptr, nullptr);
   CGDataConsumerRelease(consumer);
   if (!cg) {
+    rmr_apple_writer_free(writer);
     free(targets.items);
-    free(output.bytes.bytes);
+    free(drawn.bytes.bytes);
     return fail(e, RMR_ERR_BACKEND, "PDF context unavailable");
   }
+  /* The writer's pages go to output as they are deflated, under the header
+   * CoreGraphics has just written; its own output is merged after them. */
+  if (output)
+    rmr_apple_writer_output(writer, output, drawn.bytes.bytes,
+                            drawn.bytes.size);
 
   rmr_status status = RMR_OK;
   bool reported = false; /* set once a marks or drawing call has filled e */
+  bool written = false;  /* set once writing the output has failed */
   rmr_pdf_report result = {0};
   for (size_t i = 0; i < count; i++) {
     if (cancel && cancel(context)) {
@@ -723,14 +741,26 @@ rmr_status rmr_apple_pdf_overlay_marks(
       reported = status != RMR_OK;
     }
     if (status == RMR_OK) {
-      status =
-          rmr_apple_draw_context(cg, plan, &p->sheet, &l, cancel, context, e);
+      /* CoreGraphics draws what only it can, up to the last such draw; the
+       * writer draws the rest after it. */
+      size_t split = rmr_apple_writer_split(plan), all = rmr_plan_count(plan);
+      if (split || !all)
+        status = rmr_apple_draw_context_range(cg, plan, 0, split, &p->sheet, &l,
+                                              rmr_apple_writer_mask, writer,
+                                              cancel, context, e);
+      if (status == RMR_OK && split < all)
+        status = rmr_apple_writer_page(writer, i, plan, split, &p->sheet,
+                                       cancel, context, e);
       reported = status != RMR_OK;
       rmr_pdf_marks_release(marks, i);
     }
+    if (status == RMR_OK) {
+      status = rmr_apple_writer_flush(writer, false);
+      written = status != RMR_OK;
+    }
 
     CGPDFContextEndPage(cg);
-    if (status != RMR_OK || output.status != RMR_OK) break;
+    if (status != RMR_OK || drawn.status != RMR_OK) break;
   }
 
   if (status == RMR_OK && source) {
@@ -763,18 +793,38 @@ rmr_status rmr_apple_pdf_overlay_marks(
   CGContextRelease(cg);
   free(targets.items);
 
-  const char* message = "PDF overlay failed";
-  if (status == RMR_OK && output.status != RMR_OK) {
-    status = output.status;
-    if (status == RMR_ERR_LIMIT) message = "PDF output byte limit";
+  if (status == RMR_OK && drawn.status != RMR_OK) {
+    status = drawn.status;
+    written = true;
   }
+  if (status == RMR_OK && rmr_apple_writer_pages(writer)) {
+    rmr_buffer merged = {0};
+    status = rmr_apple_writer_merge(writer, drawn.bytes.bytes, drawn.bytes.size,
+                                    &merged);
+    written = status != RMR_OK;
+    free(drawn.bytes.bytes);
+    drawn.bytes = merged;
+  } else if (status == RMR_OK && output) {
+    /* CoreGraphics drew every page: its output is the file. */
+    status =
+        output->write(output->context, drawn.bytes.bytes, drawn.bytes.size);
+    written = status != RMR_OK;
+  }
+  rmr_apple_writer_free(writer);
 
   if (status != RMR_OK) {
-    free(output.bytes.bytes);
-    return reported ? status : fail(e, status, message);
+    free(drawn.bytes.bytes);
+    return reported ? status
+                    : fail(e, status,
+                           written && status == RMR_ERR_LIMIT
+                               ? "PDF output byte limit"
+                               : "PDF overlay failed");
   }
 
-  *out = output.bytes;
+  if (output)
+    free(drawn.bytes.bytes);
+  else
+    *out = drawn.bytes;
   if (report) *report = result;
   return RMR_OK;
 }
@@ -785,7 +835,8 @@ rmr_status rmr_apple_pdf_overlay(const rmr_apple_pdf_source* source,
                                  void* context, rmr_buffer* out,
                                  rmr_pdf_report* report, rmr_error* e) {
   return rmr_apple_pdf_overlay_marks(source, pages, count, nullptr, limits,
-                                     nullptr, cancel, context, out, report, e);
+                                     nullptr, cancel, context, nullptr, out,
+                                     report, e);
 }
 
 rmr_status rmr_apple_pdf_overlay_with_options(
@@ -794,7 +845,8 @@ rmr_status rmr_apple_pdf_overlay_with_options(
     rmr_cancel_fn cancel, void* context, rmr_buffer* out,
     rmr_pdf_report* report, rmr_error* e) {
   return rmr_apple_pdf_overlay_marks(source, pages, count, nullptr, limits,
-                                     options, cancel, context, out, report, e);
+                                     options, cancel, context, nullptr, out,
+                                     report, e);
 }
 
 /* The incremental writer edits the page tree it parses itself, while sizes and
@@ -832,12 +884,52 @@ static rmr_status agree(const rmr_apple_pdf_source* source,
   return RMR_OK;
 }
 
+/* Charges a retained overlay PDF to the plan budget, as an overlay made by
+ * rmr_apple_pdf_sheets is. */
+static rmr_status retain(const rmr_buffer* pdf, rmr_limits* limits,
+                         rmr_error* e) {
+  if (pdf->size > limits->maximum_plan_bytes)
+    return fail(e, RMR_ERR_LIMIT, "retained overlay PDF limit");
+  limits->maximum_plan_bytes -= pdf->size;
+  return RMR_OK;
+}
+
+/* Takes the writer's finished overlays into their slots, oldest first,
+ * waiting while more than window are queued; failures report as
+ * rmr_apple_pdf_sheets reports them. */
+static rmr_status collect(rmr_apple_writer* writer, rmr_buffer* pdfs,
+                          rmr_pdf_overlay* overlays, size_t window,
+                          rmr_limits* limits, rmr_error* e) {
+  for (;;) {
+    size_t pending = rmr_apple_writer_pending(writer), slot = 0;
+    if (!pending) return RMR_OK;
+    rmr_buffer pdf = {0};
+    rmr_status status = RMR_OK;
+    if (!rmr_apple_writer_next_overlay(writer, pending > window, &pdf, &slot,
+                                       &status)) {
+      if (status == RMR_OK) return RMR_OK;
+      return fail(e, status, "PDF output memory limit or allocation failure");
+    }
+    if (pdf.size > limits->maximum_pdf_bytes) {
+      rmr_buffer_free(&pdf);
+      return fail(e, RMR_ERR_LIMIT,
+                  "PDF output memory limit or allocation failure");
+    }
+    pdfs[slot] = pdf;
+    overlays[slot].pdf = pdf.bytes;
+    overlays[slot].size = pdf.size;
+    status = retain(&pdfs[slot], limits, e);
+    if (status != RMR_OK) return status;
+  }
+}
+
 rmr_status rmr_apple_pdf_incremental_marks(
     const rmr_apple_pdf_source* source, const rmr_pdf_page* pages, size_t count,
     const rmr_pdf_marks* marks, const rmr_limits* given,
     const rmr_pdf_options* options, rmr_cancel_fn cancel, void* context,
-    rmr_buffer* out, rmr_pdf_incremental_report* report, rmr_error* e) {
-  if (!source || !pages || !out || !count)
+    const rmr_output* output, rmr_buffer* out,
+    rmr_pdf_incremental_report* report, rmr_error* e) {
+  if (!source || !pages || (!out && !output) || !count)
     return fail(e, RMR_ERR_INVALID_ARGUMENT, "missing incremental pages");
   rmr_pdf_options checked;
   if (!rmr_pdf_options_read(options, &checked))
@@ -868,6 +960,12 @@ rmr_status rmr_apple_pdf_incremental_marks(
       count * (sizeof *overlays + sizeof *pdfs + sizeof *geometry);
   size_t used = 0;
   rmr_status status = agree(source, geometry, count, &limits, e);
+  /* Overlays the writer can serialize come back from it in order, each into
+   * its slot; CoreGraphics renders the others in place. */
+  rmr_apple_writer* writer = nullptr;
+  if (status == RMR_OK && rmr_apple_writer_create(&limits, checked.decimals,
+                                                  false, &writer) != RMR_OK)
+    status = fail(e, RMR_ERR_OUT_OF_MEMORY, "incremental page allocation");
 
   for (size_t i = 0; status == RMR_OK && i < count; i++) {
     const rmr_pdf_page* p = &pages[i];
@@ -909,18 +1007,18 @@ rmr_status rmr_apple_pdf_incremental_marks(
     }
 
     t = CGAffineTransformInvert(t);
-    status = rmr_apple_pdf_sheets(&plan, &p->sheet, 1, &limits, cancel, context,
-                                  &pdfs[used], e);
+    bool queued = !rmr_apple_writer_split(plan);
+    status = queued ? rmr_apple_writer_overlay(writer, used, plan, &p->sheet,
+                                               cancel, context, e)
+                    : rmr_apple_pdf_sheets(&plan, &p->sheet, 1, &limits, cancel,
+                                           context, &pdfs[used], e);
     rmr_pdf_marks_release(marks, i);
 
     if (status != RMR_OK) break;
+    status = queued ? collect(writer, pdfs, overlays, 16, &limits, e)
+                    : retain(&pdfs[used], &limits, e);
+    if (status != RMR_OK) break;
 
-    if (pdfs[used].size > limits.maximum_plan_bytes) {
-      status = fail(e, RMR_ERR_LIMIT, "retained overlay PDF limit");
-      break;
-    }
-
-    limits.maximum_plan_bytes -= pdfs[used].size;
     CGRect box = CGRectApplyAffineTransform(
         CGRectMake(0, 0, p->sheet.width, p->sheet.height), t);
     CGRect media = CGPDFPageGetBoxRect(original, kCGPDFMediaBox);
@@ -940,10 +1038,13 @@ rmr_status rmr_apple_pdf_incremental_marks(
     used++;
   }
 
+  if (status == RMR_OK) status = collect(writer, pdfs, overlays, 0, &limits, e);
+  rmr_apple_writer_free(writer);
+
   if (status == RMR_OK)
-    status = rmr_pdf_incremental(
+    status = rmr_pdf_incremental_output(
         CFDataGetBytePtr(source->data), (size_t)CFDataGetLength(source->data),
-        overlays, used, &limits, cancel, context, out, report, e);
+        overlays, used, &limits, cancel, context, output, out, report, e);
 
   for (size_t i = 0; i < count; i++) rmr_buffer_free(&pdfs[i]);
   free(pdfs);
@@ -957,8 +1058,8 @@ rmr_status rmr_apple_pdf_incremental(
     const rmr_limits* limits, rmr_cancel_fn cancel, void* context,
     rmr_buffer* out, rmr_pdf_incremental_report* report, rmr_error* e) {
   return rmr_apple_pdf_incremental_marks(source, pages, count, nullptr, limits,
-                                         nullptr, cancel, context, out, report,
-                                         e);
+                                         nullptr, cancel, context, nullptr, out,
+                                         report, e);
 }
 
 rmr_status rmr_apple_pdf_incremental_with_options(
@@ -967,8 +1068,8 @@ rmr_status rmr_apple_pdf_incremental_with_options(
     rmr_cancel_fn cancel, void* context, rmr_buffer* out,
     rmr_pdf_incremental_report* report, rmr_error* e) {
   return rmr_apple_pdf_incremental_marks(source, pages, count, nullptr, limits,
-                                         options, cancel, context, out, report,
-                                         e);
+                                         options, cancel, context, nullptr, out,
+                                         report, e);
 }
 
 const uint8_t* rmr_apple_pdf_source_data(const rmr_apple_pdf_source* s) {
