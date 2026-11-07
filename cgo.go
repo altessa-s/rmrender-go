@@ -44,7 +44,7 @@ package rmrender
 #cgo linux windows darwin,rmrender_cairo pkg-config: cairo pangocairo pangoft2 fontconfig harfbuzz gdk-pixbuf-2.0
 #cgo linux LDFLAGS: -lpdfium -lpthread
 #cgo darwin,rmrender_cairo LDFLAGS: -lpdfium
-#cgo windows LDFLAGS: -l:pdfium.dll.lib
+#cgo windows LDFLAGS: -l:pdfium.dll.lib -lpthread
 
 #include "bridge.h"
 */
