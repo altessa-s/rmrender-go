@@ -6,6 +6,7 @@
 #include <rmrender/apple_document.h>
 
 #include "../common/rmr_pdf_options.h"
+#include "../common/rmr_pdf_output.h"
 #include "rmr_pdf_platform.h"
 #include "rmr_typography_internal.h"
 
@@ -153,16 +154,14 @@ static void plan_release(void* context, size_t i) {
 
 /* Shared implementation behind the three document PDF export modes and
  * SVG output, which renders each page as soon as it is assembled. */
-static rmr_status document_pdf(const rmr_archive_document* document,
-                               const rmr_page_resources* given_resources,
-                               const rmr_apple_fonts* fonts, rmr_paper paper,
-                               size_t maximum_pages, const rmr_limits* given,
-                               const rmr_pdf_options* options,
-                               rmr_cancel_fn cancel, void* context,
-                               rmr_buffer* out, rmr_document_report* report,
-                               rmr_error* e, pdf_output_mode mode,
-                               double raster_dpi, rmr_svg_pages* svg) {
-  if (!document || (mode == SVG_PAGES ? !svg : !out) ||
+static rmr_status document_pdf(
+    const rmr_archive_document* document,
+    const rmr_page_resources* given_resources, const rmr_apple_fonts* fonts,
+    rmr_paper paper, size_t maximum_pages, const rmr_limits* given,
+    const rmr_pdf_options* options, rmr_cancel_fn cancel, void* context,
+    const rmr_output* output, rmr_buffer* out, rmr_document_report* report,
+    rmr_error* e, pdf_output_mode mode, double raster_dpi, rmr_svg_pages* svg) {
+  if (!document || (mode == SVG_PAGES ? !svg : !out && !output) ||
       paper > RMR_PAPER_TABLET)
     return rmr_apple_text_error(e, RMR_ERR_INVALID_ARGUMENT,
                                 "invalid document render input");
@@ -170,6 +169,14 @@ static rmr_status document_pdf(const rmr_archive_document* document,
   if (!rmr_pdf_options_read(options, &checked))
     return rmr_apple_text_error(e, RMR_ERR_INVALID_ARGUMENT,
                                 "invalid PDF options");
+  /* The export writes through guard, so that a failure of output's own is
+   * reported as one however deep in the export it happens. */
+  rmr_output_guard guard = {0};
+  if (output && !rmr_output_valid(output))
+    return rmr_apple_text_error(e, RMR_ERR_INVALID_ARGUMENT,
+                                "invalid PDF output");
+  if (output) rmr_output_guard_init(&guard, output);
+  const rmr_output* target = output ? &guard.output : nullptr;
 
   rmr_limits limits = given ? *given : rmr_limits_default(), remaining = limits;
   rmr_asset_view pdf = rmr_archive_document_pdf(document);
@@ -378,15 +385,15 @@ static rmr_status document_pdf(const rmr_archive_document* document,
   if (mode == PDF_RECOMPOSED && source)
     status =
         rmr_apple_pdf_recompose_marks(source, pages, count, &marks, &remaining,
-                                      options, cancel, context, out, e);
+                                      options, cancel, context, target, out, e);
   else if (mode == PDF_INCREMENTAL && source)
     status = rmr_apple_pdf_incremental_marks(source, pages, count, &marks,
                                              &remaining, options, cancel,
-                                             context, out, nullptr, e);
+                                             context, target, out, nullptr, e);
   else
     status = rmr_apple_pdf_overlay_marks(source, pages, count, &marks,
                                          &remaining, options, cancel, context,
-                                         out, &result.pdf, e);
+                                         target, out, &result.pdf, e);
   if (status == RMR_OK && report) *report = result;
 
 done:
@@ -401,6 +408,10 @@ done:
   free(pages);
   free(shapes);
   rmr_apple_pdf_source_free(source);
+  if (output && guard.status != RMR_OK) {
+    status = guard.status;
+    failure = "PDF output write failed";
+  }
   return failure ? rmr_apple_text_error(e, status, failure) : status;
 }
 
@@ -410,8 +421,8 @@ rmr_status rmr_apple_document_pdf(
     const rmr_limits* limits, rmr_cancel_fn cancel, void* context,
     rmr_buffer* out, rmr_document_report* report, rmr_error* error) {
   return document_pdf(document, resources, fonts, paper, maximum_pages, limits,
-                      nullptr, cancel, context, out, report, error, PDF_FRESH,
-                      0, nullptr);
+                      nullptr, cancel, context, nullptr, out, report, error,
+                      PDF_FRESH, 0, nullptr);
 }
 
 rmr_status rmr_apple_document_pdf_preserving(
@@ -420,7 +431,7 @@ rmr_status rmr_apple_document_pdf_preserving(
     const rmr_limits* limits, rmr_cancel_fn cancel, void* context,
     rmr_buffer* out, rmr_document_report* report, rmr_error* error) {
   return document_pdf(document, resources, fonts, paper, maximum_pages, limits,
-                      nullptr, cancel, context, out, report, error,
+                      nullptr, cancel, context, nullptr, out, report, error,
                       PDF_INCREMENTAL, 0, nullptr);
 }
 
@@ -430,7 +441,7 @@ rmr_status rmr_apple_document_pdf_recomposed(
     const rmr_limits* limits, rmr_cancel_fn cancel, void* context,
     rmr_buffer* out, rmr_document_report* report, rmr_error* error) {
   return document_pdf(document, resources, fonts, paper, maximum_pages, limits,
-                      nullptr, cancel, context, out, report, error,
+                      nullptr, cancel, context, nullptr, out, report, error,
                       PDF_RECOMPOSED, 0, nullptr);
 }
 
@@ -441,8 +452,8 @@ rmr_status rmr_apple_document_pdf_with_options(
     rmr_cancel_fn cancel, void* context, rmr_buffer* out,
     rmr_document_report* report, rmr_error* error) {
   return document_pdf(document, resources, fonts, paper, maximum_pages, limits,
-                      options, cancel, context, out, report, error, PDF_FRESH,
-                      0, nullptr);
+                      options, cancel, context, nullptr, out, report, error,
+                      PDF_FRESH, 0, nullptr);
 }
 
 rmr_status rmr_apple_document_pdf_preserving_with_options(
@@ -452,7 +463,7 @@ rmr_status rmr_apple_document_pdf_preserving_with_options(
     rmr_cancel_fn cancel, void* context, rmr_buffer* out,
     rmr_document_report* report, rmr_error* error) {
   return document_pdf(document, resources, fonts, paper, maximum_pages, limits,
-                      options, cancel, context, out, report, error,
+                      options, cancel, context, nullptr, out, report, error,
                       PDF_INCREMENTAL, 0, nullptr);
 }
 
@@ -463,7 +474,49 @@ rmr_status rmr_apple_document_pdf_recomposed_with_options(
     rmr_cancel_fn cancel, void* context, rmr_buffer* out,
     rmr_document_report* report, rmr_error* error) {
   return document_pdf(document, resources, fonts, paper, maximum_pages, limits,
-                      options, cancel, context, out, report, error,
+                      options, cancel, context, nullptr, out, report, error,
+                      PDF_RECOMPOSED, 0, nullptr);
+}
+
+rmr_status rmr_apple_document_pdf_to_output(
+    const rmr_archive_document* document, const rmr_page_resources* resources,
+    const rmr_apple_fonts* fonts, rmr_paper paper, size_t maximum_pages,
+    const rmr_limits* limits, const rmr_pdf_options* options,
+    rmr_cancel_fn cancel, void* context, const rmr_output* output,
+    rmr_document_report* report, rmr_error* error) {
+  if (!output)
+    return rmr_apple_text_error(error, RMR_ERR_INVALID_ARGUMENT,
+                                "invalid PDF output");
+  return document_pdf(document, resources, fonts, paper, maximum_pages, limits,
+                      options, cancel, context, output, nullptr, report, error,
+                      PDF_FRESH, 0, nullptr);
+}
+
+rmr_status rmr_apple_document_pdf_preserving_to_output(
+    const rmr_archive_document* document, const rmr_page_resources* resources,
+    const rmr_apple_fonts* fonts, rmr_paper paper, size_t maximum_pages,
+    const rmr_limits* limits, const rmr_pdf_options* options,
+    rmr_cancel_fn cancel, void* context, const rmr_output* output,
+    rmr_document_report* report, rmr_error* error) {
+  if (!output)
+    return rmr_apple_text_error(error, RMR_ERR_INVALID_ARGUMENT,
+                                "invalid PDF output");
+  return document_pdf(document, resources, fonts, paper, maximum_pages, limits,
+                      options, cancel, context, output, nullptr, report, error,
+                      PDF_INCREMENTAL, 0, nullptr);
+}
+
+rmr_status rmr_apple_document_pdf_recomposed_to_output(
+    const rmr_archive_document* document, const rmr_page_resources* resources,
+    const rmr_apple_fonts* fonts, rmr_paper paper, size_t maximum_pages,
+    const rmr_limits* limits, const rmr_pdf_options* options,
+    rmr_cancel_fn cancel, void* context, const rmr_output* output,
+    rmr_document_report* report, rmr_error* error) {
+  if (!output)
+    return rmr_apple_text_error(error, RMR_ERR_INVALID_ARGUMENT,
+                                "invalid PDF output");
+  return document_pdf(document, resources, fonts, paper, maximum_pages, limits,
+                      options, cancel, context, output, nullptr, report, error,
                       PDF_RECOMPOSED, 0, nullptr);
 }
 
@@ -474,6 +527,6 @@ rmr_status rmr_apple_document_svg(
     void* context, rmr_svg_pages* out, rmr_document_report* report,
     rmr_error* error) {
   return document_pdf(document, resources, fonts, paper, maximum_pages, limits,
-                      nullptr, cancel, context, nullptr, report, error,
+                      nullptr, cancel, context, nullptr, nullptr, report, error,
                       SVG_PAGES, raster_dpi, out);
 }

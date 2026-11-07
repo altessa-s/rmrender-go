@@ -108,6 +108,12 @@ rmr_status rmrgo_document_pdf(const rmrgo_request *request, rmrgo_document *docu
                               uint32_t mode, size_t maximum_pages, rmr_buffer *out,
                               rmr_document_report *report, rmr_error *error);
 
+// The same exports written as they are produced, through the Go writer of
+// the request's handle, instead of returned in a buffer.
+rmr_status rmrgo_document_pdf_write(const rmrgo_request *request, rmrgo_document *document,
+                                    uint32_t mode, size_t maximum_pages,
+                                    rmr_document_report *report, rmr_error *error);
+
 // The whole document as SVG, one document per page, as the library's
 // document export makes it.
 rmr_status rmrgo_document_svg(const rmrgo_request *request, rmrgo_document *document,

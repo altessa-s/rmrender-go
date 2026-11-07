@@ -9,6 +9,7 @@
 #include <rmrender/pdf.h>
 #include <stdlib.h>
 
+#include "../../src/rmr_pdf_edit.h"
 #include "rmr_pdf_options.h"
 #include "rmr_pdf_platform.h"
 
@@ -16,8 +17,8 @@ rmr_status RMR_PDF_NATIVE(pdf_recompose_marks)(
     const RMR_PDF_NATIVE(pdf_source) * source, const rmr_pdf_page* pages,
     size_t count, const rmr_pdf_marks* marks, const rmr_limits* given,
     const rmr_pdf_options* options, rmr_cancel_fn cancel, void* context,
-    rmr_buffer* out, rmr_error* error) {
-  if (!pages || !count || !out)
+    const rmr_output* output, rmr_buffer* out, rmr_error* error) {
+  if (!pages || !count || (!out && !output))
     return RMR_PDF_FAIL(error, RMR_ERR_INVALID_ARGUMENT,
                         "missing PDF recomposition input");
   rmr_pdf_options checked;
@@ -26,7 +27,7 @@ rmr_status RMR_PDF_NATIVE(pdf_recompose_marks)(
   if (!source)
     return RMR_PDF_NATIVE(pdf_overlay_marks)(nullptr, pages, count, marks,
                                              given, options, cancel, context,
-                                             out, nullptr, error);
+                                             output, out, nullptr, error);
 
   rmr_limits limits = given ? *given : rmr_limits_default();
   if (count > limits.maximum_draws ||
@@ -83,12 +84,14 @@ rmr_status RMR_PDF_NATIVE(pdf_recompose_marks)(
   if (status == RMR_OK)
     status = RMR_PDF_NATIVE(pdf_incremental_marks)(
         copy, selected_pages, count, marks, &limits, options, cancel, context,
-        &painted, nullptr, error);
+        nullptr, &painted, nullptr, error);
   RMR_PDF_NATIVE(pdf_source_free)(copy);
 
+  /* Only the rewrite goes to output as it is written: it reads the whole
+   * painted file, which reads the whole selection. */
   if (status == RMR_OK)
-    status = rmr_pdf_rewrite(painted.bytes, painted.size, &limits, cancel,
-                             context, out, error);
+    status = rmr_pdf_rewrite_output(painted.bytes, painted.size, &limits,
+                                    cancel, context, output, out, error);
   rmr_buffer_free(&painted);
 
   free(indices);
@@ -105,7 +108,7 @@ rmr_status RMR_PDF_NATIVE(pdf_recompose)(const RMR_PDF_NATIVE(pdf_source) *
                                          rmr_buffer* out, rmr_error* error) {
   return RMR_PDF_NATIVE(pdf_recompose_marks)(source, pages, count, nullptr,
                                              limits, nullptr, cancel, context,
-                                             out, error);
+                                             nullptr, out, error);
 }
 
 rmr_status RMR_PDF_NATIVE(pdf_recompose_with_options)(
@@ -114,5 +117,5 @@ rmr_status RMR_PDF_NATIVE(pdf_recompose_with_options)(
     rmr_cancel_fn cancel, void* context, rmr_buffer* out, rmr_error* error) {
   return RMR_PDF_NATIVE(pdf_recompose_marks)(source, pages, count, nullptr,
                                              limits, options, cancel, context,
-                                             out, error);
+                                             nullptr, out, error);
 }

@@ -61,6 +61,12 @@ func watch(ctx context.Context) (unsafe.Pointer, func()) {
 // request, the callbacks reading o's templates and images, and ctx able to
 // cancel the drawing.
 func render(ctx context.Context, o *Options, f func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status) error {
+	return renderCall(ctx, o, &call{}, f)
+}
+
+// renderCall is render with the callbacks' state c, which may already say
+// where output goes.
+func renderCall(ctx context.Context, o *Options, c *call, f func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -71,7 +77,6 @@ func render(ctx context.Context, o *Options, f func(r *C.rmrgo_request, cerr *C.
 	if err != nil {
 		return err
 	}
-	c := &call{}
 	if o != nil {
 		c.templates = o.Templates
 		c.images = o.Images

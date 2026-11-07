@@ -12,6 +12,7 @@ import "C"
 import (
 	"context"
 	"image"
+	"io"
 	"sync"
 	"unsafe"
 )
@@ -292,16 +293,9 @@ func (d *Document) PageMarks(i int, o *Options) (*Marks, error) {
 // fail the call; what was recovered from is counted in the report.
 func (d *Document) PDF(ctx context.Context, mode PDFMode, o *Options) ([]byte, Report, error) {
 	var report Report
-	var cmode C.uint32_t
-	switch mode {
-	case PDFFresh:
-		cmode = C.RMRGO_PDF_FRESH
-	case PDFPreserving:
-		cmode = C.RMRGO_PDF_PRESERVING
-	case PDFRecomposed:
-		cmode = C.RMRGO_PDF_RECOMPOSED
-	default:
-		return nil, report, errInvalid("unknown PDF mode")
+	cmode, err := mode.c()
+	if err != nil {
+		return nil, report, err
 	}
 	maximum, err := o.maximumPages()
 	if err != nil {
@@ -325,6 +319,58 @@ func (d *Document) PDF(ctx context.Context, mode PDFMode, o *Options) ([]byte, R
 		return nil, Report{}, err
 	}
 	return pdf, report, nil
+}
+
+// WritePDF is [Document.PDF] writing the file to w as it is produced instead
+// of answering it whole: the same bytes, in order, handed to w in pieces of
+// at most 4 MiB, so that the file need not fit in memory. A fresh export
+// writes each page as it is finished; a preserving one writes the imported
+// PDF and then its update, and a recomposed one its final rewrite, as they
+// go, each holding what the [Document.PDF] of its mode holds before that.
+// o.Limits.MaximumPDFBytes still bounds the file: raise it for files past
+// its default.
+//
+// w's failure stops the export with StatusBackend, the message "PDF output
+// write failed" and w's error as the cause; w is not called again. On any
+// failure, cancellation included, w has received part of a file, which the
+// caller discards. w is called on the calling goroutine, during the call
+// only, and must not call back into this package.
+func (d *Document) WritePDF(ctx context.Context, w io.Writer, mode PDFMode, o *Options) (Report, error) {
+	if w == nil {
+		return Report{}, errInvalid("nil writer")
+	}
+	cmode, err := mode.c()
+	if err != nil {
+		return Report{}, err
+	}
+	maximum, err := o.maximumPages()
+	if err != nil {
+		return Report{}, err
+	}
+	var cr C.rmr_document_report
+	c := &call{out: &output{w: w}}
+	err = d.use(func(doc *C.rmrgo_document) error {
+		return renderCall(ctx, o, c, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
+			return C.rmrgo_document_pdf_write(r, doc, cmode, C.size_t(maximum), &cr, cerr)
+		})
+	})
+	if err != nil {
+		return Report{}, err
+	}
+	return reportOf(&cr)
+}
+
+// c answers the mode for C, refusing one this package does not name.
+func (mode PDFMode) c() (C.uint32_t, error) {
+	switch mode {
+	case PDFFresh:
+		return C.RMRGO_PDF_FRESH, nil
+	case PDFPreserving:
+		return C.RMRGO_PDF_PRESERVING, nil
+	case PDFRecomposed:
+		return C.RMRGO_PDF_RECOMPOSED, nil
+	}
+	return 0, errInvalid("unknown PDF mode")
 }
 
 // maximumPages answers the page cap of a document export, zero for all.
