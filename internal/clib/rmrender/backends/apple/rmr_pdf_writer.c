@@ -28,10 +28,21 @@
  *   image matrix is [a*w 0 0 -d*h tx' ty'], at Perceptual intent.
  * - Colors are in sRGB through an ICCBased space; the context alpha goes to
  *   /ca for fills and /CA for strokes, the blend mode to /BM.
+ * - A transparency group (BeginTransparencyLayer) is a Form XObject: an
+ *   isolated, non-knockout group blending in Generic RGB, clipped inside to
+ *   the page's media box, its members drawn as on the page, painted inside
+ *   q/Q under the group's alpha (/ca) and blend mode (/BM). Its BBox is the
+ *   union of what CoreGraphics records for each member (see member_box); a
+ *   group whose BBox misses the media box is not written at all.
  * - Every number goes through rmr_pdf_number, CoreGraphics' own formatting.
  *
  * Graphics state is emitted where it changes, as CoreGraphics does; only its
- * order and the q/Q nesting differ, which do not change what is painted. */
+ * order and the q/Q nesting differ, which do not change what is painted.
+ *
+ * A page's template, its plan's leading background draws, is written as a
+ * Form XObject of its own, once per document for every page whose template
+ * draws the same: CoreGraphics would draw it on the page itself, and the
+ * form paints what those operators paint. */
 
 enum { BLOCK = 64 };
 
@@ -49,6 +60,12 @@ typedef struct {
   uint32_t number;
 } state_entry;
 
+/* A template's Form XObject, by the digest of its dictionary and content. */
+typedef struct {
+  rmr_pdf_digest digest;
+  uint32_t number;
+} form_entry;
+
 /* Shared objects already written and their numbers: one set per merged
  * document, or one per overlay PDF. */
 typedef struct {
@@ -56,12 +73,15 @@ typedef struct {
   size_t image_count, image_capacity;
   state_entry* states;
   size_t state_count;
-  uint32_t profile, space;
+  form_entry* forms; /* open addressing, capacity a power of two */
+  size_t form_count, form_capacity;
+  uint32_t profile, space, group_profile, group_space;
 } catalog;
 
 static void catalog_free(catalog* c) {
   free(c->images);
   free(c->states);
+  free(c->forms);
   *c = (catalog){0};
 }
 
@@ -71,13 +91,45 @@ struct rmr_apple_writer {
   bool merged;
   rmr_pdf_pipeline* pipeline;
   size_t window;
-  CFDataRef profile;
+  /* sRGB, which colors are in, and Generic RGB, which CoreGraphics'
+   * transparency layers blend in. */
+  CFDataRef profile, group_profile;
   /* Merged documents. */
   rmr_pdf_builder* builder;
   catalog shared;
   rmr_pdf_page_objects* pages;
   size_t page_count, page_capacity;
 };
+
+/* A content stream being written, the resources it names and the graphics
+ * state in effect outside q/Q: a page's, or a Form XObject's. */
+typedef struct {
+  rmr_pdf_text content;
+  uint32_t *xobjects, *states;
+  size_t xobject_count, xobject_capacity, state_count, state_capacity;
+  bool space;
+  bool has_fill, has_stroke;
+  double fill[3], stroke[3], ca, stroke_alpha, line_width, miter;
+  rmr_blend blend;
+  int cap, join;
+} stream;
+
+/* PDF's initial graphics state. */
+static void initial(stream* s) {
+  s->has_fill = s->has_stroke = false;
+  s->ca = s->stroke_alpha = 1;
+  s->line_width = 1;
+  s->miter = 10;
+  s->blend = RMR_BLEND_NORMAL;
+  s->cap = s->join = 0;
+}
+
+static void stream_free(stream* s) {
+  rmr_pdf_text_free(&s->content);
+  free(s->xobjects);
+  free(s->states);
+  *s = (stream){0};
+}
 
 /* Per-page serialization state; the rmr_backend context. */
 typedef struct {
@@ -86,19 +138,17 @@ typedef struct {
   catalog local;
   rmr_pdf_batch* batch;
   uint32_t next; /* overlay numbering; 0 numbers from the builder */
-  rmr_pdf_text content;
-  uint32_t *xobjects, *states;
-  size_t xobject_count, xobject_capacity, state_count, state_capacity;
-  bool space;
+  stream s;      /* being written */
+  stream outer;  /* the page's, while s is a form's */
+  /* The open transparency group, 0 for none, and its members' bounds. */
+  uint64_t group;
+  double group_alpha;
+  rmr_blend group_blend;
+  CGRect box;
   CGAffineTransform ctm, inverse;
   bool clip;
   double width, height;
   unsigned decimals;
-  /* Graphics state in effect outside q/Q. */
-  bool has_fill, has_stroke;
-  double fill[3], stroke[3], ca, stroke_alpha, line_width, miter;
-  rmr_blend blend;
-  int cap, join;
 } page;
 
 static uint32_t number(page* p) {
@@ -121,46 +171,56 @@ static bool list_add(uint32_t** list, size_t* count, size_t* capacity,
   return true;
 }
 
-static void put(page* p, const char* s) { rmr_pdf_text_string(&p->content, s); }
+static void put(page* p, const char* s) {
+  rmr_pdf_text_string(&p->s.content, s);
+}
 
 /* A number exactly as CoreGraphics prints it. */
 static void exact(page* p, double v) {
-  rmr_pdf_text_number(&p->content, v, 0);
-  rmr_pdf_text_append(&p->content, " ", 1);
+  rmr_pdf_text_number(&p->s.content, v, 0);
+  rmr_pdf_text_append(&p->s.content, " ", 1);
 }
 
 /* A path coordinate: as CoreGraphics prints it, or rounded when asked. */
 static void coordinate(page* p, double v) {
-  rmr_pdf_text_number(&p->content, v, p->decimals);
-  rmr_pdf_text_append(&p->content, " ", 1);
+  rmr_pdf_text_number(&p->s.content, v, p->decimals);
+  rmr_pdf_text_append(&p->s.content, " ", 1);
+}
+
+/* An ICCBased color space of profile icc, its stream and array objects
+ * written once per catalog into *profile and *space; *space, or 0 on
+ * failure. */
+static uint32_t icc_space(page* p, CFDataRef icc, uint32_t* profile,
+                          uint32_t* space) {
+  if (!*space) {
+    size_t size = (size_t)CFDataGetLength(icc);
+    uint32_t data_number = number(p), array = number(p);
+    /* Adding an object may move those added before it. */
+    size_t at = p->batch->count;
+    bool added = data_number && array &&
+                 rmr_pdf_batch_add(p->batch, data_number, true) &&
+                 rmr_pdf_batch_add(p->batch, array, false);
+    rmr_pdf_object* data = added ? &p->batch->objects[at] : nullptr;
+    rmr_pdf_object* list = added ? &p->batch->objects[at + 1] : nullptr;
+    uint8_t* bytes = added ? malloc(size) : nullptr;
+    if (!bytes) return 0;
+    memcpy(bytes, CFDataGetBytePtr(icc), size);
+    data->data = bytes;
+    data->size = size;
+    rmr_pdf_text_string(&data->dict, "/N 3 /Alternate /DeviceRGB");
+    rmr_pdf_text_format(&list->dict, "[ /ICCBased %u 0 R ]", data_number);
+    *profile = data_number;
+    *space = array;
+  }
+  return *space;
 }
 
 /* The sRGB ICCBased color space, written once per catalog. */
 static uint32_t color_space(page* p) {
   catalog* c = p->resources;
-  if (!c->space) {
-    CFDataRef icc = p->writer->profile;
-    size_t size = (size_t)CFDataGetLength(icc);
-    uint32_t profile = number(p), space = number(p);
-    /* Adding an object may move those added before it. */
-    size_t at = p->batch->count;
-    bool added = profile && space &&
-                 rmr_pdf_batch_add(p->batch, profile, true) &&
-                 rmr_pdf_batch_add(p->batch, space, false);
-    rmr_pdf_object* stream = added ? &p->batch->objects[at] : nullptr;
-    rmr_pdf_object* array = added ? &p->batch->objects[at + 1] : nullptr;
-    uint8_t* data = added ? malloc(size) : nullptr;
-    if (!data) return 0;
-    memcpy(data, CFDataGetBytePtr(icc), size);
-    stream->data = data;
-    stream->size = size;
-    rmr_pdf_text_string(&stream->dict, "/N 3 /Alternate /DeviceRGB");
-    rmr_pdf_text_format(&array->dict, "[ /ICCBased %u 0 R ]", profile);
-    c->profile = profile;
-    c->space = space;
-  }
-  p->space = true;
-  return c->space;
+  uint32_t space = icc_space(p, p->writer->profile, &c->profile, &c->space);
+  if (space) p->s.space = true;
+  return space;
 }
 
 /* A graphics state dictionary holding one entry (key and value text),
@@ -179,7 +239,7 @@ static uint32_t graphics_state(page* p, const char* key, double alpha,
   catalog* c = p->resources;
   for (size_t i = 0; i < c->state_count; i++)
     if (!strcmp(c->states[i].key, text)) {
-      return list_add(&p->states, &p->state_count, &p->state_capacity,
+      return list_add(&p->s.states, &p->s.state_count, &p->s.state_capacity,
                       c->states[i].number)
                  ? c->states[i].number
                  : 0;
@@ -198,14 +258,15 @@ static uint32_t graphics_state(page* p, const char* key, double alpha,
   state_entry* e = &c->states[c->state_count++];
   snprintf(e->key, sizeof e->key, "%s", text);
   e->number = n;
-  return list_add(&p->states, &p->state_count, &p->state_capacity, n) ? n : 0;
+  return list_add(&p->s.states, &p->s.state_count, &p->s.state_capacity, n) ? n
+                                                                            : 0;
 }
 
 static bool use_state(page* p, const char* key, double alpha,
                       const char* name) {
   uint32_t n = graphics_state(p, key, alpha, name);
   if (!n) return false;
-  rmr_pdf_text_format(&p->content, "/RMRg%u gs\n", n);
+  rmr_pdf_text_format(&p->s.content, "/RMRg%u gs\n", n);
   return true;
 }
 
@@ -219,17 +280,17 @@ static const char* blend_name(rmr_blend b) {
  * to the given values. */
 static bool outer_state(page* p, double ca, double stroke_alpha,
                         rmr_blend blend) {
-  if (ca != p->ca) {
+  if (ca != p->s.ca) {
     if (!use_state(p, "ca", ca, nullptr)) return false;
-    p->ca = ca;
+    p->s.ca = ca;
   }
-  if (stroke_alpha != p->stroke_alpha) {
+  if (stroke_alpha != p->s.stroke_alpha) {
     if (!use_state(p, "CA", stroke_alpha, nullptr)) return false;
-    p->stroke_alpha = stroke_alpha;
+    p->s.stroke_alpha = stroke_alpha;
   }
-  if (blend != p->blend) {
+  if (blend != p->s.blend) {
     if (!use_state(p, "BM", 0, blend_name(blend))) return false;
-    p->blend = blend;
+    p->s.blend = blend;
   }
   return true;
 }
@@ -237,7 +298,8 @@ static bool outer_state(page* p, double ca, double stroke_alpha,
 static bool set_color(page* p, rmr_color c, bool stroke) {
   uint32_t space = color_space(p);
   if (!space) return false;
-  rmr_pdf_text_format(&p->content, "/RMRc%u %s ", space, stroke ? "CS" : "cs");
+  rmr_pdf_text_format(&p->s.content, "/RMRc%u %s ", space,
+                      stroke ? "CS" : "cs");
   exact(p, c.red);
   exact(p, c.green);
   exact(p, c.blue);
@@ -246,8 +308,8 @@ static bool set_color(page* p, rmr_color c, bool stroke) {
 }
 
 static bool outer_color(page* p, rmr_color c, bool stroke) {
-  bool* has = stroke ? &p->has_stroke : &p->has_fill;
-  double* now = stroke ? p->stroke : p->fill;
+  bool* has = stroke ? &p->s.has_stroke : &p->s.has_fill;
+  double* now = stroke ? p->s.stroke : p->s.fill;
   if (*has && now[0] == c.red && now[1] == c.green && now[2] == c.blue)
     return true;
   if (!set_color(p, c, stroke)) return false;
@@ -263,23 +325,23 @@ static void outer_line(page* p, const rmr_draw* d) {
   int cap = d->cap == RMR_CAP_ROUND ? 1 : d->cap == RMR_CAP_SQUARE ? 2 : 0;
   int join = d->join == RMR_JOIN_ROUND ? 1 : d->join == RMR_JOIN_MITER ? 0 : 2;
   double miter = d->miter_limit != 0 ? d->miter_limit : 10;
-  if (d->line_width != p->line_width) {
+  if (d->line_width != p->s.line_width) {
     exact(p, d->line_width);
     put(p, "w\n");
-    p->line_width = d->line_width;
+    p->s.line_width = d->line_width;
   }
-  if (cap != p->cap) {
-    rmr_pdf_text_format(&p->content, "%d J\n", cap);
-    p->cap = cap;
+  if (cap != p->s.cap) {
+    rmr_pdf_text_format(&p->s.content, "%d J\n", cap);
+    p->s.cap = cap;
   }
-  if (join != p->join) {
-    rmr_pdf_text_format(&p->content, "%d j\n", join);
-    p->join = join;
+  if (join != p->s.join) {
+    rmr_pdf_text_format(&p->s.content, "%d j\n", join);
+    p->s.join = join;
   }
-  if (miter != p->miter) {
+  if (miter != p->s.miter) {
     exact(p, miter);
     put(p, "M\n");
-    p->miter = miter;
+    p->s.miter = miter;
   }
 }
 
@@ -445,6 +507,85 @@ static rmr_status erased_path(const rmr_draw* d, CGPathRef* out) {
   return RMR_ERR_UNSUPPORTED;
 }
 
+/* A path being mapped into device space, as CoreGraphics keeps it. */
+typedef struct {
+  CGMutablePathRef path;
+  CGAffineTransform t;
+} device_mapper;
+
+/* CGPathApply callback adding an element in device space, a quadratic
+ * segment as it is. */
+static void device_element(void* info, const CGPathElement* e) {
+  device_mapper* m = info;
+  const CGPoint* q = e->points;
+  CGPoint a, b, c;
+  switch (e->type) {
+    case kCGPathElementMoveToPoint:
+      a = device(m->t, q[0].x, q[0].y);
+      CGPathMoveToPoint(m->path, nullptr, a.x, a.y);
+      break;
+    case kCGPathElementAddLineToPoint:
+      a = device(m->t, q[0].x, q[0].y);
+      CGPathAddLineToPoint(m->path, nullptr, a.x, a.y);
+      break;
+    case kCGPathElementAddQuadCurveToPoint:
+      a = device(m->t, q[0].x, q[0].y);
+      b = device(m->t, q[1].x, q[1].y);
+      CGPathAddQuadCurveToPoint(m->path, nullptr, a.x, a.y, b.x, b.y);
+      break;
+    case kCGPathElementAddCurveToPoint:
+      a = device(m->t, q[0].x, q[0].y);
+      b = device(m->t, q[1].x, q[1].y);
+      c = device(m->t, q[2].x, q[2].y);
+      CGPathAddCurveToPoint(m->path, nullptr, a.x, a.y, b.x, b.y, c.x, c.y);
+      break;
+    case kCGPathElementCloseSubpath:
+      CGPathCloseSubpath(m->path);
+      break;
+  }
+}
+
+/* What CoreGraphics records of a draw inside a transparency layer, the
+ * layer's BBox being the union of its members': the bounds of the path in
+ * device space (erased, when erasers cut it); a stroke's grown on every side
+ * by its width, or by its width times half its miter limit for mitered joins
+ * when that is more; for a grain mask, its image's rectangle within the
+ * bounds of its clip's control points. image is that rectangle's corner,
+ * set for a mask. False on allocation failure. */
+static bool member_box(const page* p, const rmr_draw* d, CGPathRef erased,
+                       CGPoint image, CGRect* out) {
+  device_mapper m = {CGPathCreateMutable(), p->ctm};
+  if (!m.path) return false;
+  if (erased) {
+    CGPathApply(erased, &m, device_element);
+  } else {
+    CGPathRef path = native_path(d->path);
+    if (!path) {
+      CGPathRelease(m.path);
+      return false;
+    }
+    CGPathApply(path, &m, device_element);
+    CGPathRelease(path);
+  }
+  CGRect r = d->mask.bytes ? CGPathGetBoundingBox(m.path)
+                           : CGPathGetPathBoundingBox(m.path);
+  CGPathRelease(m.path);
+  if (d->mode == RMR_STROKE && !erased) {
+    double limit = d->miter_limit != 0 ? d->miter_limit : 10;
+    double grow = d->line_width *
+                  (d->join == RMR_JOIN_MITER ? fmax(limit / 2, 1) : 1) *
+                  p->ctm.a;
+    r = CGRectInset(r, -grow, -grow);
+  }
+  if (d->mask.bytes)
+    r = CGRectIntersection(CGRectStandardize(CGRectMake(
+                               image.x, image.y, p->ctm.a * d->mask.box.width,
+                               -p->ctm.d * d->mask.box.height)),
+                           r);
+  *out = r;
+  return true;
+}
+
 /* The first eight bytes of a digest, where the image table starts looking. */
 static size_t slot(const rmr_pdf_digest* d) {
   uint64_t v = 0;
@@ -486,6 +627,32 @@ static image_entry* image_lookup(catalog* c, const rmr_mask_view* m,
   return &c->images[at];
 }
 
+/* The entry for a template form of digest d, added unnumbered when it was
+ * not seen before; null on allocation failure. */
+static form_entry* form_lookup(catalog* c, rmr_pdf_digest d) {
+  if (c->form_count + 1 > c->form_capacity / 4 * 3) {
+    size_t capacity = c->form_capacity ? c->form_capacity * 2 : 16;
+    form_entry* grown = calloc(capacity, sizeof *grown);
+    if (!grown) return nullptr;
+    for (size_t i = 0; i < c->form_capacity; i++)
+      if (c->forms[i].number) {
+        size_t at = slot(&c->forms[i].digest) & (capacity - 1);
+        while (grown[at].number) at = (at + 1) & (capacity - 1);
+        grown[at] = c->forms[i];
+      }
+    free(c->forms);
+    c->forms = grown;
+    c->form_capacity = capacity;
+  }
+
+  size_t at = slot(&d) & (c->form_capacity - 1);
+  for (; c->forms[at].number; at = (at + 1) & (c->form_capacity - 1))
+    if (!memcmp(c->forms[at].digest.bytes, d.bytes, sizeof d.bytes))
+      return &c->forms[at];
+  c->forms[at].digest = d;
+  return &c->forms[at];
+}
+
 /* The grain mask as an image XObject, its rows packed as PDF expects, with
  * the dimensions first seen with its bytes. Its number, or 0 on failure. */
 static uint32_t mask_image(page* p, const rmr_mask_view* m) {
@@ -514,7 +681,7 @@ static uint32_t mask_image(page* p, const rmr_mask_view* m) {
                         width, height);
     e->number = n;
   }
-  return list_add(&p->xobjects, &p->xobject_count, &p->xobject_capacity,
+  return list_add(&p->s.xobjects, &p->s.xobject_count, &p->s.xobject_capacity,
                   e->number)
              ? e->number
              : 0;
@@ -548,17 +715,126 @@ static void transform(page* p) {
   put(p, "cm\n");
 }
 
-/* rmr_backend begin: the sheet's transform; an overlay is clipped to its
- * sheet. */
-static rmr_status begin(void* context, rmr_rect viewport) {
-  (void)viewport;
-  page* p = context;
-  if (p->clip) {
-    put(p, "q\n0 0 ");
-    exact(p, p->width);
-    exact(p, p->height);
-    put(p, "re\nW n\n");
+/* "q 0 0 <width> <height> re W n": the media box, as CoreGraphics clips an
+ * overlay to its sheet and every transparency layer to the page. */
+static void media_clip(page* p) {
+  put(p, "q\n0 0 ");
+  exact(p, p->width);
+  exact(p, p->height);
+  put(p, "re\nW n\n");
+}
+
+/* Writes the resource dictionary of what s names, after the objects'
+ * numbers. */
+static void resource_names(rmr_pdf_text* d, const stream* s, uint32_t space) {
+  rmr_pdf_text_string(d, "<<");
+  if (s->space)
+    rmr_pdf_text_format(d, " /ColorSpace << /RMRc%u %u 0 R >>", space, space);
+  if (s->state_count) {
+    rmr_pdf_text_string(d, " /ExtGState <<");
+    for (size_t i = 0; i < s->state_count; i++)
+      rmr_pdf_text_format(d, " /RMRg%u %u 0 R", s->states[i], s->states[i]);
+    rmr_pdf_text_string(d, " >>");
   }
+  if (s->xobject_count) {
+    rmr_pdf_text_string(d, " /XObject <<");
+    for (size_t i = 0; i < s->xobject_count; i++)
+      rmr_pdf_text_format(d, " /RMRx%u %u 0 R", s->xobjects[i], s->xobjects[i]);
+    rmr_pdf_text_string(d, " >>");
+  }
+  rmr_pdf_text_string(d, " >>");
+}
+
+/* Starts writing a Form XObject's content in place of the page's. */
+static void form_begin(page* p) {
+  p->outer = p->s;
+  p->s = (stream){0};
+  initial(&p->s);
+}
+
+/* Stops writing the form's content, returned, and goes back to the page's. */
+static stream form_end(page* p) {
+  stream form = p->s;
+  p->s = p->outer;
+  p->outer = (stream){0};
+  return form;
+}
+
+/* Opens a transparency group as rmr_apple.c's BeginTransparencyLayer does. */
+static void open_group(page* p, const rmr_draw* d) {
+  form_begin(p);
+  /* Inside the group alpha and blend mode start from their initial values;
+   * the rest comes from where the group is painted, and is set again. */
+  p->s.line_width = p->s.miter = NAN;
+  p->s.cap = p->s.join = -1;
+  p->group = d->group;
+  p->group_alpha = d->group_alpha;
+  p->group_blend = d->group_blend;
+  p->box = CGRectNull;
+  media_clip(p);
+}
+
+/* Closes the open group, writing it as a transparency group Form XObject and
+ * painting it under its alpha and blend mode, as EndTransparencyLayer does
+ * for a layer that reaches the media box; false on allocation failure. */
+static bool close_group(page* p) {
+  put(p, "Q\n");
+  stream form = form_end(p);
+  p->group = 0;
+  bool ok = !form.content.failed;
+  if (ok &&
+      CGRectIntersectsRect(p->box, CGRectMake(0, 0, p->width, p->height))) {
+    catalog* c = p->resources;
+    uint32_t space = icc_space(p, p->writer->group_profile, &c->group_profile,
+                               &c->group_space);
+    uint32_t n = space ? number(p) : 0;
+    rmr_pdf_object* o = n ? rmr_pdf_batch_add(p->batch, n, true) : nullptr;
+    if (!o) {
+      ok = false;
+    } else {
+      rmr_pdf_text* d = &o->dict;
+      char box[4][RMR_PDF_NUMBER_SIZE];
+      size_t length[4] = {rmr_pdf_number(box[0], CGRectGetMinX(p->box)),
+                          rmr_pdf_number(box[1], CGRectGetMinY(p->box)),
+                          rmr_pdf_number(box[2], CGRectGetMaxX(p->box)),
+                          rmr_pdf_number(box[3], CGRectGetMaxY(p->box))};
+      rmr_pdf_text_string(d,
+                          "/Type /XObject /Subtype /Form /FormType 1 /BBox [");
+      for (size_t i = 0; i < 4; i++) {
+        rmr_pdf_text_append(d, box[i], length[i]);
+        rmr_pdf_text_string(d, i < 3 ? " " : "]");
+      }
+      rmr_pdf_text_format(d,
+                          " /Group << /S /Transparency /CS %u 0 R /I true "
+                          "/K false >> /Resources ",
+                          space);
+      resource_names(d, &form, c->space);
+      o->data = form.content.bytes;
+      o->size = form.content.size;
+      form.content = (rmr_pdf_text){0};
+      /* Inside q, as CoreGraphics paints a layer: its alpha and blend mode
+       * end at Q. Left set after it, CoreGraphics' own renderer takes them
+       * for set no longer once the group is painted. */
+      double ca = p->s.ca;
+      rmr_blend blend = p->s.blend;
+      put(p, "q\n");
+      ok = outer_state(p, p->group_alpha, p->s.stroke_alpha, p->group_blend) &&
+           list_add(&p->s.xobjects, &p->s.xobject_count, &p->s.xobject_capacity,
+                    n);
+      rmr_pdf_text_format(&p->s.content, "/RMRx%u Do\nQ\n", n);
+      p->s.ca = ca;
+      p->s.blend = blend;
+    }
+  }
+  stream_free(&form);
+  return ok;
+}
+
+/* rmr_backend begin: nothing; serialize clips an overlay itself, around the
+ * template's form too. */
+static rmr_status begin(void* context, rmr_rect viewport) {
+  (void)context;
+  (void)viewport;
   return RMR_OK;
 }
 
@@ -566,10 +842,15 @@ static bool native_only(const rmr_draw* d);
 static bool paints(const rmr_draw* d);
 
 /* rmr_backend draw: one fill, stroke, combined fill and stroke or grain mask,
- * after its erasers; a draw only CoreGraphics can write is left out when it
- * paints nothing, and refused otherwise. */
+ * after its erasers, in or out of a transparency group opened and closed as
+ * the draws' group changes; a draw only CoreGraphics can write is left out
+ * when it paints nothing, and refused otherwise. */
 static rmr_status draw(void* context, const rmr_draw* d) {
   page* p = context;
+  if (d->group != p->group) {
+    if (p->group && !close_group(p)) return RMR_ERR_OUT_OF_MEMORY;
+    if (d->group) open_group(p, d);
+  }
   if (native_only(d)) return paints(d) ? RMR_ERR_UNSUPPORTED : RMR_OK;
   CGPathRef erased = nullptr;
   if (d->eraser_count) {
@@ -584,6 +865,7 @@ static rmr_status draw(void* context, const rmr_draw* d) {
 
   bool ok = true;
   path_writer w = {.p = p};
+  CGPoint image = {0};
   if (d->mode == RMR_FILL_STROKE) {
     outer_line(p, d);
     ok = outer_color(p, d->color, false) &&
@@ -595,8 +877,8 @@ static rmr_status draw(void* context, const rmr_draw* d) {
   } else if (d->mode == RMR_FILL || erased) {
     rmr_color opaque = {d->color.red, d->color.green, d->color.blue, 1};
     if (d->mask.bytes) {
-      uint32_t image = mask_image(p, &d->mask);
-      if (!image) ok = false;
+      uint32_t mask = mask_image(p, &d->mask);
+      if (!mask) ok = false;
       put(p, "q\n");
       if (erased)
         CGPathApply(erased, &w, native_element);
@@ -604,12 +886,12 @@ static rmr_status draw(void* context, const rmr_draw* d) {
         plan_path(p, d->path, false);
       put(p, "W n\n/Perceptual ri\n");
       /* Inside q: color and state changes end at Q. */
-      double ca = p->ca;
-      rmr_blend blend = p->blend;
+      double ca = p->s.ca;
+      rmr_blend blend = p->s.blend;
       ok = ok && set_color(p, opaque, false) &&
-           outer_state(p, d->color.alpha, p->stroke_alpha, d->blend);
-      p->ca = ca;
-      p->blend = blend;
+           outer_state(p, d->color.alpha, p->s.stroke_alpha, d->blend);
+      p->s.ca = ca;
+      p->s.blend = blend;
 
       CGAffineTransform t = p->ctm;
       const rmr_mask_view* m = &d->mask;
@@ -618,6 +900,7 @@ static rmr_status draw(void* context, const rmr_draw* d) {
       double y = fma(t.d, top, fma(t.b, m->box.x, t.ty));
       double a = t.a * 1, b = t.b * 1, c = t.c * -1, e = t.d * -1;
       double zero = 0;
+      image = CGPointMake(x, y);
       put(p, "q ");
       exact(p, fma(a, m->box.width, c * zero));
       exact(p, fma(b, m->box.width, e * zero));
@@ -625,10 +908,10 @@ static rmr_status draw(void* context, const rmr_draw* d) {
       exact(p, fma(b, zero, e * m->box.height));
       exact(p, x + fma(a, zero, c * zero));
       exact(p, y + fma(b, zero, e * zero));
-      rmr_pdf_text_format(&p->content, "cm\n/RMRx%u Do\nQ\nQ\n", image);
+      rmr_pdf_text_format(&p->s.content, "cm\n/RMRx%u Do\nQ\nQ\n", mask);
     } else {
       ok = outer_color(p, opaque, false) &&
-           outer_state(p, d->color.alpha, p->stroke_alpha, d->blend);
+           outer_state(p, d->color.alpha, p->s.stroke_alpha, d->blend);
       if (erased)
         CGPathApply(erased, &w, native_element);
       else
@@ -639,22 +922,27 @@ static rmr_status draw(void* context, const rmr_draw* d) {
     outer_line(p, d);
     rmr_color opaque = {d->color.red, d->color.green, d->color.blue, 1};
     ok = outer_color(p, opaque, true) &&
-         outer_state(p, p->ca, d->color.alpha, d->blend);
+         outer_state(p, p->s.ca, d->color.alpha, d->blend);
     transform(p);
     plan_path(p, d->path, true);
     put(p, "S\nQ\n");
   }
 
+  if (ok && p->group) {
+    CGRect r;
+    ok = member_box(p, d, erased, image, &r);
+    if (ok) p->box = CGRectUnion(p->box, r);
+  }
   if (erased) CGPathRelease(erased);
   /* The output limit is the document's, checked as pages are appended. */
-  return ok && !p->content.failed ? RMR_OK : RMR_ERR_OUT_OF_MEMORY;
+  return ok && !p->s.content.failed ? RMR_OK : RMR_ERR_OUT_OF_MEMORY;
 }
 
-/* rmr_backend end: closes an overlay's clip. */
+/* rmr_backend end: closes the open transparency group, if any. */
 static rmr_status end(void* context) {
   page* p = context;
-  if (p->clip) put(p, "Q\n");
-  return p->content.failed ? RMR_ERR_OUT_OF_MEMORY : RMR_OK;
+  if (p->group && !close_group(p)) return RMR_ERR_OUT_OF_MEMORY;
+  return p->s.content.failed ? RMR_ERR_OUT_OF_MEMORY : RMR_OK;
 }
 
 static void abort_page(void* context) { (void)context; }
@@ -674,8 +962,7 @@ static rmr_backend backend(page* p) {
 
 /* Draws the writer leaves to CoreGraphics. */
 static bool native_only(const rmr_draw* d) {
-  return d->group || d->mode == RMR_TEXT || d->mode == RMR_IMAGE ||
-         d->mode == RMR_PDF;
+  return d->mode == RMR_TEXT || d->mode == RMR_IMAGE || d->mode == RMR_PDF;
 }
 
 /* CGPDFScanner callback: an operator that paints was met. */
@@ -690,7 +977,7 @@ static void painting(CGPDFScannerRef scanner, void* info) {
  * state or clip: a text layer without glyphs is one. Anything else, and any
  * page that does not scan, may. */
 static bool paints(const rmr_draw* d) {
-  if (d->mode != RMR_PDF || d->group || !d->image.bytes || !d->image.size ||
+  if (d->mode != RMR_PDF || !d->image.bytes || !d->image.size ||
       d->pdf_page == SIZE_MAX)
     return true;
   CGDataProviderRef provider = CGDataProviderCreateWithData(
@@ -730,6 +1017,21 @@ size_t rmr_apple_writer_split(const rmr_plan* plan) {
   return 0;
 }
 
+/* The plan's template draws, clamped to the plan. */
+static size_t background(const rmr_plan* plan) {
+  size_t count = rmr_plan_count(plan), leading = rmr_plan_background(plan);
+  return leading < count ? leading : count;
+}
+
+size_t rmr_apple_writer_lead(const rmr_plan* plan) {
+  size_t end = background(plan);
+  for (size_t i = 0; i < end; i++) {
+    const rmr_draw* d = rmr_plan_draw(plan, i);
+    if (native_only(d) && paints(d)) return i;
+  }
+  return end;
+}
+
 rmr_status rmr_apple_writer_create(const rmr_limits* limits, unsigned decimals,
                                    bool merged, rmr_apple_writer** out) {
   rmr_apple_writer* w = calloc(1, sizeof *w);
@@ -744,7 +1046,12 @@ rmr_status rmr_apple_writer_create(const rmr_limits* limits, unsigned decimals,
   CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
   w->profile = srgb ? CGColorSpaceCopyICCData(srgb) : nullptr;
   if (srgb) CGColorSpaceRelease(srgb);
-  rmr_status s = !w->pipeline || !w->profile ? RMR_ERR_OUT_OF_MEMORY : RMR_OK;
+  CGColorSpaceRef generic = CGColorSpaceCreateWithName(kCGColorSpaceGenericRGB);
+  w->group_profile = generic ? CGColorSpaceCopyICCData(generic) : nullptr;
+  if (generic) CGColorSpaceRelease(generic);
+  rmr_status s = !w->pipeline || !w->profile || !w->group_profile
+                     ? RMR_ERR_OUT_OF_MEMORY
+                     : RMR_OK;
   /* CoreGraphics checks nothing here; the builder only accounts output. */
   if (s == RMR_OK && merged)
     s = rmr_pdf_builder_create(&w->limits, nullptr, nullptr, &w->builder);
@@ -760,6 +1067,7 @@ void rmr_apple_writer_free(rmr_apple_writer* w) {
   if (!w) return;
   rmr_pdf_pipeline_free(w->pipeline);
   if (w->profile) CFRelease(w->profile);
+  if (w->group_profile) CFRelease(w->group_profile);
   rmr_pdf_builder_free(w->builder);
   catalog_free(&w->shared);
   for (size_t i = 0; i < w->page_count; i++) {
@@ -808,22 +1116,97 @@ rmr_status rmr_apple_writer_flush(rmr_apple_writer* w, bool all) {
   }
 }
 
+/* Executes draws first to end - 1 of plan into page state p. */
+static rmr_status execute(page* p, const rmr_plan* plan, size_t first,
+                          size_t end, rmr_cancel_fn cancel, void* context,
+                          rmr_error* e) {
+  rmr_backend b = backend(p);
+  return rmr_plan_execute_range(plan, first, end, &b, cancel, context, e);
+}
+
+/* Draws 0 to end - 1 of plan, the page's template, as a Form XObject and
+ * paints it: the form is written once per catalog for templates that draw
+ * the same. Like the page's own, its content starts from PDF's initial
+ * graphics state: it is painted where the page's is, before anything else.
+ * Its box reaches a page beyond each side, so that it clips nothing a
+ * renderer could show. */
+static rmr_status template_form(page* p, const rmr_plan* plan, size_t end,
+                                rmr_cancel_fn cancel, void* context,
+                                rmr_error* e) {
+  form_begin(p);
+  rmr_status s = execute(p, plan, 0, end, cancel, context, e);
+  stream form = form_end(p);
+  if (s != RMR_OK || !form.content.size) {
+    stream_free(&form);
+    return s;
+  }
+
+  catalog* c = p->resources;
+  rmr_pdf_text dict = {0};
+  rmr_pdf_text_string(&dict,
+                      "/Type /XObject /Subtype /Form /FormType 1 /BBox [");
+  double box[] = {-p->width, -p->height, 2 * p->width, 2 * p->height};
+  for (size_t i = 0; i < 4; i++) {
+    rmr_pdf_text_number(&dict, box[i], 0);
+    rmr_pdf_text_string(&dict, i < 3 ? " " : "]");
+  }
+  rmr_pdf_text_string(&dict, " /Resources ");
+  resource_names(&dict, &form, c->space);
+
+  rmr_sha256 h;
+  rmr_sha256_init(&h);
+  rmr_sha256_update(&h, dict.bytes, dict.size);
+  rmr_sha256_update(&h, form.content.bytes, form.content.size);
+  form_entry* entry = !dict.failed && !form.content.failed
+                          ? form_lookup(c, rmr_sha256_final(&h))
+                          : nullptr;
+  bool ok = entry;
+  if (entry && !entry->number) {
+    uint32_t n = number(p);
+    rmr_pdf_object* o = n ? rmr_pdf_batch_add(p->batch, n, true) : nullptr;
+    if (o) {
+      o->dict = dict;
+      dict = (rmr_pdf_text){0};
+      o->data = form.content.bytes;
+      o->size = form.content.size;
+      form.content = (rmr_pdf_text){0};
+      entry->number = n;
+      c->form_count++;
+    } else {
+      /* Unnumbered, the entry is free again. */
+      entry->digest = (rmr_pdf_digest){0};
+      ok = false;
+    }
+  }
+  if (ok) {
+    ok = list_add(&p->s.xobjects, &p->s.xobject_count, &p->s.xobject_capacity,
+                  entry->number);
+    rmr_pdf_text_format(&p->s.content, "/RMRx%u Do\n", entry->number);
+  }
+  rmr_pdf_text_free(&dict);
+  stream_free(&form);
+  return ok ? RMR_OK : RMR_ERR_OUT_OF_MEMORY;
+}
+
 /* Serializes draws first onwards of plan as page state p, already set up,
- * into p->batch, starting from PDF's initial graphics state. */
+ * into p->batch, starting from PDF's initial graphics state: from the first,
+ * its template as a form of its own, then the rest. */
 static rmr_status serialize(page* p, const rmr_plan* plan, size_t first,
                             rmr_cancel_fn cancel, void* context, rmr_error* e) {
-  p->ca = p->stroke_alpha = 1;
-  p->line_width = 1;
-  p->miter = 10;
-  rmr_backend b = backend(p);
-  return rmr_plan_execute_range(plan, first, rmr_plan_count(plan), &b, cancel,
-                                context, e);
+  initial(&p->s);
+  if (p->clip) media_clip(p);
+  size_t start = first ? first : background(plan);
+  rmr_status s = RMR_OK;
+  if (!first && start) s = template_form(p, plan, start, cancel, context, e);
+  if (s == RMR_OK)
+    s = execute(p, plan, start, rmr_plan_count(plan), cancel, context, e);
+  if (s == RMR_OK && p->clip) put(p, "Q\n");
+  return s == RMR_OK && p->s.content.failed ? RMR_ERR_OUT_OF_MEMORY : s;
 }
 
 static void page_free(page* p) {
-  rmr_pdf_text_free(&p->content);
-  free(p->xobjects);
-  free(p->states);
+  stream_free(&p->s);
+  stream_free(&p->outer);
   catalog_free(&p->local);
   rmr_pdf_batch_free(p->batch);
 }
@@ -847,19 +1230,35 @@ static bool valid_sheet(const rmr_sheet* s) {
          isfinite(t.tx) && isfinite(t.ty);
 }
 
+/* A content stream object holding text, or 0 on failure. */
+static uint32_t content_object(page* p, rmr_pdf_text* text) {
+  uint32_t n = rmr_pdf_builder_reserve(p->writer->builder);
+  rmr_pdf_object* o = n ? rmr_pdf_batch_add(p->batch, n, true) : nullptr;
+  if (!o || text->failed) return 0;
+  o->data = text->bytes;
+  o->size = text->size;
+  *text = (rmr_pdf_text){0};
+  return n;
+}
+
 rmr_status rmr_apple_writer_page(rmr_apple_writer* w, size_t index,
-                                 const rmr_plan* plan, size_t first,
-                                 const rmr_sheet* sheet, rmr_cancel_fn cancel,
-                                 void* context, rmr_error* e) {
+                                 const rmr_plan* plan, size_t lead,
+                                 size_t first, const rmr_sheet* sheet,
+                                 rmr_cancel_fn cancel, void* context,
+                                 rmr_error* e) {
   if (!w->merged) return fail(e, RMR_ERR_INVALID_ARGUMENT, "not a document");
   /* As rmr_apple_draw_context checks. */
   if (!valid_sheet(sheet))
     return fail(e, RMR_ERR_INVALID_ARGUMENT, "invalid native output sheet");
+  if (lead && lead >= first)
+    return fail(e, RMR_ERR_INVALID_ARGUMENT, "invalid PDF writer range");
   rmr_transform t = sheet->transform;
   page p = {.writer = w,
             .resources = &w->shared,
             .batch = calloc(1, sizeof(rmr_pdf_batch)),
             .ctm = CGAffineTransformMake(t.a, t.b, t.c, t.d, t.tx, t.ty),
+            .width = sheet->width,
+            .height = sheet->height,
             .decimals = w->decimals};
   p.inverse = CGAffineTransformInvert(p.ctm);
   if (w->page_count == w->page_capacity) {
@@ -875,36 +1274,46 @@ rmr_status rmr_apple_writer_page(rmr_apple_writer* w, size_t index,
   if (!p.batch)
     return fail(e, RMR_ERR_OUT_OF_MEMORY, "PDF page allocation failed");
 
-  rmr_status s = serialize(&p, plan, first, cancel, context, e);
-  if (s != RMR_OK) {
+  /* The template ahead of CoreGraphics' share, in a stream of its own. */
+  uint32_t before = 0;
+  rmr_status s = RMR_OK;
+  if (lead) {
+    initial(&p.s);
+    s = template_form(&p, plan, lead, cancel, context, e);
+    if (s == RMR_OK && p.s.content.size &&
+        !(before = content_object(&p, &p.s.content))) {
+      page_free(&p);
+      return fail(e, RMR_ERR_OUT_OF_MEMORY, "PDF page allocation failed");
+    }
+  }
+  bool rest = first < rmr_plan_count(plan) || !lead;
+  if (s == RMR_OK && rest) s = serialize(&p, plan, first, cancel, context, e);
+  if (s != RMR_OK || (!rest && !before)) {
+    /* A template painting nothing before all CoreGraphics drew. */
     page_free(&p);
     return s;
   }
 
-  uint32_t contents = rmr_pdf_builder_reserve(w->builder);
-  rmr_pdf_object* o =
-      contents ? rmr_pdf_batch_add(p.batch, contents, true) : nullptr;
-  uint32_t* spaces = p.space ? malloc(sizeof *spaces) : nullptr;
-  if (!o || (p.space && !spaces) || p.content.failed) {
+  uint32_t contents = rest ? content_object(&p, &p.s.content) : 0;
+  uint32_t* spaces = p.s.space ? malloc(sizeof *spaces) : nullptr;
+  if ((rest && !contents) || (p.s.space && !spaces)) {
     free(spaces);
     page_free(&p);
     return fail(e, RMR_ERR_OUT_OF_MEMORY, "PDF page allocation failed");
   }
-  o->data = p.content.bytes;
-  o->size = p.content.size;
-  p.content = (rmr_pdf_text){0};
   if (spaces) spaces[0] = w->shared.space;
 
   w->pages[w->page_count++] =
       (rmr_pdf_page_objects){.page = index,
                              .contents = contents,
-                             .xobjects = p.xobjects,
-                             .states = p.states,
+                             .xobjects = p.s.xobjects,
+                             .states = p.s.states,
                              .spaces = spaces,
-                             .xobject_count = p.xobject_count,
-                             .state_count = p.state_count,
-                             .space_count = spaces ? 1 : 0};
-  p.xobjects = p.states = nullptr;
+                             .xobject_count = p.s.xobject_count,
+                             .state_count = p.s.state_count,
+                             .space_count = spaces ? 1 : 0,
+                             .before = before};
+  p.s.xobjects = p.s.states = nullptr;
   rmr_pdf_pipeline_submit(w->pipeline, p.batch);
   p.batch = nullptr;
   page_free(&p);
@@ -978,7 +1387,7 @@ rmr_status rmr_apple_writer_overlay(rmr_apple_writer* w, size_t tag,
                rmr_pdf_batch_add(p.batch, 2, false) &&
                rmr_pdf_batch_add(p.batch, 3, false) &&
                rmr_pdf_batch_add(p.batch, 4, true);
-  if (!added || p.content.failed) {
+  if (!added || p.s.content.failed) {
     page_free(&p);
     return fail(e, RMR_ERR_OUT_OF_MEMORY,
                 "PDF output memory limit or allocation failure");
@@ -995,26 +1404,12 @@ rmr_status rmr_apple_writer_overlay(rmr_apple_writer* w, size_t tag,
   rmr_pdf_text_number(d, sheet->width, 0);
   rmr_pdf_text_string(d, " ");
   rmr_pdf_text_number(d, sheet->height, 0);
-  rmr_pdf_text_string(d, "] /Contents 4 0 R /Resources <<");
-  if (p.space)
-    rmr_pdf_text_format(d, " /ColorSpace << /RMRc%u %u 0 R >>", p.local.space,
-                        p.local.space);
-  if (p.state_count) {
-    rmr_pdf_text_string(d, " /ExtGState <<");
-    for (size_t i = 0; i < p.state_count; i++)
-      rmr_pdf_text_format(d, " /RMRg%u %u 0 R", p.states[i], p.states[i]);
-    rmr_pdf_text_string(d, " >>");
-  }
-  if (p.xobject_count) {
-    rmr_pdf_text_string(d, " /XObject <<");
-    for (size_t i = 0; i < p.xobject_count; i++)
-      rmr_pdf_text_format(d, " /RMRx%u %u 0 R", p.xobjects[i], p.xobjects[i]);
-    rmr_pdf_text_string(d, " >>");
-  }
-  rmr_pdf_text_string(d, " >> >>");
-  content->data = p.content.bytes;
-  content->size = p.content.size;
-  p.content = (rmr_pdf_text){0};
+  rmr_pdf_text_string(d, "] /Contents 4 0 R /Resources ");
+  resource_names(d, &p.s, p.local.space);
+  rmr_pdf_text_string(d, " >>");
+  content->data = p.s.content.bytes;
+  content->size = p.s.content.size;
+  p.s.content = (rmr_pdf_text){0};
 
   p.batch->root = 1;
   p.batch->tag = tag;

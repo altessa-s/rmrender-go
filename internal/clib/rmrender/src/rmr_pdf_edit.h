@@ -109,6 +109,11 @@ RMR_API rmr_status rmr_plan_execute_range(const rmr_plan* plan, size_t first,
                                           rmr_cancel_fn cancel, void* context,
                                           rmr_error* error);
 
+/* How many of plan's leading draws are the page's template, drawn under the
+ * rest; 0 when the plan was not composed over one (only
+ * rmr_template_background_plan_with_text composes one). */
+RMR_API size_t rmr_plan_background(const rmr_plan* plan);
+
 /* A fresh PDF written as it is produced: the caller appends serialized
  * objects numbered from rmr_pdf_builder_reserve, then a finishing call adds
  * the rest of the file and hands over the bytes. Output is bounded by
@@ -149,14 +154,16 @@ RMR_API rmr_status rmr_pdf_builder_append(rmr_pdf_builder* builder,
                                           rmr_error* error);
 
 /* Objects appended for one page of the base document: a content stream
- * drawn after the page's own, and resources named RMRx<n> (XObjects),
- * RMRg<n> (graphics states) and RMRc<n> (color spaces) after their object
- * numbers n, each listed once. */
+ * drawn after the page's own and one drawn before it (either 0 for none, not
+ * both), and resources named RMRx<n> (XObjects), RMRg<n> (graphics states)
+ * and RMRc<n> (color spaces) after their object numbers n, each listed once.
+ * The stream before must leave the graphics state as it found it. */
 typedef struct {
   size_t page;
   uint32_t contents;
   const uint32_t *xobjects, *states, *spaces;
   size_t xobject_count, state_count, space_count;
+  uint32_t before;
 } rmr_pdf_page_objects;
 
 /* Completes the file with every object of base, renumbered after those

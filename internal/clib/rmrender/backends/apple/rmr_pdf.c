@@ -742,14 +742,16 @@ rmr_status rmr_apple_pdf_overlay_marks(
     }
     if (status == RMR_OK) {
       /* CoreGraphics draws what only it can, up to the last such draw; the
-       * writer draws the rest after it. */
+       * writer draws the rest after it, and the page's template up to the
+       * first such draw before it. */
       size_t split = rmr_apple_writer_split(plan), all = rmr_plan_count(plan);
+      size_t lead = split ? rmr_apple_writer_lead(plan) : 0;
       if (split || !all)
-        status = rmr_apple_draw_context_range(cg, plan, 0, split, &p->sheet, &l,
-                                              rmr_apple_writer_mask, writer,
+        status = rmr_apple_draw_context_range(cg, plan, lead, split, &p->sheet,
+                                              &l, rmr_apple_writer_mask, writer,
                                               cancel, context, e);
-      if (status == RMR_OK && split < all)
-        status = rmr_apple_writer_page(writer, i, plan, split, &p->sheet,
+      if (status == RMR_OK && (lead || split < all))
+        status = rmr_apple_writer_page(writer, i, plan, lead, split, &p->sheet,
                                        cancel, context, e);
       reported = status != RMR_OK;
       rmr_pdf_marks_release(marks, i);
