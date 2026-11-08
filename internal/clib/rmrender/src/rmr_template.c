@@ -480,6 +480,7 @@ rmr_status rmr_template_background_plan_with_text(
            foreground->count * sizeof *draws);
   l.maximum_plan_bytes -= bytes;
   s = rmr_plan_create(draws, count, foreground->viewport, &l, out, e);
+  if (s == RMR_OK) (*out)->background = background->count;
 
 done:
   free(draws);

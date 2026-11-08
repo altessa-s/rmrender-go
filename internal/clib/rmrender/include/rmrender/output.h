@@ -75,9 +75,9 @@ typedef struct {
    * ink path coordinates to that many decimal places of a point (stroke
    * coordinates, in page units, to as many places, which is finer): 2 is
    * invisible at print resolution and makes ink-heavy files about a quarter
-   * smaller. Pages holding text, images, embedded PDFs or transparency groups
-   * are drawn by CoreGraphics at full precision; the Cairo backend ignores this
-   * field. */
+   * smaller. On pages holding text, images or embedded PDFs, CoreGraphics
+   * draws the marks from the first of them to the last at full precision; the
+   * Cairo backend ignores this field. */
   uint32_t decimals;
   /* Read when struct_size covers them, by the document exports only (PDF in
    * every mode, and SVG through *_document_svg_with_options): what they do

@@ -5,11 +5,13 @@
 /* Page marks written by rmrender instead of CoreGraphics. CoreGraphics prints
  * every coordinate through vfprintf and deflates every stream on the calling
  * thread, which dominates the export of ink-heavy documents. For pages whose
- * marks are fills, strokes, grain masks and erasers, this writer emits the
- * operators CoreGraphics would, with the same numbers computed by the same
- * floating-point steps and printed the way it prints them, and deflates them
- * on worker threads. Text, images, embedded PDFs and transparency groups stay
- * with CoreGraphics. */
+ * marks are fills, strokes, grain masks, erasers and transparency groups,
+ * this writer emits the operators CoreGraphics would, with the same numbers
+ * computed by the same floating-point steps and printed the way it prints
+ * them, a group as the Form XObject CoreGraphics makes of a transparency
+ * layer, and deflates them on worker threads. A page's template is a Form
+ * XObject written once for every page that draws the same template. Text,
+ * images and embedded PDFs stay with CoreGraphics. */
 
 #ifndef RMR_APPLE_PDF_WRITER_H
 #define RMR_APPLE_PDF_WRITER_H
@@ -34,20 +36,31 @@ void rmr_apple_writer_output(rmr_apple_writer* w, const rmr_output* output,
                              const uint8_t* base, size_t size);
 
 /* Where the writable tail of plan starts: after its last draw only
- * CoreGraphics can serialize (text, images, embedded PDFs, transparency
- * groups) that may paint, 0 when it has none. A page typically draws its text
- * layer and template labels first and its ink after them; a text layer
- * without glyphs paints nothing, and the writer leaves it out. */
+ * CoreGraphics can serialize (text, images, embedded PDFs) that may paint, 0
+ * when it has none. A page typically draws its template, text layer and
+ * template labels first and its ink after them; a text layer without glyphs
+ * paints nothing, and the writer leaves it out. */
 size_t rmr_apple_writer_split(const rmr_plan* plan);
+
+/* How many of plan's leading draws, its template's (rmr_plan_background),
+ * the writer can draw ahead of what CoreGraphics draws from the first draw
+ * only it can serialize that may paint: all of the template's up to that
+ * draw, 0 when the plan has no template. */
+size_t rmr_apple_writer_lead(const rmr_plan* plan);
 
 /* Merged documents: serializes draws first onwards of plan for base page
  * `page`, drawn under sheet without a clip as rmr_apple_draw_context draws
  * them, after whatever CoreGraphics drew on that page, and queues their
- * deflation. Fails as rmr_plan_execute does, filling error. */
+ * deflation; from the first draw, the plan's template as a form of its own.
+ * When lead is nonzero (less than first: CoreGraphics drew draws lead to
+ * first - 1), the plan's first lead draws, its template's, go before
+ * everything CoreGraphics drew. Fails as rmr_plan_execute does, filling
+ * error. */
 rmr_status rmr_apple_writer_page(rmr_apple_writer* w, size_t page,
-                                 const rmr_plan* plan, size_t first,
-                                 const rmr_sheet* sheet, rmr_cancel_fn cancel,
-                                 void* context, rmr_error* error);
+                                 const rmr_plan* plan, size_t lead,
+                                 size_t first, const rmr_sheet* sheet,
+                                 rmr_cancel_fn cancel, void* context,
+                                 rmr_error* error);
 
 /* The rmr_apple_mask_fn hook for the masks CoreGraphics draws. It records
  * each mask's bytes as the writer's do, in drawing order, so that both give a

@@ -19,6 +19,9 @@ struct rmr_plan {
   size_t count, bytes;
   rmr_rect viewport, bounds;
   uint64_t caps;
+  /* Leading draws that are the page's template, drawn under everything else;
+   * 0 when the plan was not composed over one. */
+  size_t background;
 };
 
 /* Validates grain points and limits; fails on the first invalid point. */

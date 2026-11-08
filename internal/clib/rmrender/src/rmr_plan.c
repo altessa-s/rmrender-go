@@ -351,6 +351,8 @@ const rmr_draw* rmr_plan_draw(const rmr_plan* p, size_t i) {
   return p && i < p->count ? &p->draws[i] : nullptr;
 }
 
+size_t rmr_plan_background(const rmr_plan* p) { return p ? p->background : 0; }
+
 rmr_status rmr_plan_execute(const rmr_plan* p, const rmr_backend* b,
                             rmr_cancel_fn cancel, void* context, rmr_error* e) {
   return rmr_plan_execute_range(p, 0, p ? p->count : 0, b, cancel, context, e);

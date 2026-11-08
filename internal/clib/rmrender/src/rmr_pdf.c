@@ -3221,10 +3221,11 @@ static void page_contents(writer* w, file* f, node* old) {
   }
 }
 
-/* Writes the base page p (its object renumbered) with its own content
- * between the streams open ("q") and close ("Q"), so that o's content stream
- * after them starts from the initial graphics state, and with o's resources
- * added to its inherited ones. */
+/* Writes the base page p (its object renumbered) with o's content stream
+ * before its own, if any, and its own content between the streams open ("q")
+ * and close ("Q"), so that o's content stream after them, if any, starts from
+ * the initial graphics state, and with o's resources added to its inherited
+ * ones. */
 static void extend_page(rmr_pdf_builder* b, file* f, page* p,
                         const rmr_pdf_page_objects* o) {
   writer* w = &b->w;
@@ -3233,9 +3234,12 @@ static void extend_page(rmr_pdf_builder* b, file* f, page* p,
   text(w, "<<\n");
   const char* skip[] = {"Contents", "Resources"};
   fields(w, f, e->object, skip, 2);
-  format(w, "/Contents [%u 0 R ", b->open);
+  text(w, "/Contents [");
+  if (o->before) format(w, "%u 0 R ", o->before);
+  if (o->contents) format(w, "%u 0 R ", b->open);
   page_contents(w, f, get(e->object, "Contents"));
-  format(w, "%u 0 R %u 0 R]\n/Resources ", b->close, o->contents);
+  if (o->contents) format(w, "%u 0 R %u 0 R", b->close, o->contents);
+  text(w, "]\n/Resources ");
   const uint32_t* const lists[3] = {o->xobjects, o->states, o->spaces};
   const size_t counts[3] = {o->xobject_count, o->state_count, o->space_count};
   resources_with(w, f, resolve(f, p->resources, 0), lists, counts);
@@ -3291,7 +3295,8 @@ rmr_status rmr_pdf_builder_merge(rmr_pdf_builder* b, const uint8_t* base,
       for (page* p = f.pages; p; p = p->next) list[at++] = p;
       for (size_t i = 0; i < count && tick(j); i++) {
         size_t index = 0;
-        if (pages[i].page >= f.page_count || !pages[i].contents ||
+        if (pages[i].page >= f.page_count ||
+            (!pages[i].contents && !pages[i].before) ||
             extra[index = (size_t)(list[pages[i].page]->object - f.entries)]) {
           stop(j, RMR_ERR_INVALID_ARGUMENT, "invalid PDF page extension");
           break;

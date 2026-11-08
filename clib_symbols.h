@@ -10,7 +10,7 @@
 // alike, so that the C names stay as written and the linker sees only the
 // prefixed ones: rmlines-go, rmdoc-go and rmmarks-go compile the same
 // libraries under their own names, and one program may link them all.
-// 569 symbols, read with nm from objects of both backends; Windows
+// 571 symbols, read with nm from objects of both backends; Windows
 // compiles the Cairo backend's sources, and its _WIN32 branches add no other.
 
 #ifndef RMRENDER_GO_CLIB_SYMBOLS_H
@@ -318,6 +318,7 @@
 #define rmr_apple_writer_create rmrgo_rmr_apple_writer_create
 #define rmr_apple_writer_flush rmrgo_rmr_apple_writer_flush
 #define rmr_apple_writer_free rmrgo_rmr_apple_writer_free
+#define rmr_apple_writer_lead rmrgo_rmr_apple_writer_lead
 #define rmr_apple_writer_mask rmrgo_rmr_apple_writer_mask
 #define rmr_apple_writer_merge rmrgo_rmr_apple_writer_merge
 #define rmr_apple_writer_next_overlay rmrgo_rmr_apple_writer_next_overlay
@@ -539,6 +540,7 @@
 #define rmr_placed_scene_images rmrgo_rmr_placed_scene_images
 #define rmr_placed_scene_stroke_count rmrgo_rmr_placed_scene_stroke_count
 #define rmr_placed_scene_strokes rmrgo_rmr_placed_scene_strokes
+#define rmr_plan_background rmrgo_rmr_plan_background
 #define rmr_plan_bounds rmrgo_rmr_plan_bounds
 #define rmr_plan_bytes rmrgo_rmr_plan_bytes
 #define rmr_plan_concat rmrgo_rmr_plan_concat
