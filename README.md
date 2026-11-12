@@ -54,7 +54,7 @@ library in Finder.
 
   The official Go for Windows works with it (or MSYS2's `mingw-w64-clang-x86_64-go`), with `CC=clang` and CLANG64's `bin` ahead on `PATH`.
   PDFium comes from the same script, as the `win-x64` SDK: `include/`, the import library `lib/pdfium.dll.lib` (the package links it with
-  `-l:pdfium.dll.lib`) and `bin/pdfium.dll`. Give cgo the paths in Windows form, as `cygpath -m` writes them:
+  `-lpdfium.dll`) and `bin/pdfium.dll`. Give cgo the paths in Windows form, as `cygpath -m` writes them:
 
   ```sh
   module=$(go list -m -f '{{.Dir}}' github.com/altessa-s/rmrender-go)
