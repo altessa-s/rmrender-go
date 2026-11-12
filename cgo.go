@@ -29,7 +29,10 @@ package rmrender
 // sources that include windows.h define WIN32_LEAN_AND_MEAN themselves, and
 // the CMake build adds no other Windows define. The PDFium SDK ships its
 // import library as pdfium.dll.lib, which -lpdfium does not find, hence
-// -l:pdfium.dll.lib; the program then needs pdfium.dll at run time.
+// -lpdfium.dll: the linker tries <name>.lib for a library it is asked for,
+// and that name is this file. Not -l:pdfium.dll.lib, which names the file
+// outright: cgo has refused a -l: flag since Go 1.27.4. The program then
+// needs pdfium.dll at run time.
 
 /*
 #cgo CFLAGS: -std=c2x -include ${SRCDIR}/clib_prelude.h
@@ -44,7 +47,7 @@ package rmrender
 #cgo linux windows darwin,rmrender_cairo pkg-config: cairo pangocairo pangoft2 fontconfig harfbuzz gdk-pixbuf-2.0
 #cgo linux LDFLAGS: -lpdfium -lpthread
 #cgo darwin,rmrender_cairo LDFLAGS: -lpdfium
-#cgo windows LDFLAGS: -l:pdfium.dll.lib -lpthread
+#cgo windows LDFLAGS: -lpdfium.dll -lpthread
 
 #include "bridge.h"
 */
