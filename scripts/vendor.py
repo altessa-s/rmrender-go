@@ -6,7 +6,7 @@
 """Re-vendor the C libraries this module compiles.
 
     python3 scripts/vendor.py --rmrender ../rmrender-lib --rmlines ../rmlines-lib \\
-        --rmdoc ../rmdoc-lib --rmmarks ../rmmarks-lib --pdfium /path/to/pdfium
+        --rmdoc ../rmdoc-lib --rmmarks ../rmmarks-lib
 
 Copies from each clean checkout the sources and headers this module builds,
 with their licences and notices, into internal/clib/<library>/, and records
@@ -35,8 +35,10 @@ It then writes, in the package directory:
 The symbols are read with nm from objects compiled here, for both backends:
 the Apple one needs macOS, the Cairo one pkg-config with Cairo, Pango,
 Fontconfig, HarfBuzz and GdkPixbuf (Homebrew provides them on macOS) and the
-PDFium headers given by --pdfium (rmrender-lib's scripts/fetch-pdfium.py
-fetches them). Everything is assembled and checked in a staging directory and
+PDFium headers. Without --pdfium they are the SDK rmrender-lib pins, fetched
+once by the checkout's scripts/fetch-pdfium.py, which checks its checksum,
+into the user's cache directory and read from there afterwards; --pdfium
+names an SDK already on disk. Everything is assembled and checked in a staging directory and
 swapped in whole: on any failure the previous tree stays as it was.
 
 Windows builds the Cairo backend from the same sources, and the macOS objects
@@ -52,6 +54,7 @@ import concurrent.futures
 import hashlib
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -299,6 +302,44 @@ def digest(stage, version_lines):
     return value
 
 
+# The headers the Cairo backend includes: an SDK without them is a partial
+# copy, and compiling against it fails a long way from the cause.
+PDFIUM_HEADERS = ["fpdfview.h", "fpdf_ppo.h"]
+
+
+def pinned_pdfium(rmrender):
+    """Answers the PDFium SDK rmrender pins, fetching it on first use.
+
+    It is kept in the user's cache directory under its revision and its
+    checksum, so a new pin is a new directory and an old one is never read.
+    The fetch goes into a sibling directory and is renamed into place: an
+    interrupted download leaves nothing that looks like an SDK."""
+    script = rmrender / "scripts" / "fetch-pdfium.py"
+    if not script.is_file():
+        fail(f"{script} is missing: give --pdfium")
+    target = "mac-arm64" if platform.machine() == "arm64" else "mac-x64"
+    text = script.read_text()
+    revision = re.search(r'^REVISION = "([^"]+)"', text, re.MULTILINE)
+    checksum = re.search(rf'"{target}": "([0-9a-f]{{64}})"', text)
+    if not revision or not checksum:
+        fail(f"{script} names no revision or no checksum for {target}: give --pdfium")
+    cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / "Library" / "Caches") / "rmrender-go"
+    sdk = cache / f"pdfium-{revision.group(1)}-{target}-{checksum.group(1)[:16]}"
+    if (sdk / "include" / "fpdfview.h").is_file():
+        return sdk
+    cache.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=".pdfium-", dir=cache))
+    try:
+        print(f"fetching PDFium {revision.group(1)} for {target} into {sdk}")
+        run([sys.executable, str(script), "--platform", target, "--output", str(staging / "sdk")])
+        if sdk.exists():
+            shutil.rmtree(sdk)
+        os.replace(staging / "sdk", sdk)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return sdk
+
+
 def compile_flags(stage, pdfium):
     clib = stage / "internal" / "clib"
     common = ["-std=c2x", "-ffp-contract=off", "-w", "-I", str(stage)]
@@ -380,7 +421,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     for name, spec in LIBRARIES.items():
         parser.add_argument(f"--{name}", type=Path, required=True, help=f"a {spec['repository']} checkout")
-    parser.add_argument("--pdfium", type=Path, required=True, help="a PDFium SDK (its include/ is read)")
+    parser.add_argument(
+        "--pdfium", type=Path,
+        help="a PDFium SDK whose include/ is read (default: the one rmrender-lib pins, fetched into the cache)",
+    )
     parser.add_argument("--cc", default=os.environ.get("CC", "cc"), help="the C compiler (default $CC or cc)")
     parser.add_argument("--allow-dirty", action="store_true", help="vendor checkouts with uncommitted changes")
     args = parser.parse_args()
@@ -395,8 +439,10 @@ def main():
             fail(f"{checkout} overlaps {module}")
         checkouts[name] = checkout
         checkouts[name + ".version"] = describe(checkout, args.allow_dirty)
-    if not (args.pdfium / "include" / "fpdfview.h").is_file():
-        fail(f"{args.pdfium} holds no include/fpdfview.h")
+    pdfium = args.pdfium or pinned_pdfium(checkouts["rmrender"])
+    for header in PDFIUM_HEADERS:
+        if not (pdfium / "include" / header).is_file():
+            fail(f"{pdfium} holds no include/{header}")
 
     stage = Path(tempfile.mkdtemp(prefix=".vendor-staging-", dir=module))
     try:
@@ -404,7 +450,7 @@ def main():
         fonts(checkouts["rmrender"], stage)
         sources = wrappers(stage)
         value = digest(stage, version_lines)
-        names = symbols(stage, sources, args.pdfium.resolve(), args.cc)
+        names = symbols(stage, sources, pdfium.resolve(), args.cc)
         odd = symbols_header(stage, names)
 
         # Swap in: the vendored tree, the font files, the generated files.

@@ -503,12 +503,15 @@ same bytes.
 | `scripts/vendor.py` | Re-vendors the four libraries from their checkouts and regenerates the wrappers and headers |
 | `testdata/pages/` | Sample `.rm` pages and a `.rmdoc` built from them, with their licence |
 
+The script reads the PDFium headers of the SDK rmrender-lib pins: it fetches that SDK once, checksum-verified, into the user's cache
+directory, and `--pdfium` names one already on disk.
+
 miniz, the deflate codec rmdoc-lib compiles in, is vendored under `internal/clib/rmdoc/miniz/` rather than a `vendor/` directory, because the Go
 module zip leaves out files below any directory named `vendor`; the vendoring script points the library's two codec includes there.
 
 ```sh
 python3 scripts/vendor.py --rmrender ../rmrender-lib --rmlines ../rmlines-lib --rmdoc ../rmdoc-lib \
-    --rmmarks ../rmmarks-lib --pdfium /path/to/pdfium
+    --rmmarks ../rmmarks-lib
 go test -race ./...
 GOEXPERIMENT=cgocheck2 go test ./...
 go test -run='^$' -fuzz=FuzzPage -fuzztime=30s .
