@@ -11,15 +11,18 @@ import "C"
 
 import (
 	"errors"
+	"io"
 	"io/fs"
 	"runtime"
 	"runtime/cgo"
 	"strings"
+	"unsafe"
 )
 
 // call is what one call into C hands its callbacks, through a cgo.Handle:
-// where fonts, templates and page images are read from. The callbacks run on
-// the calling goroutine, one at a time, so its fields need no lock.
+// where fonts, templates and page images are read from, and where an export
+// writes its file. The callbacks run on the calling goroutine, one at a
+// time, so its fields need no lock.
 type call struct {
 	fonts     fs.FS
 	templates *Templates
@@ -29,6 +32,13 @@ type call struct {
 	// lent keeps them alive.
 	pinner runtime.Pinner
 	lent   [][]byte
+
+	// out receives the file of an export written as it is produced.
+	out *output
+
+	// unreadable holds the pages the call was told do not parse, in the
+	// order it was told of them.
+	unreadable []int
 
 	// err is what the first failed callback failed with.
 	err error
@@ -159,6 +169,72 @@ func rmrgoTemplate(handle C.uintptr_t, name *C.char, length C.size_t, out *C.rmr
 		}
 	}
 	return C.RMR_OK
+}
+
+// outputPiece is the most an export's writer is handed at once.
+const outputPiece = 4 << 20
+
+// output is where an export writes its file: w, through a buffer of Go
+// memory each piece C hands over is copied into, at most outputPiece bytes
+// at a time, so that w never sees C memory and nothing holds the whole file.
+type output struct {
+	w      io.Writer
+	buffer []byte
+}
+
+// write passes C's bytes p on to w, failing as w fails, or with
+// [io.ErrShortWrite] when w takes less than it is given without saying why.
+func (o *output) write(p []byte) error {
+	for len(p) > 0 {
+		n := min(len(p), outputPiece)
+		if len(o.buffer) < n {
+			o.buffer = make([]byte, n)
+		}
+		copy(o.buffer, p[:n])
+		written, err := o.w.Write(o.buffer[:n])
+		if err != nil {
+			return err
+		}
+		if written != n {
+			return io.ErrShortWrite
+		}
+		p = p[n:]
+	}
+	return nil
+}
+
+// rmrgoWrite hands the next size bytes of an export's file to its writer.
+// The writer's failure stops the export.
+//
+//export rmrgoWrite
+func rmrgoWrite(handle C.uintptr_t, bytes *C.uint8_t, size C.size_t) (status C.rmr_status) {
+	c := cgo.Handle(handle).Value().(*call)
+	defer c.recovered(&status)
+	if c.out == nil {
+		return C.RMR_ERR_INVALID_ARGUMENT
+	}
+	n, err := goLength(size, "output")
+	if err != nil {
+		c.fail(err)
+		return C.RMR_ERR_OUT_OF_MEMORY
+	}
+	if err := c.out.write(unsafe.Slice((*byte)(unsafe.Pointer(bytes)), n)); err != nil {
+		c.fail(err)
+		return C.RMR_ERR_BACKEND
+	}
+	return C.RMR_OK
+}
+
+// rmrgoUnreadable is told of a page of a document whose .rm file does not
+// parse, before the call draws it as Options.Unreadable says or fails with
+// it.
+//
+//export rmrgoUnreadable
+func rmrgoUnreadable(handle C.uintptr_t, page C.size_t, _ C.rmr_status) {
+	c := cgo.Handle(handle).Value().(*call)
+	if uint64(page) <= uint64(maxInt) {
+		c.unreadable = append(c.unreadable, int(page))
+	}
 }
 
 // rmrgoImage resolves an image a lone page places, by its file name. A

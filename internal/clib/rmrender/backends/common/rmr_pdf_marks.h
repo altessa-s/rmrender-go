@@ -3,8 +3,8 @@
  * found in the LICENSE file. */
 
 /* Page marks supplied on demand to the PDF writers, so document export need
- * not hold every page's plan at once: a long annotated document keeps only the
- * plans that fit its plan budget and rebuilds the others as they are drawn. */
+ * not hold every page's plan at once: each page's plan is built as the page is
+ * drawn and freed once it is. */
 
 #ifndef RMR_PDF_MARKS_H
 #define RMR_PDF_MARKS_H

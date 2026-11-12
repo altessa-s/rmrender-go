@@ -2,6 +2,10 @@
  * Use of this source code is governed by an MIT-style license that can be
  * found in the LICENSE file. */
 
+/* mmap's MAP_ANON under a strict C standard on glibc. */
+#if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE
+#endif
 #include <limits.h>
 #include <rmrender/pdf.h>
 #include <stdarg.h>
@@ -9,6 +13,14 @@
 #include <zlib.h>
 
 #include "rmr_internal.h"
+#include "rmr_pdf_edit.h"
+#include "rmr_sha256.h"
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
 
 /* Bounded arena; parsed scalar tokens retain their exact source spelling.
  * References are the only scalar rewritten when importing an overlay. */
@@ -168,8 +180,9 @@ static bool named(const node* n, const char* name) {
   return name[k] == 0;
 }
 
-/* Compares two validated name tokens after decoding #xx escapes. */
-static bool same_name(const node* a, const node* b) {
+/* Orders two validated name tokens by their bytes after decoding #xx
+ * escapes; 0 when they name the same thing. */
+static int name_order(const node* a, const node* b) {
   size_t i = 1, k = 1;
 
   while (i < a->length && k < b->length) {
@@ -182,10 +195,15 @@ static bool same_name(const node* a, const node* b) {
       y = (unsigned)(hex(b->raw[k]) * 16 + hex(b->raw[k + 1]));
       k += 2;
     }
-    if (x != y) return false;
+    if (x != y) return x < y ? -1 : 1;
   }
 
-  return i == a->length && k == b->length;
+  return (i < a->length) - (k < b->length);
+}
+
+/* Compares two validated name tokens after decoding #xx escapes. */
+static bool same_name(const node* a, const node* b) {
+  return !name_order(a, b);
 }
 
 /* Unresolved value of key in dictionary d; null if absent or d is not a
@@ -195,6 +213,60 @@ static node* get(node* d, const char* key) {
   for (node* n = d->child; n && n->next; n = n->next->next)
     if (named(n, key)) return n->next;
   return nullptr;
+}
+
+/* Charges n units of work at once, as n ticks would. */
+static bool charge(job* j, size_t n) {
+  if (!tick(j)) return false;
+  if (n > j->limits.maximum_elements - j->work) {
+    stop(j, RMR_ERR_LIMIT, "PDF work limit");
+    return false;
+  }
+  j->work += n;
+  return true;
+}
+
+/* qsort order of dictionary keys by decoded name. */
+static int key_order(const void* a, const void* b) {
+  return name_order(*(const node* const*)a, *(const node* const*)b);
+}
+
+/* False when dictionary d, of count keys, names a key twice (the job still
+ * fine) or the check fails the job. A small dictionary is checked pair by
+ * pair; a larger one sorted, so that its work grows as n log n rather than
+ * n², and a page's resources naming each of its thousands of images once
+ * stay well inside the work budget. */
+static bool unique_keys(job* j, node* d, size_t count) {
+  if (count <= 16) {
+    for (node* k = d->child; k; k = k->next->next)
+      for (node* other = k->next->next; other; other = other->next->next) {
+        if (!tick(j)) return false;
+        if (same_name(k, other)) return false;
+      }
+    return true;
+  }
+
+  size_t bytes = count * sizeof(node*), depth = 0;
+  for (size_t n = count; n; n >>= 1) depth++;
+  if (count > SIZE_MAX / sizeof(node*) / 2 ||
+      bytes > j->limits.maximum_plan_bytes - j->allocated) {
+    stop(j, RMR_ERR_LIMIT, "PDF scratch limit");
+    return false;
+  }
+  if (!charge(j, count * depth)) return false;
+  node** keys = rmr_alloc(bytes);
+  if (!keys) {
+    stop(j, RMR_ERR_OUT_OF_MEMORY, "PDF allocation failed");
+    return false;
+  }
+  size_t n = 0;
+  for (node* k = d->child; k; k = k->next->next) keys[n++] = k;
+  qsort(keys, n, sizeof *keys, key_order);
+  bool unique = true;
+  for (size_t i = 1; i < n && unique; i++)
+    unique = name_order(keys[i - 1], keys[i]) != 0;
+  free(keys);
+  return unique;
 }
 
 /* Parses one direct object into arena nodes. Strings, numbers and keywords
@@ -232,19 +304,17 @@ static node* parse(scan* s, unsigned depth) {
           s->data[s->pos + 1] == '>') {
         if (count % 2) goto bad;
         s->pos += 2;
+        if (!unique_keys(s->j, n, count / 2)) {
+          if (s->j->status != RMR_OK) return nullptr;
+          goto bad;
+        }
         break;
       }
 
       node* v = parse(s, depth + 1);
       if (!v) return nullptr;
 
-      if (n->type == DICT && count % 2 == 0) {
-        if (v->type != NAME) goto bad;
-        for (node* key = n->child; key; key = key->next->next) {
-          if (!tick(s->j)) return nullptr;
-          if (same_name(key, v)) goto bad;
-        }
-      }
+      if (n->type == DICT && count % 2 == 0 && v->type != NAME) goto bad;
 
       *tail = v;
       tail = &v->next;
@@ -1213,20 +1283,202 @@ typedef struct update {
   struct update* next;
 } update;
 
+/* Output already moved out of a chunked writer's buffer: mapped pages of
+ * their own rather than heap blocks, so that releasing a chunk while the
+ * output is assembled returns its memory at once. */
+typedef struct chunk {
+  struct chunk* next;
+  size_t size, mapped;
+  uint8_t bytes[];
+} chunk;
+
+/* A chunk able to hold size bytes; null when no memory is left. */
+static chunk* chunk_new(size_t size) {
+  size_t mapped = sizeof(chunk) + size;
+#ifdef _WIN32
+  chunk* c =
+      VirtualAlloc(nullptr, mapped, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+  void* p = mmap(nullptr, mapped, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANON, -1, 0);
+  chunk* c = p == MAP_FAILED ? nullptr : p;
+#endif
+  if (c) *c = (chunk){.size = size, .mapped = mapped};
+  return c;
+}
+
+static void chunk_free(chunk* c) {
+#ifdef _WIN32
+  VirtualFree(c, 0, MEM_RELEASE);
+#else
+  munmap(c, c->mapped);
+#endif
+}
+
+typedef rmr_sha256 digester;
+typedef rmr_sha256_digest digest;
+
+/* Adds n bytes to the digest. */
+static void absorb(digester* h, const void* bytes, size_t n) {
+  rmr_sha256_update(h, bytes, n);
+}
+
+/* Adds v as eight bytes. */
+static void absorb_size(digester* h, uint64_t v) {
+  uint8_t b[8];
+  for (unsigned k = 0; k < 8; k++) b[k] = (uint8_t)(v >> (8 * k));
+  absorb(h, b, sizeof b);
+}
+
+/* The first eight bytes of d, where a table of digests starts looking. */
+static size_t digest_slot(const digest* d) {
+  uint64_t v = 0;
+  for (unsigned k = 0; k < 8; k++) v |= (uint64_t)d->bytes[k] << (8 * k);
+  return (size_t)v;
+}
+
+/* Objects an update has imported, by digest: an object imported again,
+ * identical down to the objects it refers to, is referred to rather than
+ * written again. Only SHA-256 digests and object numbers are kept, in an
+ * open addressing table charged to j's scratch budget: 18 MiB at most, and no
+ * more than a quarter of the budget, so that the update's own records keep
+ * the rest. Past MAXIMUM_SHARED entries, or once the table may not grow,
+ * objects are no longer recorded, those recorded still shared. */
+typedef struct {
+  digest d;
+  uint32_t number;
+} shared_object;
+
+typedef struct ledger {
+  job* j;
+  shared_object* slots;
+  size_t capacity, count;
+} ledger;
+
+enum { MAXIMUM_SHARED = 1 << 18 };
+
+/* The number of the object recorded under d; 0 when there is none. */
+static uint32_t ledger_find(const ledger* l, digest d) {
+  if (!l->capacity) return 0;
+  for (size_t at = digest_slot(&d) & (l->capacity - 1); l->slots[at].number;
+       at = (at + 1) & (l->capacity - 1))
+    if (!memcmp(l->slots[at].d.bytes, d.bytes, sizeof d.bytes))
+      return l->slots[at].number;
+  return 0;
+}
+
+/* Records object number under d, unless the ledger is full. */
+static void ledger_add(ledger* l, digest d, uint32_t number) {
+  job* j = l->j;
+  if (l->count >= MAXIMUM_SHARED || ledger_find(l, d)) return;
+  if (l->count + 1 > l->capacity / 2) {
+    size_t capacity = l->capacity ? l->capacity * 2 : 1024,
+           bytes = capacity * sizeof *l->slots,
+           held = l->capacity * sizeof *l->slots;
+    if (bytes > j->limits.maximum_plan_bytes / 4 ||
+        bytes - held > j->limits.maximum_plan_bytes - j->allocated)
+      return;
+    shared_object* grown = rmr_calloc(capacity, sizeof *grown);
+    if (!grown) {
+      stop(j, RMR_ERR_OUT_OF_MEMORY, "PDF allocation failed");
+      return;
+    }
+    for (size_t i = 0; i < l->capacity; i++)
+      if (l->slots[i].number) {
+        size_t at = digest_slot(&l->slots[i].d) & (capacity - 1);
+        while (grown[at].number) at = (at + 1) & (capacity - 1);
+        grown[at] = l->slots[i];
+      }
+    free(l->slots);
+    j->allocated = j->allocated - held + bytes;
+    l->slots = grown;
+    l->capacity = capacity;
+  }
+  size_t at = digest_slot(&d) & (l->capacity - 1);
+  while (l->slots[at].number) at = (at + 1) & (l->capacity - 1);
+  l->slots[at] = (shared_object){d, number};
+  l->count++;
+}
+
+/* renumber, when set, is the file whose objects are written under new numbers
+ * (its entries' mapped field), trailer values included. records, when set,
+ * is the job holding the xref records instead of j. A chunked writer moves
+ * each full megabytes of output aside instead of growing one buffer, so that
+ * a long file never needs room for twice its size. A writer with an output
+ * hands its bytes on to it instead, a chunk's worth at a time, keeping none
+ * once they are written. shared, when set, is the ledger of imported objects
+ * that imports refer to instead of writing them again. */
 typedef struct {
   job* j;
   rmr_buffer data;
   size_t capacity, next_number;
   update* updates;
   size_t count;
+  file* renumber;
+  job* records;
+  bool chunked;
+  chunk *chunks, *last_chunk;
+  size_t flushed;
+  const rmr_output* output;
+  ledger* shared;
 } writer;
+
+enum { CHUNK_BYTES = 4 << 20 };
+
+/* Offset in the output of the next byte written. */
+static size_t position(const writer* w) { return w->flushed + w->data.size; }
+
+/* Hands n bytes, which follow those buffered, to the writer's output. */
+static void emit(writer* w, const void* bytes, size_t n) {
+  if (w->j->status != RMR_OK || !n) return;
+  rmr_status s = w->output->write(w->output->context, bytes, n);
+  if (s != RMR_OK)
+    stop(w->j, s, "PDF output write failed");
+  else
+    w->flushed += n;
+}
+
+/* Hands what is buffered to the writer's output. */
+static void drain(writer* w) {
+  size_t n = w->data.size;
+  w->data.size = 0;
+  emit(w, w->data.bytes, n);
+}
 
 /* Appends bytes to the output, growing it up to maximum_pdf_bytes. */
 static void put(writer* w, const void* bytes, size_t n) {
   if (w->j->status != RMR_OK || !n) return;
-  if (n > w->j->limits.maximum_pdf_bytes - w->data.size) {
+  if (n > w->j->limits.maximum_pdf_bytes - position(w)) {
     stop(w->j, RMR_ERR_LIMIT, "PDF output size limit");
     return;
+  }
+
+  /* Output goes on once a chunk's worth is buffered; as much again or more
+   * goes on at once, unbuffered. */
+  if (w->output && w->data.size + n > CHUNK_BYTES) {
+    drain(w);
+    if (n >= CHUNK_BYTES) {
+      emit(w, bytes, n);
+      return;
+    }
+    if (w->j->status != RMR_OK) return;
+  }
+
+  if (w->chunked && !w->output && w->data.size >= CHUNK_BYTES &&
+      n > w->capacity - w->data.size) {
+    chunk* c = chunk_new(w->data.size);
+    if (!c) {
+      stop(w->j, RMR_ERR_OUT_OF_MEMORY, "PDF output allocation");
+      return;
+    }
+    memcpy(c->bytes, w->data.bytes, w->data.size);
+    if (w->last_chunk)
+      w->last_chunk->next = c;
+    else
+      w->chunks = c;
+    w->last_chunk = c;
+    w->flushed += w->data.size;
+    w->data.size = 0;
   }
 
   size_t needed = w->data.size + n;
@@ -1348,10 +1600,13 @@ static void begin(writer* w, uint32_t id, uint32_t gen) {
     stop(w->j, RMR_ERR_INVALID_ARGUMENT, "PDF object number 0 is reserved");
     return;
   }
-  update* u = take(w->j, sizeof *u);
-  if (!u) return;
+  update* u = take(w->records ? w->records : w->j, sizeof *u);
+  if (!u) {
+    if (w->records) stop(w->j, w->records->status, w->records->reason);
+    return;
+  }
 
-  *u = (update){id, gen, w->data.size, w->updates};
+  *u = (update){id, gen, position(w), w->updates};
   w->updates = u;
   w->count++;
   format(w, "%u %u obj\n", id, gen);
@@ -1424,38 +1679,6 @@ static uint32_t stream_text(writer* w, const char* s) {
   return id;
 }
 
-/* Imports every object stored in the overlay, including objects packed in
- * object streams. Object stream containers and xref streams are file
- * structure, not content, and are not copied. Quartz reserves unused objects
- * as live generation-zero rows at offset zero; they have no object, and a
- * reference to one is rejected by value() (no mapped number). */
-static bool import_objects(writer* w, file* f) {
-  for (size_t i = 0; i < f->count && w->j->status == RMR_OK; i++) {
-    entry* e = &f->entries[i];
-    if (!e->live || absent(e)) continue;
-    node* n = object(f, e, 0);
-    if (!n) return false;
-    node* type = n->type == DICT ? get(n, "Type") : nullptr;
-    if (!e->stream || !(named(type, "ObjStm") || named(type, "XRef")))
-      e->mapped = reserve(w);
-  }
-
-  for (size_t i = 0; i < f->count && w->j->status == RMR_OK; i++) {
-    entry* e = &f->entries[i];
-    if (!e->mapped) continue;
-    begin(w, e->mapped, 0);
-    value(w, f, e->object, 0);
-    if (e->stream) {
-      text(w, "\nstream\n");
-      put(w, e->stream, e->stream_size);
-      text(w, "\nendstream");
-    }
-    end(w);
-  }
-
-  return w->j->status == RMR_OK;
-}
-
 /* Entry of the indirect content stream that contents refers to, either
  * directly or as a one-element array; null after failing the job
  * otherwise. */
@@ -1486,8 +1709,15 @@ static entry* single_stream(file* f, node* contents) {
   return e;
 }
 
-/* Imports a one-page overlay file and wraps its page as a Form XObject.
- * Returns the form's object number, or 0 on failure. */
+static bool import_reachable(writer* w, file* f, node* const* roots,
+                             size_t count);
+static size_t dict_values(node* d, const char* except, node** out, size_t room);
+
+/* Imports a one-page overlay file and wraps its page as a Form XObject: the
+ * objects its resources, box, group and content stream's other entries refer
+ * to come along, not the file's catalog, page tree, page or content stream
+ * object, which the form replaces. Returns the form's object number, or 0
+ * on failure. */
 static uint32_t form(writer* w, file* f) {
   page* p = f->pages;
   uint64_t rotation = 0;
@@ -1507,7 +1737,14 @@ static uint32_t form(writer* w, file* f) {
     return 0;
   }
 
-  if (!import_objects(w, f)) return 0;
+  node* group = get(p->object->object, "Group");
+  node* roots[64];
+  size_t n = 0;
+  roots[n++] = p->resources;
+  roots[n++] = box;
+  if (group) roots[n++] = group;
+  n += dict_values(e->object, "Length", roots + n, 64 - n);
+  if (!import_reachable(w, f, roots, n)) return 0;
 
   uint32_t id = reserve(w);
   begin(w, id, 0);
@@ -1520,7 +1757,6 @@ static uint32_t form(writer* w, file* f) {
   text(w, "\n");
   fields(w, f, e->object, skip, sizeof skip / sizeof *skip);
 
-  node* group = get(p->object->object, "Group");
   if (group) {
     text(w, "/Group ");
     value(w, f, group, 0);
@@ -1568,28 +1804,27 @@ static void rectangle(writer* w, rmr_rect b) {
   text(w, "]");
 }
 
-/* Rewrites one source page so it draws the overlay form, under its
- * transform, after the original contents wrapped in q/Q. With
- * replace_box, also replaces MediaBox/CropBox and keeps the old
- * MediaBox as ArtBox. */
-static void overlay(writer* w, file* source, const rmr_pdf_overlay* o) {
-  page* p = source->pages;
-  for (size_t i = 0; i < o->page && p; i++) {
-    if (!tick(w->j)) return;
-    p = p->next;
-  }
-  if (!p) {
-    stop(w->j, RMR_ERR_INVALID_ARGUMENT, "overlay page outside source");
-    return;
-  }
+enum { MAXIMUM_PARTS = 8 };
 
-  file imported;
-  if (!open_file(&imported, w->j, o->pdf, o->size)) return;
-  if (imported.page_count != 1) {
-    stop(w->j, RMR_ERR_INVALID_ARGUMENT, "overlay PDF must have one page");
-    return;
+/* Rewrites source page p so that it draws the parts, one-page overlay files
+ * each imported with its objects as a Form XObject, in order under the
+ * first part's transform, after its own contents between the streams open
+ * ("q") and close ("Q"). With the first part's replace_box, also replaces
+ * MediaBox/CropBox and keeps the old MediaBox as ArtBox. */
+static void overlay(writer* w, file* source, page* p,
+                    const rmr_pdf_overlay* parts, size_t count, uint32_t open,
+                    uint32_t close) {
+  const rmr_pdf_overlay* o = &parts[0];
+  uint32_t forms[MAXIMUM_PARTS];
+  for (size_t i = 0; i < count && w->j->status == RMR_OK; i++) {
+    file imported;
+    if (!open_file(&imported, w->j, parts[i].pdf, parts[i].size)) return;
+    if (imported.page_count != 1) {
+      stop(w->j, RMR_ERR_INVALID_ARGUMENT, "overlay PDF must have one page");
+      return;
+    }
+    forms[i] = form(w, &imported);
   }
-  uint32_t form_id = form(w, &imported);
   if (w->j->status != RMR_OK) return;
 
   node *resources = resolve(source, p->resources, 0),
@@ -1600,12 +1835,14 @@ static void overlay(writer* w, file* source, const rmr_pdf_overlay* o) {
     return;
   }
 
-  char name[80];
-  unsigned suffix = 0;
-  do {
-    if (!tick(w->j)) return;
-    snprintf(name, sizeof name, "RMR%u_%u", form_id, suffix++);
-  } while (get(objects, name));
+  char names[MAXIMUM_PARTS][32];
+  for (size_t i = 0; i < count; i++) {
+    unsigned suffix = 0;
+    do {
+      if (!tick(w->j)) return;
+      snprintf(names[i], sizeof names[i], "RMR%u_%u", forms[i], suffix++);
+    } while (get(objects, names[i]));
+  }
 
   /* The overlay lives in its own Form resource scope, so its gs/image/font
    * names can never replace names used by the original page. */
@@ -1618,7 +1855,9 @@ static void overlay(writer* w, file* source, const rmr_pdf_overlay* o) {
     real(&content, m[i]);
     text(&content, " ");
   }
-  format(&content, "cm\n/%s Do\nQ\n", name);
+  text(&content, "cm\n");
+  for (size_t i = 0; i < count; i++) format(&content, "/%s Do\n", names[i]);
+  text(&content, "Q\n");
   begin(w, invoke, 0);
   format(w, "<< /Length %zu >>\nstream\n", content.data.size);
   put(w, content.data.bytes, content.data.size);
@@ -1626,7 +1865,6 @@ static void overlay(writer* w, file* source, const rmr_pdf_overlay* o) {
   end(w);
   free(content.data.bytes);
 
-  uint32_t open = stream_text(w, "q\n"), close = stream_text(w, "Q\n");
   begin(w, p->object->number, p->object->generation);
   text(w, "<<\n");
   const char* skip[] = {"Contents", "Resources", "MediaBox", "CropBox",
@@ -1655,7 +1893,9 @@ static void overlay(writer* w, file* source, const rmr_pdf_overlay* o) {
   fields(w, nullptr, resources, xskip, 1);
   text(w, "/XObject <<\n");
   fields(w, nullptr, objects, nullptr, 0);
-  format(w, "/%s %u 0 R\n>>\n>>\n>>", name, form_id);
+  for (size_t i = 0; i < count; i++)
+    format(w, "/%s %u 0 R\n", names[i], forms[i]);
+  text(w, ">>\n>>\n>>");
   end(w);
 }
 
@@ -1668,7 +1908,7 @@ static void trailer_fields(writer* w, node* trailer) {
       if (named(k, keep[i])) {
         value(w, nullptr, k, 0);
         text(w, " ");
-        value(w, nullptr, k->next, 0);
+        value(w, w->renumber, k->next, 0);
         text(w, "\n");
       }
 }
@@ -1683,7 +1923,7 @@ static int update_order(const void* a, const void* b) {
  * so far: a complete table for a fresh file, otherwise an update chained
  * to the source's last xref, as a table, stream or both (hybrid). */
 static void finish(writer* w, file* f) {
-  size_t offset = w->data.size;
+  size_t offset = position(w);
   bool hybrid = f->xref_streams && get(f->trailer, "XRefStm") != nullptr;
   size_t hybrid_offset = offset;
   if (f->xref_streams) begin(w, reserve(w), 0);
@@ -1752,7 +1992,7 @@ static void finish(writer* w, file* f) {
       format(w, "startxref\n%zu\n%%%%EOF\n", offset);
       return;
     }
-    offset = w->data.size;
+    offset = position(w);
   }
 
   text(w, "xref\n");
@@ -1778,62 +2018,6 @@ static void release(job* j) {
     free(j->memory);
     j->memory = next;
   }
-}
-
-rmr_status rmr_pdf_incremental(const uint8_t* source, size_t size,
-                               const rmr_pdf_overlay* overlays, size_t count,
-                               const rmr_limits* given, rmr_cancel_fn cancel,
-                               void* context, rmr_buffer* out,
-                               rmr_pdf_incremental_report* report,
-                               rmr_error* error) {
-  if (!source || !size || !out || (count && !overlays))
-    return rmr_fail(error, RMR_ERR_INVALID_ARGUMENT, 0,
-                    "missing PDF update input");
-
-  job j = {.limits = given ? *given : rmr_limits_default(),
-           .cancel = cancel,
-           .context = context};
-  writer w = {.j = &j};
-  file f;
-  if (count > j.limits.maximum_draws)
-    stop(&j, RMR_ERR_LIMIT, "overlay count limit");
-
-  if (tick(&j) && open_file(&f, &j, source, size)) {
-    w.next_number = f.next_number;
-    put(&w, source, size);
-    if (count) text(&w, "\n");
-    for (size_t i = 0; i < count && tick(&j); i++) {
-      const rmr_pdf_overlay* o = &overlays[i];
-      if (!o->pdf || !o->size ||
-          !isfinite(o->transform.a * o->transform.d -
-                    o->transform.b * o->transform.c) ||
-          o->transform.a * o->transform.d == o->transform.b * o->transform.c ||
-          (o->replace_box &&
-           (!isfinite(o->box.x) || !isfinite(o->box.y) ||
-            !isfinite(o->box.width) || !isfinite(o->box.height) ||
-            o->box.width <= 0 || o->box.height <= 0))) {
-        stop(&j, RMR_ERR_INVALID_ARGUMENT, "invalid overlay transform/box");
-        break;
-      }
-      for (size_t k = 0; k < i && tick(&j); k++)
-        if (overlays[k].page == o->page)
-          stop(&j, RMR_ERR_INVALID_ARGUMENT, "duplicate page overlay");
-      if (j.status == RMR_OK) overlay(&w, &f, o);
-    }
-    if (count && j.status == RMR_OK) finish(&w, &f);
-  }
-
-  if (j.status == RMR_OK) {
-    *out = w.data;
-    if (report) *report = (rmr_pdf_incremental_report){count, size, true};
-  } else
-    free(w.data.bytes);
-
-  release(&j);
-  return j.status == RMR_OK
-             ? RMR_OK
-             : rmr_fail(error, j.status, 0,
-                        j.reason ? j.reason : "PDF update failed");
 }
 
 /* A page's inherited MediaBox, normalised to positive size, and /Rotate
@@ -1894,8 +2078,6 @@ rmr_status rmr_pdf_pages(const uint8_t* source, size_t size,
              : rmr_fail(error, j.status, 0,
                         j.reason ? j.reason : "PDF inspection failed");
 }
-
-#include "rmr_pdf_edit.h"
 
 /* Writes t applied to p as two PDF numbers, each followed by a space. */
 static void clip_point(writer* w, rmr_transform t, rmr_point p) {
@@ -1986,27 +2168,117 @@ rmr_status rmr_pdf_clip(const uint8_t* pdf, size_t size, rmr_path_view path,
   return j.status;
 }
 
+/* Object numbers of the output's pages by index: the entries of numbers and
+ * generations, or first + index when numbers is null. */
+typedef struct {
+  const uint32_t *numbers, *generations;
+  uint32_t first;
+  size_t count;
+} page_refs;
+
 /* Writes a /Dest [page /XYZ x y null] entry; fails the job if the page
  * index is out of range. */
-static void destination(writer* w, page** pages, size_t count,
-                        rmr_pdf_destination d) {
-  if (d.page >= count) {
+static void destination(writer* w, page_refs pages, rmr_pdf_destination d) {
+  if (d.page >= pages.count) {
     stop(w->j, RMR_ERR_INVALID_ARGUMENT, "navigation target outside document");
     return;
   }
 
-  entry* e = pages[d.page]->object;
-  format(w, "/Dest [%u %u R /XYZ ", e->number, e->generation);
+  format(w, "/Dest [%u %u R /XYZ ",
+         pages.numbers ? pages.numbers[d.page] : pages.first + (uint32_t)d.page,
+         pages.generations ? pages.generations[d.page] : 0);
   real(w, d.point.x);
   text(w, " ");
   real(w, d.point.y);
   text(w, " null]\n");
 }
 
+/* Writes link annotation object id: rect, to destination d. */
+static void link_object(writer* w, uint32_t id, rmr_rect rect, page_refs pages,
+                        rmr_pdf_destination d) {
+  begin(w, id, 0);
+  text(w, "<< /Type /Annot /Subtype /Link /Border [0 0 0] /Rect ");
+  rectangle(w, rect);
+  text(w, "\n");
+  destination(w, pages, d);
+  text(w, ">>");
+  end(w);
+}
+
 typedef struct {
   uint32_t id;
   size_t first, last, prev, next, visible;
 } outline_entry;
+
+/* Writes the outline's items and, when it has any, its /Outlines root;
+ * returns the root's object number, 0 without items or after failing the
+ * job. Outline parents must precede their children. */
+static uint32_t outline_objects(writer* w, const rmr_pdf_outline* outline,
+                                size_t outline_count, page_refs pages) {
+  job* j = w->j;
+  outline_entry* tree = take(j, (outline_count + 1) * sizeof *tree);
+  if (!tree) return 0;
+
+  for (size_t i = 0; i <= outline_count && tick(j); i++)
+    tree[i] =
+        (outline_entry){reserve(w), SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX, 0};
+
+  for (size_t i = 0; i < outline_count && tick(j); i++) {
+    size_t parent = outline[i].parent;
+    if (parent != SIZE_MAX && parent >= i) {
+      stop(j, RMR_ERR_INVALID_ARGUMENT, "invalid outline parent");
+      break;
+    }
+    if (parent == SIZE_MAX) parent = outline_count;
+    size_t prev = tree[parent].last;
+    tree[i].prev = prev;
+    if (prev != SIZE_MAX)
+      tree[prev].next = i;
+    else
+      tree[parent].first = i;
+    tree[parent].last = i;
+  }
+
+  for (size_t i = outline_count; i > 0 && tick(j);) {
+    --i;
+    size_t parent =
+        outline[i].parent == SIZE_MAX ? outline_count : outline[i].parent;
+    tree[parent].visible += 1 + (outline[i].open ? tree[i].visible : 0);
+  }
+
+  for (size_t i = 0; i < outline_count && tick(j); i++) {
+    const rmr_pdf_outline* o = &outline[i];
+    if ((o->title_size && !o->title) || o->title_size % 2) {
+      stop(j, RMR_ERR_INVALID_ARGUMENT, "invalid outline title");
+      break;
+    }
+    begin(w, tree[i].id, 0);
+    text(w, "<< /Title <FEFF");
+    for (size_t k = 0; k < o->title_size && tick(j); k += 2)
+      format(w, "%02X%02X", o->title[k + 1], o->title[k]);
+    size_t parent = o->parent == SIZE_MAX ? outline_count : o->parent;
+    format(w, "> /Parent %u 0 R\n", tree[parent].id);
+    if (tree[i].prev != SIZE_MAX)
+      format(w, "/Prev %u 0 R\n", tree[tree[i].prev].id);
+    if (tree[i].next != SIZE_MAX)
+      format(w, "/Next %u 0 R\n", tree[tree[i].next].id);
+    if (tree[i].first != SIZE_MAX)
+      format(w, "/First %u 0 R /Last %u 0 R /Count %s%zu\n",
+             tree[tree[i].first].id, tree[tree[i].last].id, o->open ? "" : "-",
+             tree[i].visible);
+    if (o->destination.page != SIZE_MAX) destination(w, pages, o->destination);
+    text(w, ">>");
+    end(w);
+  }
+
+  if (!outline_count || j->status != RMR_OK) return 0;
+  outline_entry* root = &tree[outline_count];
+  begin(w, root->id, 0);
+  format(w, "<< /Type /Outlines /First %u 0 R /Last %u 0 R /Count %zu >>",
+         tree[root->first].id, tree[root->last].id, root->visible);
+  end(w);
+  return root->id;
+}
 
 /* Appends an incremental update that adds local link annotations to their
  * pages and, when outline_count is nonzero, installs a new document
@@ -2042,12 +2314,18 @@ rmr_status rmr_pdf_navigation(const uint8_t* pdf, size_t size,
       stop(&j, RMR_ERR_LIMIT, "navigation page limit");
 
     page** pages = take(&j, f.page_count * sizeof *pages);
+    uint32_t* numbers = take(&j, f.page_count * sizeof *numbers);
+    uint32_t* generations = take(&j, f.page_count * sizeof *generations);
     uint32_t* ids = take(&j, link_count * sizeof *ids);
-    outline_entry* tree = take(&j, (outline_count + 1) * sizeof *tree);
 
     if (j.status == RMR_OK) {
       size_t at = 0;
-      for (page* p = f.pages; p; p = p->next) pages[at++] = p;
+      for (page* p = f.pages; p; p = p->next, at++) {
+        pages[at] = p;
+        numbers[at] = p->object->number;
+        generations[at] = p->object->generation;
+      }
+      page_refs refs = {numbers, generations, 0, f.page_count};
 
       for (size_t i = 0; i < link_count && tick(&j); i++) {
         if (links[i].page >= f.page_count) {
@@ -2055,13 +2333,7 @@ rmr_status rmr_pdf_navigation(const uint8_t* pdf, size_t size,
           break;
         }
         ids[i] = reserve(&w);
-        begin(&w, ids[i], 0);
-        text(&w, "<< /Type /Annot /Subtype /Link /Border [0 0 0] /Rect ");
-        rectangle(&w, links[i].rect);
-        text(&w, "\n");
-        destination(&w, pages, f.page_count, links[i].destination);
-        text(&w, ">>");
-        end(&w);
+        link_object(&w, ids[i], links[i].rect, refs, links[i].destination);
       }
 
       for (size_t pi = 0; pi < f.page_count && tick(&j); pi++) {
@@ -2089,72 +2361,14 @@ rmr_status rmr_pdf_navigation(const uint8_t* pdf, size_t size,
         end(&w);
       }
 
-      for (size_t i = 0; i <= outline_count && tick(&j); i++)
-        tree[i] = (outline_entry){reserve(&w), SIZE_MAX, SIZE_MAX,
-                                  SIZE_MAX,    SIZE_MAX, 0};
-
-      for (size_t i = 0; i < outline_count && tick(&j); i++) {
-        size_t parent = outline[i].parent;
-        if (parent != SIZE_MAX && parent >= i) {
-          stop(&j, RMR_ERR_INVALID_ARGUMENT, "invalid outline parent");
-          break;
-        }
-        if (parent == SIZE_MAX) parent = outline_count;
-        size_t prev = tree[parent].last;
-        tree[i].prev = prev;
-        if (prev != SIZE_MAX)
-          tree[prev].next = i;
-        else
-          tree[parent].first = i;
-        tree[parent].last = i;
-      }
-
-      for (size_t i = outline_count; i > 0 && tick(&j);) {
-        --i;
-        size_t parent =
-            outline[i].parent == SIZE_MAX ? outline_count : outline[i].parent;
-        tree[parent].visible += 1 + (outline[i].open ? tree[i].visible : 0);
-      }
-
-      for (size_t i = 0; i < outline_count && tick(&j); i++) {
-        const rmr_pdf_outline* o = &outline[i];
-        if ((o->title_size && !o->title) || o->title_size % 2) {
-          stop(&j, RMR_ERR_INVALID_ARGUMENT, "invalid outline title");
-          break;
-        }
-        begin(&w, tree[i].id, 0);
-        text(&w, "<< /Title <FEFF");
-        for (size_t k = 0; k < o->title_size && tick(&j); k += 2)
-          format(&w, "%02X%02X", o->title[k + 1], o->title[k]);
-        size_t parent = o->parent == SIZE_MAX ? outline_count : o->parent;
-        format(&w, "> /Parent %u 0 R\n", tree[parent].id);
-        if (tree[i].prev != SIZE_MAX)
-          format(&w, "/Prev %u 0 R\n", tree[tree[i].prev].id);
-        if (tree[i].next != SIZE_MAX)
-          format(&w, "/Next %u 0 R\n", tree[tree[i].next].id);
-        if (tree[i].first != SIZE_MAX)
-          format(&w, "/First %u 0 R /Last %u 0 R /Count %s%zu\n",
-                 tree[tree[i].first].id, tree[tree[i].last].id,
-                 o->open ? "" : "-", tree[i].visible);
-        if (o->destination.page != SIZE_MAX)
-          destination(&w, pages, f.page_count, o->destination);
-        text(&w, ">>");
-        end(&w);
-      }
-
-      if (outline_count && j.status == RMR_OK) {
-        outline_entry* root = &tree[outline_count];
-        begin(&w, root->id, 0);
-        format(&w,
-               "<< /Type /Outlines /First %u 0 R /Last %u 0 R /Count %zu >>",
-               tree[root->first].id, tree[root->last].id, root->visible);
-        end(&w);
+      uint32_t root = outline_objects(&w, outline, outline_count, refs);
+      if (root) {
         node* ref = get(f.trailer, "Root");
         begin(&w, ref->number, ref->generation);
         text(&w, "<<\n");
         const char* skip[] = {"Outlines"};
         fields(&w, nullptr, f.root, skip, 1);
-        format(&w, "/Outlines %u 0 R >>", root->id);
+        format(&w, "/Outlines %u 0 R >>", root);
         end(&w);
       }
 
@@ -2197,14 +2411,26 @@ static void header(writer* w, const uint8_t* source, size_t size) {
 rmr_status rmr_pdf_rewrite(const uint8_t* source, size_t size,
                            const rmr_limits* limits, rmr_cancel_fn cancel,
                            void* context, rmr_buffer* out, rmr_error* error) {
-  if (!source || !size || !out)
+  if (!out)
+    return rmr_fail(error, RMR_ERR_INVALID_ARGUMENT, 0,
+                    "missing PDF rewrite input");
+  return rmr_pdf_rewrite_output(source, size, limits, cancel, context, nullptr,
+                                out, error);
+}
+
+rmr_status rmr_pdf_rewrite_output(const uint8_t* source, size_t size,
+                                  const rmr_limits* limits,
+                                  rmr_cancel_fn cancel, void* context,
+                                  const rmr_output* output, rmr_buffer* out,
+                                  rmr_error* error) {
+  if (!source || !size || (!out && !output))
     return rmr_fail(error, RMR_ERR_INVALID_ARGUMENT, 0,
                     "missing PDF rewrite input");
 
   job j = {.limits = limits ? *limits : rmr_limits_default(),
            .cancel = cancel,
            .context = context};
-  writer w = {.j = &j};
+  writer w = {.j = &j, .output = output};
   file f;
 
   if (tick(&j) && open_file(&f, &j, source, size)) {
@@ -2235,7 +2461,10 @@ rmr_status rmr_pdf_rewrite(const uint8_t* source, size_t size,
     }
   }
 
-  if (j.status == RMR_OK)
+  if (output) {
+    drain(&w);
+    free(w.data.bytes);
+  } else if (j.status == RMR_OK)
     *out = w.data;
   else
     free(w.data.bytes);
@@ -2788,4 +3017,1209 @@ rmr_status rmr_pdf_select_pages(const uint8_t* source, size_t size,
              ? RMR_OK
              : rmr_fail(error, j.status, 0,
                         j.reason ? j.reason : "PDF page selection failed");
+}
+
+/* A fresh file written as its parts arrive (rmr_pdf_edit.h). Its writer
+ * keeps output in chunks and records its xref rows in the builder's job;
+ * each imported PDF is parsed under a job of its own, released once copied,
+ * so neither memory nor work limits grow with the number of pages. */
+struct rmr_pdf_builder {
+  job j;
+  writer w;
+  uint32_t tree, first_page, open, close;
+  size_t page_count;
+  char version[3]; /* The header's, "1.7" until a base's replaces it. */
+};
+
+rmr_status rmr_pdf_builder_create(const rmr_limits* limits,
+                                  rmr_cancel_fn cancel, void* context,
+                                  rmr_pdf_builder** out) {
+  if (!out) return RMR_ERR_INVALID_ARGUMENT;
+  rmr_pdf_builder* b = rmr_calloc(1, sizeof *b);
+  if (!b) return RMR_ERR_OUT_OF_MEMORY;
+  b->j = (job){.limits = limits ? *limits : rmr_limits_default(),
+               .cancel = cancel,
+               .context = context};
+  b->w = (writer){.j = &b->j, .next_number = 1, .chunked = true};
+  /* rmr_pdf_builder_merge gives the file its base's version. */
+  memcpy(b->version, "1.7", 3);
+  text(&b->w, "%PDF-1.7\n%\342\343\317\323\n");
+  if (b->j.status != RMR_OK) {
+    rmr_status s = b->j.status;
+    rmr_pdf_builder_free(b);
+    return s;
+  }
+  *out = b;
+  return RMR_OK;
+}
+
+void rmr_pdf_builder_free(rmr_pdf_builder* b) {
+  if (!b) return;
+  free(b->w.data.bytes);
+  for (chunk* c = b->w.chunks; c;) {
+    chunk* next = c->next;
+    chunk_free(c);
+    c = next;
+  }
+  release(&b->j);
+  free(b);
+}
+
+void rmr_pdf_builder_output(rmr_pdf_builder* b, const rmr_output* output) {
+  if (b->w.chunks)
+    stop(&b->j, RMR_ERR_INVALID_ARGUMENT, "PDF output already collected");
+  else
+    b->w.output = output;
+}
+
+uint32_t rmr_pdf_builder_reserve(rmr_pdf_builder* b) {
+  return b->j.status == RMR_OK ? reserve(&b->w) : 0;
+}
+
+/* The builder's failure as an rmr_status, filling error. */
+static rmr_status built(rmr_pdf_builder* b, rmr_error* error) {
+  job* j = &b->j;
+  return j->status == RMR_OK
+             ? RMR_OK
+             : rmr_fail(error, j->status, 0,
+                        j->reason ? j->reason : "PDF assembly failed");
+}
+
+rmr_status rmr_pdf_builder_append(rmr_pdf_builder* b, const uint8_t* bytes,
+                                  size_t size, const uint32_t* numbers,
+                                  const size_t* offsets, size_t count,
+                                  rmr_error* error) {
+  job* j = &b->j;
+  writer* w = &b->w;
+  if ((size && !bytes) || (count && (!numbers || !offsets)))
+    stop(j, RMR_ERR_INVALID_ARGUMENT, "missing PDF objects");
+  update* list =
+      count && j->status == RMR_OK ? take(j, count * sizeof *list) : nullptr;
+
+  size_t at = position(w);
+  for (size_t i = 0; i < count && j->status == RMR_OK; i++) {
+    if (!numbers[i] || numbers[i] >= w->next_number || offsets[i] >= size ||
+        (i && offsets[i] <= offsets[i - 1])) {
+      stop(j, RMR_ERR_INVALID_ARGUMENT, "invalid appended PDF object");
+      break;
+    }
+    list[i] = (update){numbers[i], 0, at + offsets[i], w->updates};
+    w->updates = &list[i];
+    w->count++;
+  }
+  put(w, bytes, size);
+  return built(b, error);
+}
+
+/* Moves the output, chunks first, into one exactly sized buffer, freeing
+ * each chunk as it is copied; with an output, hands it the rest instead. */
+static void assemble(writer* w, rmr_buffer* out) {
+  if (w->output) {
+    drain(w);
+    return;
+  }
+  size_t size = position(w);
+  uint8_t* bytes = rmr_alloc(size);
+  if (!bytes) {
+    stop(w->j, RMR_ERR_OUT_OF_MEMORY, "PDF output allocation");
+    return;
+  }
+  size_t at = 0;
+  for (chunk* c = w->chunks; c;) {
+    chunk* next = c->next;
+    memcpy(bytes + at, c->bytes, c->size);
+    at += c->size;
+    chunk_free(c);
+    c = next;
+  }
+  w->chunks = w->last_chunk = nullptr;
+  memcpy(bytes + at, w->data.bytes, w->data.size);
+  free(w->data.bytes);
+  w->data = (rmr_buffer){0};
+  w->capacity = w->flushed = 0;
+  *out = (rmr_buffer){bytes, size};
+}
+
+/* Writes resources (a resolved dictionary or null) with the objects of each
+ * kind in lists added under RMRx<n>, RMRg<n> and RMRc<n> names. */
+static void resources_with(writer* w, file* f, node* resources,
+                           const uint32_t* const lists[3],
+                           const size_t counts[3]) {
+  static const char* const kinds[] = {"XObject", "ExtGState", "ColorSpace"};
+  static const char prefixes[] = {'x', 'g', 'c'};
+  bool written[3] = {};
+  if (resources && resources->type != DICT) {
+    stop(w->j, RMR_ERR_INVALID_ARGUMENT, "invalid page resources");
+    return;
+  }
+
+  text(w, "<<\n");
+  for (node* k = resources ? resources->child : nullptr; k && tick(w->j);
+       k = k->next->next) {
+    size_t slot = 0;
+    while (slot < 3 && !named(k, kinds[slot])) slot++;
+    value(w, nullptr, k, 0);
+    text(w, " ");
+    if (slot == 3 || !counts[slot]) {
+      value(w, f, k->next, 0);
+      text(w, "\n");
+      continue;
+    }
+
+    node* existing = resolve(f, k->next, 0);
+    if (!existing || existing->type != DICT) {
+      stop(w->j, RMR_ERR_INVALID_ARGUMENT, "invalid page resources");
+      return;
+    }
+    text(w, "<<\n");
+    fields(w, f, existing, nullptr, 0);
+    for (size_t i = 0; i < counts[slot] && tick(w->j); i++) {
+      char name[24];
+      snprintf(name, sizeof name, "RMR%c%u", prefixes[slot], lists[slot][i]);
+      if (get(existing, name)) {
+        stop(w->j, RMR_ERR_INVALID_ARGUMENT, "PDF resource name in use");
+        return;
+      }
+      format(w, "/%s %u 0 R\n", name, lists[slot][i]);
+    }
+    text(w, ">>\n");
+    written[slot] = true;
+  }
+
+  for (size_t slot = 0; slot < 3; slot++) {
+    if (written[slot] || !counts[slot]) continue;
+    format(w, "/%s <<\n", kinds[slot]);
+    for (size_t i = 0; i < counts[slot] && tick(w->j); i++)
+      format(w, "/RMR%c%u %u 0 R\n", prefixes[slot], lists[slot][i],
+             lists[slot][i]);
+    text(w, ">>\n");
+  }
+  text(w, ">>");
+}
+
+/* The content streams "q" and "Q" that wrap a page's own content when more
+ * is drawn after it, written once per file. */
+static void wrapping(rmr_pdf_builder* b) {
+  if (!b->open) {
+    b->open = stream_text(&b->w, "q\n");
+    b->close = stream_text(&b->w, "Q\n");
+  }
+}
+
+/* Writes a page's existing content references (renumbered through f). */
+static void page_contents(writer* w, file* f, node* old) {
+  node* v = resolve(f, old, 0);
+  if (v && v->type == ARRAY)
+    for (node* c = v->child; c && tick(w->j); c = c->next) {
+      value(w, f, c, 0);
+      text(w, " ");
+    }
+  else if (old && !(v && v->type == SCALAR && v->length == 4 &&
+                    !memcmp(v->raw, "null", 4))) {
+    value(w, f, old, 0);
+    text(w, " ");
+  }
+}
+
+/* Writes the base page p (its object renumbered) with o's content stream
+ * before its own, if any, and its own content between the streams open ("q")
+ * and close ("Q"), so that o's content stream after them, if any, starts from
+ * the initial graphics state, and with o's resources added to its inherited
+ * ones. */
+static void extend_page(rmr_pdf_builder* b, file* f, page* p,
+                        const rmr_pdf_page_objects* o) {
+  writer* w = &b->w;
+  entry* e = p->object;
+  begin(w, e->mapped, 0);
+  text(w, "<<\n");
+  const char* skip[] = {"Contents", "Resources"};
+  fields(w, f, e->object, skip, 2);
+  text(w, "/Contents [");
+  if (o->before) format(w, "%u 0 R ", o->before);
+  if (o->contents) format(w, "%u 0 R ", b->open);
+  page_contents(w, f, get(e->object, "Contents"));
+  if (o->contents) format(w, "%u 0 R %u 0 R", b->close, o->contents);
+  text(w, "]\n/Resources ");
+  const uint32_t* const lists[3] = {o->xobjects, o->states, o->spaces};
+  const size_t counts[3] = {o->xobject_count, o->state_count, o->space_count};
+  resources_with(w, f, resolve(f, p->resources, 0), lists, counts);
+  text(w, "\n>>");
+  end(w);
+}
+
+/* Gives the file base's version when it has one of the same length, so that
+ * recorded offsets stay valid. Once the header has gone to the output, the
+ * version can no longer change. */
+static void version(rmr_pdf_builder* b, const uint8_t* base, size_t size) {
+  writer* w = &b->w;
+  if (size > 9 && base[5] >= '0' && base[5] <= '9' && base[6] == '.' &&
+      base[7] >= '0' && base[7] <= '9' &&
+      (base[8] == '\n' || base[8] == '\r')) {
+    if (w->output && w->flushed) {
+      if (memcmp(b->version, base + 5, 3))
+        stop(w->j, RMR_ERR_BACKEND, "PDF version changed after output began");
+      return;
+    }
+    uint8_t* header = w->chunks ? w->chunks->bytes : w->data.bytes;
+    memcpy(header + 5, base + 5, 3);
+    memcpy(b->version, base + 5, 3);
+  }
+}
+
+void rmr_pdf_builder_version(rmr_pdf_builder* b, const uint8_t* base,
+                             size_t size) {
+  if (base && b->j.status == RMR_OK) version(b, base, size);
+}
+
+rmr_status rmr_pdf_builder_merge(rmr_pdf_builder* b, const uint8_t* base,
+                                 size_t size, const rmr_pdf_page_objects* pages,
+                                 size_t count, rmr_buffer* out,
+                                 rmr_error* error) {
+  job* j = &b->j;
+  writer* w = &b->w;
+  file f;
+  if (!base || !size || (!out && !w->output) || (count && !pages))
+    stop(j, RMR_ERR_INVALID_ARGUMENT, "missing PDF assembly input");
+
+  if (tick(j) && open_file(&f, j, base, size)) {
+    version(b, base, size);
+    if (f.count > SIZE_MAX / sizeof(void*) ||
+        f.page_count > SIZE_MAX / sizeof(void*))
+      stop(j, RMR_ERR_LIMIT, "PDF assembly object limit");
+    page** list = take(j, f.page_count * sizeof *list);
+    page** owners = take(j, f.count * sizeof *owners);
+    const rmr_pdf_page_objects** extra = take(j, f.count * sizeof *extra);
+
+    if (j->status == RMR_OK) {
+      size_t at = 0;
+      for (page* p = f.pages; p; p = p->next) list[at++] = p;
+      for (size_t i = 0; i < count && tick(j); i++) {
+        size_t index = 0;
+        if (pages[i].page >= f.page_count ||
+            (!pages[i].contents && !pages[i].before) ||
+            extra[index = (size_t)(list[pages[i].page]->object - f.entries)]) {
+          stop(j, RMR_ERR_INVALID_ARGUMENT, "invalid PDF page extension");
+          break;
+        }
+        extra[index] = &pages[i];
+        owners[index] = list[pages[i].page];
+      }
+    }
+
+    for (size_t i = 0; i < f.count && tick(j); i++) {
+      entry* e = &f.entries[i];
+      if (!e->live || absent(e)) continue;
+      node* n = object(&f, e, 0);
+      if (!n) break;
+      node* type = n->type == DICT ? get(n, "Type") : nullptr;
+      if (!e->stream || !(named(type, "ObjStm") || named(type, "XRef")))
+        e->mapped = reserve(w);
+    }
+
+    if (count && j->status == RMR_OK) wrapping(b);
+    for (size_t i = 0; i < f.count && tick(j); i++) {
+      entry* e = &f.entries[i];
+      if (!e->mapped) continue;
+      if (extra[i]) {
+        extend_page(b, &f, owners[i], extra[i]);
+        continue;
+      }
+      begin(w, e->mapped, 0);
+      value(w, &f, e->object, 0);
+      if (e->stream) {
+        text(w, "\nstream\n");
+        put(w, e->stream, e->stream_size);
+        text(w, "\nendstream");
+      }
+      end(w);
+    }
+
+    if (j->status == RMR_OK) {
+      w->renumber = &f;
+      f.last = 0;
+      f.xref_streams = false;
+      finish(w, &f);
+      w->renumber = nullptr;
+    }
+  }
+
+  if (j->status == RMR_OK) assemble(w, out);
+  rmr_status s = built(b, error);
+  /* Spent either way. */
+  stop(j, RMR_ERR_INVALID_ARGUMENT, "PDF builder already finished");
+  return s;
+}
+
+uint32_t rmr_pdf_builder_pages(rmr_pdf_builder* b, size_t count) {
+  if (b->tree || !count || count > b->j.limits.maximum_draws ||
+      count >= UINT32_MAX - b->w.next_number) {
+    stop(&b->j, RMR_ERR_LIMIT, "PDF page count limit");
+    return 0;
+  }
+  b->tree = reserve(&b->w);
+  b->first_page = (uint32_t)b->w.next_number;
+  b->w.next_number += count;
+  b->page_count = count;
+  return b->first_page;
+}
+
+/* Parses pdf under a job of its own as the writer's job, so that its parse
+ * and work stay bounded per import; xref rows still go to the builder. */
+static bool import_begin(rmr_pdf_builder* b, job* scratch, file* f,
+                         const uint8_t* pdf, size_t size) {
+  *scratch = (job){.limits = b->j.limits};
+  b->w.j = scratch;
+  b->w.records = &b->j;
+  if (b->j.status != RMR_OK) {
+    stop(scratch, b->j.status, b->j.reason);
+    return false;
+  }
+  return open_file(f, scratch, pdf, size);
+}
+
+/* Ends an import: its failure becomes the builder's. */
+static void import_end(rmr_pdf_builder* b, job* scratch) {
+  b->w.j = &b->j;
+  b->w.records = nullptr;
+  if (scratch->status != RMR_OK)
+    stop(&b->j, scratch->status,
+         scratch->reason ? scratch->reason : "PDF import failed");
+  release(scratch);
+}
+
+/* The page's content as one stream: the raw bytes of its single stream, or
+ * its streams decoded and joined by newlines into data. dict is null for
+ * the joined data, which is unfiltered. */
+static bool one_stream(file* f, node* contents, entry** single,
+                       rmr_buffer* joined) {
+  *single = nullptr;
+  *joined = (rmr_buffer){0};
+  node* v = resolve(f, contents, 0);
+  if (!v) return true; /* An empty page. */
+  if (v->type != ARRAY) {
+    *single = single_stream(f, contents);
+    return *single != nullptr;
+  }
+  if (v->child && !v->child->next) {
+    *single = single_stream(f, v->child);
+    return *single != nullptr;
+  }
+
+  size_t total = 0;
+  for (node* c = v->child; c; c = c->next) {
+    entry* e = single_stream(f, c);
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+    if (!e || !decode_stream(f->j, &f->decoded_budget, e->object, e->stream,
+                             e->stream_size, &data, &size))
+      return false;
+    uint8_t* grown = rmr_realloc(joined->bytes, total + size + 1);
+    if (!grown) {
+      stop(f->j, RMR_ERR_OUT_OF_MEMORY, "PDF content allocation");
+      return false;
+    }
+    joined->bytes = grown;
+    memcpy(grown + total, data, size);
+    grown[total + size] = '\n';
+    total += size + 1;
+  }
+  joined->size = total;
+  return true;
+}
+
+/* Gives every object n refers to, directly or through other objects, a new
+ * number (unless it has one) and remembers it on stack to visit. */
+static bool reach(writer* w, file* f, node* n, entry** stack, size_t* top) {
+  if (!n || !tick(f->j)) return f->j->status == RMR_OK;
+  if (n->type == REF) {
+    entry* e = lookup(f, n->number);
+    /* A reference to nothing, such as an object Quartz reserves as a live
+     * row at offset zero and never writes, fails when written. */
+    if (e && e->live && !absent(e) && e->generation == n->generation &&
+        !e->mapped) {
+      e->mapped = reserve(w);
+      stack[(*top)++] = e;
+    }
+    return true;
+  }
+  if (n->type == ARRAY || n->type == DICT)
+    for (node* c = n->child; c; c = c->next)
+      if (!reach(w, f, c, stack, top)) return false;
+  return true;
+}
+
+/* Marks share() leaves on an import's objects. */
+enum { SHARE_OPEN = 1, SHARE_DONE = 2, SHARE_ABLE = 4, SHARE_OWN = 8 };
+
+/* share()'s marks and digests, by entry index of the imported file. */
+typedef struct {
+  uint8_t* marks;
+  digest* sums;
+} sharing;
+
+/* Pushes on todo, grown as needed, each object n refers to that share() has
+ * not yet opened. */
+static bool push_refs(file* f, node* n, const uint8_t* marks, entry*** todo,
+                      size_t* top, size_t* room) {
+  if (!n || !tick(f->j)) return f->j->status == RMR_OK;
+  if (n->type == REF) {
+    entry* e = lookup(f, n->number);
+    if (!e || !e->live || absent(e) || e->generation != n->generation ||
+        marks[e - f->entries] & (SHARE_OPEN | SHARE_DONE))
+      return true;
+    if (*top == *room) {
+      size_t grown = *room ? *room * 2 : 256;
+      entry** more = take(f->j, grown * sizeof *more);
+      if (!more) return false;
+      if (*top) memcpy(more, *todo, *top * sizeof *more);
+      *todo = more;
+      *room = grown;
+    }
+    (*todo)[(*top)++] = e;
+    return true;
+  }
+  if (n->type == ARRAY || n->type == DICT)
+    for (node* c = n->child; c; c = c->next)
+      if (!push_refs(f, c, marks, todo, top, room)) return false;
+  return true;
+}
+
+/* Adds name token n, its #xx escapes decoded, to h. */
+static void absorb_name(digester* h, const node* n) {
+  size_t length = 0;
+  for (size_t i = 1; i < n->length; i++, length++)
+    if (n->raw[i] == '#') i += 2;
+  absorb_size(h, length);
+  for (size_t i = 1; i < n->length; i++) {
+    uint8_t c = n->raw[i];
+    if (c == '#') {
+      c = (uint8_t)(hex(n->raw[i + 1]) * 16 + hex(n->raw[i + 2]));
+      i += 2;
+    }
+    absorb(h, &c, 1);
+  }
+}
+
+/* Adds n's canonical form to h: its kind, a dictionary's keys decoded and in
+ * order, a reference as the digest of the object referred to. False, the job
+ * still fine, when n refers to an object that cannot be shared. */
+static bool canonical(file* f, const sharing* s, digester* h, node* n,
+                      unsigned depth) {
+  if (!tick(f->j) || depth >= 64) return false;
+  uint8_t tag = (uint8_t)n->type;
+  absorb(h, &tag, 1);
+  if (n->type == REF) {
+    entry* e = lookup(f, n->number);
+    if (!e || e->generation != n->generation ||
+        !(s->marks[e - f->entries] & SHARE_ABLE))
+      return false;
+    absorb(h, s->sums[e - f->entries].bytes, sizeof(digest));
+    return true;
+  }
+  if (n->type == NAME) {
+    absorb_name(h, n);
+    return true;
+  }
+  if (n->type == SCALAR) {
+    absorb_size(h, n->length);
+    absorb(h, n->raw, n->length);
+    return true;
+  }
+
+  size_t count = 0;
+  for (node* c = n->child; c; c = c->next) count++;
+  absorb_size(h, count);
+  if (n->type == ARRAY) {
+    for (node* c = n->child; c; c = c->next)
+      if (!canonical(f, s, h, c, depth + 1)) return false;
+    return true;
+  }
+
+  node *few[16], **keys = few;
+  count /= 2;
+  if (count > 16) {
+    /* Sorting costs work as unique_keys() charges it. */
+    size_t bits = 0;
+    for (size_t k = count; k; k >>= 1) bits++;
+    if (!charge(f->j, count * bits) ||
+        !(keys = take(f->j, count * sizeof *keys)))
+      return false;
+  }
+  size_t at = 0;
+  for (node* k = n->child; k; k = k->next->next) keys[at++] = k;
+  qsort(keys, count, sizeof *keys, key_order);
+  for (size_t i = 0; i < count; i++) {
+    absorb_name(h, keys[i]);
+    if (!canonical(f, s, h, keys[i]->next, depth + 1)) return false;
+  }
+  return true;
+}
+
+/* Objects whose identity matters, never shared: the document's structure,
+ * its pages, annotations and optional content. */
+static bool distinct(node* n) {
+  static const char* const kinds[] = {
+      "Catalog", "Pages", "Page",           "Annot",      "OCG",
+      "OCMD",    "Sig",   "StructTreeRoot", "StructElem", "Outlines"};
+  node* type = get(n, "Type");
+  for (size_t i = 0; i < sizeof kinds / sizeof *kinds; i++)
+    if (named(type, kinds[i])) return true;
+  return get(n, "Subtype") && get(n, "Rect"); /* An annotation untyped. */
+}
+
+/* The digest of imported object e: its canonical form, then its stream's
+ * bytes as stored. False, the job still fine, when e cannot be shared. */
+static bool object_digest(file* f, const sharing* s, entry* e, digest* out) {
+  digester h;
+  rmr_sha256_init(&h);
+  absorb(&h, e->stream ? "S" : "O", 1);
+  if (!canonical(f, s, &h, e->object, 0)) return false;
+  if (e->stream) {
+    if (!charge(f->j, e->stream_size / 4096)) return false;
+    absorb_size(&h, e->stream_size);
+    absorb(&h, e->stream, e->stream_size);
+  }
+  *out = rmr_sha256_final(&h);
+  return true;
+}
+
+/* Ahead of an import into a writer keeping a ledger: digests every object the
+ * roots reach, those it refers to first, and gives each the ledger has seen
+ * the number recorded there, so that the import refers to it instead of
+ * writing it again, nor what only it refers to. An object is shared when it
+ * is neither a page's content nor of distinct identity, takes no part in a
+ * reference cycle, and refers only to objects themselves shared. */
+static bool share(writer* w, file* f, node* const* roots, size_t count,
+                  sharing* s) {
+  job* j = f->j;
+  s->marks = take(j, f->count);
+  s->sums = take(j, f->count * sizeof *s->sums);
+  if (!s->marks || !s->sums) return false;
+  for (page* p = f->pages; p; p = p->next) {
+    node* c = get(p->object->object, "Contents");
+    entry* e = c && c->type == REF ? lookup(f, c->number) : nullptr;
+    if (e) s->marks[e - f->entries] |= SHARE_OWN;
+    if (e && e->object) c = e->object;
+    for (node* k = c && c->type == ARRAY ? c->child : nullptr; k; k = k->next)
+      if (k->type == REF && (e = lookup(f, k->number)))
+        s->marks[e - f->entries] |= SHARE_OWN;
+  }
+
+  entry** todo = nullptr;
+  size_t top = 0, room = 0;
+  for (size_t i = 0; i < count; i++)
+    if (!push_refs(f, roots[i], s->marks, &todo, &top, &room)) return false;
+  while (top && j->status == RMR_OK) {
+    entry* e = todo[top - 1];
+    size_t at = (size_t)(e - f->entries);
+    if (!(s->marks[at] & (SHARE_OPEN | SHARE_DONE))) {
+      s->marks[at] |= SHARE_OPEN;
+      node* n = object(f, e, 0);
+      if (!n || !push_refs(f, n, s->marks, &todo, &top, &room)) return false;
+      continue;
+    }
+    top--;
+    if (s->marks[at] & SHARE_DONE) continue;
+    /* Every object e refers to is done, or open: a cycle through e. */
+    s->marks[at] = (uint8_t)((s->marks[at] & ~SHARE_OPEN) | SHARE_DONE);
+    if (s->marks[at] & SHARE_OWN || distinct(e->object) ||
+        !object_digest(f, s, e, &s->sums[at]))
+      continue;
+    s->marks[at] |= SHARE_ABLE;
+    uint32_t number = ledger_find(w->shared, s->sums[at]);
+    if (number) e->mapped = number;
+  }
+  return j->status == RMR_OK;
+}
+
+/* Numbers and writes the objects the roots refer to and those they refer to
+ * in turn: what a form or page imported from f draws with, without the
+ * file's catalog, page tree or document information. Objects numbered
+ * before the call (the page, its tree) are referred to, not written; with a
+ * ledger, so are those an earlier import wrote, and the objects written are
+ * recorded in it. */
+static bool import_reachable(writer* w, file* f, node* const* roots,
+                             size_t count) {
+  sharing s = {0};
+  if (w->shared && !share(w, f, roots, count, &s)) return false;
+  entry** stack = take(f->j, (f->count + 1) * sizeof *stack);
+  if (!stack) return false;
+  size_t top = 0, written = 0;
+  for (size_t i = 0; i < count; i++)
+    if (!reach(w, f, roots[i], stack, &top)) return false;
+
+  entry** order = take(f->j, (f->count + 1) * sizeof *order);
+  if (!order) return false;
+  while (top) {
+    entry* e = stack[--top];
+    order[written++] = e;
+    node* n = object(f, e, 0);
+    if (!n || !reach(w, f, n, stack, &top)) return false;
+  }
+
+  for (size_t i = 0; i < written && w->j->status == RMR_OK; i++) {
+    entry* e = order[i];
+    begin(w, e->mapped, 0);
+    value(w, f, e->object, 0);
+    if (e->stream) {
+      text(w, "\nstream\n");
+      put(w, e->stream, e->stream_size);
+      text(w, "\nendstream");
+    }
+    end(w);
+  }
+  for (size_t i = 0; s.marks && i < written && w->j->status == RMR_OK; i++) {
+    size_t at = (size_t)(order[i] - f->entries);
+    if (s.marks[at] & SHARE_ABLE)
+      ledger_add(w->shared, s.sums[at], order[i]->mapped);
+  }
+  return w->j->status == RMR_OK && f->j->status == RMR_OK;
+}
+
+/* The values of dictionary d other than its key `except`, as roots. */
+static size_t dict_values(node* d, const char* except, node** out,
+                          size_t room) {
+  size_t n = 0;
+  for (node* k = d && d->type == DICT ? d->child : nullptr; k && n < room;
+       k = k->next->next)
+    if (!named(k, except)) out[n++] = k->next;
+  return n;
+}
+
+/* The objects a form made of page p needs: its resources and box, and the
+ * filter parameters of its single content stream. */
+static bool import_roots(writer* w, file* f, page* p, entry* single) {
+  node* roots[64];
+  size_t n = 0;
+  roots[n++] = p->resources;
+  roots[n++] = p->crop ? p->crop : p->media;
+  if (single) n += dict_values(single->object, "Length", roots + n, 64 - n);
+  return import_reachable(w, f, roots, n);
+}
+
+rmr_status rmr_pdf_builder_form(rmr_pdf_builder* b, const uint8_t* pdf,
+                                size_t size, uint32_t* out, rmr_error* error) {
+  job scratch;
+  file f;
+  writer* w = &b->w;
+  rmr_buffer joined = {0};
+  if (import_begin(b, &scratch, &f, pdf, size)) {
+    page* p = f.pages;
+    uint64_t rotation = 0;
+    node* box = resolve(&f, p && p->crop ? p->crop : p ? p->media : nullptr, 0);
+    entry* single = nullptr;
+    if (f.page_count != 1)
+      stop(&scratch, RMR_ERR_INVALID_ARGUMENT, "form PDF must have one page");
+    else if (p->rotate && (!uint_value(resolve(&f, p->rotate, 0), &rotation) ||
+                           rotation % 360))
+      stop(&scratch, RMR_ERR_UNSUPPORTED, "rotated form PDF");
+    else if (!box || box->type != ARRAY)
+      stop(&scratch, RMR_ERR_INVALID_ARGUMENT, "form PDF has no media box");
+    else if (one_stream(&f, get(p->object->object, "Contents"), &single,
+                        &joined) &&
+             import_roots(w, &f, p, single)) {
+      uint32_t id = reserve(w);
+      begin(w, id, 0);
+      text(w, "<< /Type /XObject /Subtype /Form /FormType 1\n/BBox ");
+      value(w, &f, box, 0);
+      text(w, "\n/Matrix [1 0 0 1 0 0]\n/Resources ");
+      node* resources = p->resources ? p->resources : nullptr;
+      if (resources)
+        value(w, &f, resources, 0);
+      else
+        text(w, "<< >>");
+      text(w, "\n");
+      /* A page's /Group is not carried over: as PDFium imports a page, the
+       * form is no transparency group of its own. */
+      if (single) {
+        const char* skip[] = {"Type",      "Subtype", "FormType", "BBox",
+                              "Resources", "Matrix",  "Group",    "Length"};
+        fields(w, &f, single->object, skip, sizeof skip / sizeof *skip);
+        format(w, "/Length %zu >>\nstream\n", single->stream_size);
+        put(w, single->stream, single->stream_size);
+      } else {
+        format(w, "/Length %zu >>\nstream\n", joined.size);
+        put(w, joined.bytes, joined.size);
+      }
+      text(w, "\nendstream");
+      end(w);
+      if (scratch.status == RMR_OK) *out = id;
+    }
+  }
+  free(joined.bytes);
+  import_end(b, &scratch);
+  return built(b, error);
+}
+
+rmr_status rmr_pdf_builder_wrap(rmr_pdf_builder* b, double width, double height,
+                                const uint32_t* forms, size_t count,
+                                uint32_t* out, rmr_error* error) {
+  writer* w = &b->w;
+  writer content = {.j = &b->j};
+  for (size_t i = 0; i < count; i++)
+    format(&content, "q /RMRx%u Do Q\n", forms[i]);
+  uint32_t id = reserve(w);
+  begin(w, id, 0);
+  text(w, "<< /Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 ");
+  real(w, width);
+  text(w, " ");
+  real(w, height);
+  text(w, "]\n/Matrix [1 0 0 1 0 0]\n/Resources ");
+  const uint32_t* const lists[3] = {forms, nullptr, nullptr};
+  const size_t counts[3] = {count, 0, 0};
+  resources_with(w, nullptr, nullptr, lists, counts);
+  format(w, "\n/Length %zu >>\nstream\n", content.data.size);
+  put(w, content.data.bytes, content.data.size);
+  text(w, "\nendstream");
+  end(w);
+  free(content.data.bytes);
+  if (b->j.status == RMR_OK) *out = id;
+  return built(b, error);
+}
+
+rmr_status rmr_pdf_builder_page(rmr_pdf_builder* b, size_t index,
+                                const uint8_t* pdf, size_t size, double width,
+                                double height, const uint32_t* forms,
+                                size_t count, const rmr_pdf_local_link* links,
+                                size_t link_count, rmr_error* error) {
+  writer* w = &b->w;
+  if (index >= b->page_count || (link_count && !links) || (count && !forms)) {
+    stop(&b->j, RMR_ERR_INVALID_ARGUMENT, "invalid PDF page");
+    return built(b, error);
+  }
+  uint32_t number = b->first_page + (uint32_t)index;
+  page_refs refs = {nullptr, nullptr, b->first_page, b->page_count};
+
+  /* The forms drawn after the page's own content; a page of its own always
+   * has a content stream, empty when it draws nothing. */
+  uint32_t drawn = 0;
+  if ((count || !pdf) && b->j.status == RMR_OK) {
+    writer content = {.j = &b->j};
+    for (size_t i = 0; i < count; i++)
+      format(&content, "q /RMRx%u Do Q\n", forms[i]);
+    drawn = reserve(w);
+    begin(w, drawn, 0);
+    format(w, "<< /Length %zu >>\nstream\n", content.data.size);
+    put(w, content.data.bytes, content.data.size);
+    text(w, "\nendstream");
+    end(w);
+    free(content.data.bytes);
+    if (pdf) wrapping(b);
+  }
+
+  uint32_t* annots = nullptr;
+  if (link_count && b->j.status == RMR_OK) {
+    annots = take(&b->j, link_count * sizeof *annots);
+    for (size_t i = 0; annots && i < link_count; i++) {
+      annots[i] = reserve(w);
+      link_object(w, annots[i], links[i].rect, refs, links[i].destination);
+    }
+  }
+  const uint32_t* const lists[3] = {forms, nullptr, nullptr};
+  const size_t counts[3] = {count, 0, 0};
+
+  if (!pdf) {
+    if (b->j.status == RMR_OK) {
+      begin(w, number, 0);
+      format(w, "<< /Type /Page /Parent %u 0 R /MediaBox [0 0 ", b->tree);
+      real(w, width);
+      text(w, " ");
+      real(w, height);
+      text(w, "]\n");
+      if (drawn) format(w, "/Contents %u 0 R\n", drawn);
+      text(w, "/Resources ");
+      resources_with(w, nullptr, nullptr, lists, counts);
+      if (link_count) {
+        text(w, "\n/Annots [");
+        for (size_t i = 0; i < link_count; i++) format(w, "%u 0 R ", annots[i]);
+        text(w, "]");
+      }
+      text(w, " >>");
+      end(w);
+    }
+    return built(b, error);
+  }
+
+  job scratch;
+  file f;
+  if (import_begin(b, &scratch, &f, pdf, size)) {
+    if (f.page_count != 1)
+      stop(&scratch, RMR_ERR_INVALID_ARGUMENT, "page PDF must have one page");
+    page* p = f.pages;
+    /* The page tree is replaced by the output's, the page becomes page
+     * `number`; what the page refers to comes along, nothing else. */
+    node* roots[64];
+    size_t n = 0;
+    if (scratch.status == RMR_OK) {
+      p->object->mapped = number;
+      for (node* tree = get(p->object->object, "Parent");
+           tree && tree->type == REF;) {
+        entry* e = lookup(&f, tree->number);
+        if (!e || e->mapped) break;
+        e->mapped = b->tree;
+        node* d = object(&f, e, 0);
+        tree = d ? get(d, "Parent") : nullptr;
+      }
+      roots[n++] = p->resources;
+      roots[n++] = p->media;
+      roots[n++] = p->crop;
+      roots[n++] = p->rotate;
+      n += dict_values(p->object->object, "Parent", roots + n, 64 - n);
+    }
+    if (scratch.status == RMR_OK && import_reachable(w, &f, roots, n)) {
+      entry* e = p->object;
+      begin(w, number, 0);
+      format(w, "<<\n/Parent %u 0 R\n", b->tree);
+      const char* skip[] = {"Parent",   "Contents", "Resources", "Annots",
+                            "MediaBox", "CropBox",  "Rotate"};
+      fields(w, &f, e->object, skip, sizeof skip / sizeof *skip);
+      /* Inherited attributes are written on the page itself. */
+      const char* names[] = {"MediaBox", "CropBox", "Rotate"};
+      node* inherited[] = {p->media, p->crop, p->rotate};
+      for (size_t k = 0; k < 3; k++)
+        if (inherited[k]) {
+          format(w, "/%s ", names[k]);
+          value(w, &f, inherited[k], 0);
+          text(w, "\n");
+        }
+      text(w, "/Contents [");
+      if (drawn) format(w, "%u 0 R ", b->open);
+      page_contents(w, &f, get(e->object, "Contents"));
+      if (drawn) format(w, "%u 0 R %u 0 R", b->close, drawn);
+      text(w, "]\n/Resources ");
+      resources_with(w, &f, resolve(&f, p->resources, 0), lists, counts);
+      node* existing = resolve(&f, get(e->object, "Annots"), 0);
+      if (existing && existing->type != ARRAY)
+        stop(&scratch, RMR_ERR_INVALID_ARGUMENT, "invalid annotations");
+      if (existing || link_count) {
+        text(w, "\n/Annots [");
+        for (node* a = existing ? existing->child : nullptr;
+             a && tick(&scratch); a = a->next) {
+          value(w, &f, a, 0);
+          text(w, " ");
+        }
+        for (size_t k = 0; k < link_count; k++) format(w, "%u 0 R ", annots[k]);
+        text(w, "]");
+      }
+      text(w, "\n>>");
+      end(w);
+    }
+  }
+  import_end(b, &scratch);
+  return built(b, error);
+}
+
+rmr_status rmr_pdf_builder_finish(rmr_pdf_builder* b,
+                                  const rmr_pdf_outline* outline,
+                                  size_t outline_count, rmr_buffer* out,
+                                  rmr_error* error) {
+  job* j = &b->j;
+  writer* w = &b->w;
+  if ((!out && !w->output) || !b->tree || (outline_count && !outline))
+    stop(j, RMR_ERR_INVALID_ARGUMENT, "missing PDF pages");
+  if (outline_count >= j->limits.maximum_elements)
+    stop(j, RMR_ERR_LIMIT, "navigation limit");
+
+  page_refs refs = {nullptr, nullptr, b->first_page, b->page_count};
+  uint32_t outlines = j->status == RMR_OK
+                          ? outline_objects(w, outline, outline_count, refs)
+                          : 0;
+  uint32_t catalog = j->status == RMR_OK ? reserve(w) : 0;
+  if (j->status == RMR_OK) {
+    begin(w, b->tree, 0);
+    format(w, "<< /Type /Pages /Count %zu /Kids [", b->page_count);
+    for (size_t i = 0; i < b->page_count && tick(j); i++)
+      format(w, "%u 0 R ", b->first_page + (uint32_t)i);
+    text(w, "] >>");
+    end(w);
+    begin(w, catalog, 0);
+    format(w, "<< /Type /Catalog /Pages %u 0 R", b->tree);
+    if (outlines) format(w, " /Outlines %u 0 R", outlines);
+    text(w, " >>");
+    end(w);
+  }
+
+  /* Every page must have been written; numbers reserved and left unused
+   * become free entries. */
+  if (j->status == RMR_OK) {
+    update* list = take(j, w->count * sizeof *list);
+    size_t i = 0;
+    for (update* u = w->updates; list && u; u = u->next) list[i++] = *u;
+    if (list) qsort(list, w->count, sizeof *list, update_order);
+    size_t pages = 0;
+    for (i = 0; list && i < w->count; i++)
+      if (list[i].id >= b->first_page &&
+          list[i].id - b->first_page < b->page_count)
+        pages++;
+    if (pages != b->page_count)
+      stop(j, RMR_ERR_INVALID_ARGUMENT, "PDF pages missing");
+    size_t offset = position(w);
+    format(w, "xref\n0 %zu\n0000000000 65535 f \n", w->next_number);
+    i = 0;
+    for (size_t id = 1; list && id < w->next_number && j->status == RMR_OK;
+         id++) {
+      if (i < w->count && list[i].id == id) {
+        if (list[i].offset > 9999999999ULL) {
+          stop(j, RMR_ERR_LIMIT, "classic xref offset limit");
+          break;
+        }
+        format(w, "%010zu 00000 n \n", list[i].offset);
+        i++;
+      } else
+        text(w, "0000000000 65535 f \n");
+    }
+    format(w,
+           "trailer\n<< /Size %zu /Root %u 0 R >>\nstartxref\n%zu\n%%%%EOF\n",
+           w->next_number, catalog, offset);
+  }
+
+  if (j->status == RMR_OK) assemble(w, out);
+  rmr_status s = built(b, error);
+  stop(j, RMR_ERR_INVALID_ARGUMENT, "PDF builder already finished");
+  return s;
+}
+
+/* An incremental update or a fresh rewrite written page by page
+ * (rmr_pdf_edit.h). The source is parsed once under the update's own job,
+ * which also keeps the xref rows; each page's overlays are parsed and
+ * imported under a job of their own, released once they are written, so that
+ * neither memory nor work grows with the number of pages, and a page costs no
+ * more than its own overlays do. An object an overlay imports identical to
+ * one an earlier page's did (a grain mask, a color profile) is referred to
+ * instead of written again; only a ledger of digests and object numbers,
+ * bounded, outlives the page. */
+struct rmr_pdf_update {
+  job j;
+  writer w;
+  file f;
+  page** pages;  /* source pages by index */
+  uint8_t* done; /* pages written: given overlays, or (fresh) at finish */
+  uint8_t* skip; /* fresh: source objects written with their pages */
+  uint32_t open, close;
+  size_t updated, original;
+  bool fresh, started;
+  ledger shared; /* objects the pages' overlays imported */
+};
+
+/* The update's failure as an rmr_status, filling error. */
+static rmr_status update_status(rmr_pdf_update* u, rmr_error* error) {
+  job* j = &u->j;
+  return j->status == RMR_OK ? RMR_OK
+                             : rmr_fail(error, j->status, 0,
+                                        j->reason  ? j->reason
+                                        : u->fresh ? "PDF rewrite failed"
+                                                   : "PDF update failed");
+}
+
+void rmr_pdf_update_free(rmr_pdf_update* u) {
+  if (!u) return;
+  free(u->w.data.bytes);
+  for (chunk* c = u->w.chunks; c;) {
+    chunk* next = c->next;
+    chunk_free(c);
+    c = next;
+  }
+  free(u->shared.slots);
+  release(&u->j);
+  free(u);
+}
+
+/* Writes source object e as it is. */
+static void copy_object(writer* w, file* f, entry* e) {
+  node* n = object(f, e, 0);
+  if (!n) return;
+  begin(w, e->number, e->generation);
+  value(w, nullptr, n, 0);
+  if (e->stream) {
+    text(w, "\nstream\n");
+    put(w, e->stream, e->stream_size);
+    text(w, "\nendstream");
+  }
+  end(w);
+}
+
+rmr_status rmr_pdf_update_create(const uint8_t* source, size_t size, bool fresh,
+                                 const rmr_limits* limits, rmr_cancel_fn cancel,
+                                 void* context, const rmr_output* output,
+                                 rmr_pdf_update** out, rmr_error* error) {
+  if (!source || !size || !out)
+    return rmr_fail(
+        error, RMR_ERR_INVALID_ARGUMENT, 0,
+        fresh ? "missing PDF rewrite input" : "missing PDF update input");
+  rmr_pdf_update* u = rmr_calloc(1, sizeof *u);
+  if (!u)
+    return rmr_fail(error, RMR_ERR_OUT_OF_MEMORY, 0, "PDF update allocation");
+  u->j = (job){.limits = limits ? *limits : rmr_limits_default(),
+               .cancel = cancel,
+               .context = context};
+  /* Without an output the file is collected in chunks, assembled once. */
+  u->shared.j = &u->j;
+  u->w = (writer){
+      .j = &u->j, .output = output, .chunked = !output, .shared = &u->shared};
+  u->fresh = fresh;
+  u->original = size;
+  job* j = &u->j;
+  file* f = &u->f;
+
+  if (tick(j) && open_file(f, j, source, size)) {
+    u->w.next_number = f->next_number;
+    if (f->page_count > SIZE_MAX / sizeof(page*))
+      stop(j, RMR_ERR_LIMIT, "PDF page limit");
+    u->pages = take(j, f->page_count * sizeof *u->pages);
+    u->done = take(j, f->page_count);
+    if (fresh) u->skip = take(j, f->count);
+    size_t at = 0;
+    for (page* p = f->pages; p && j->status == RMR_OK; p = p->next) {
+      u->pages[at++] = p;
+      if (fresh) u->skip[p->object - f->entries] = 1;
+    }
+  }
+
+  if (j->status == RMR_OK && !fresh) put(&u->w, source, size);
+  /* A fresh file keeps object identities and generations, but not historical
+   * revisions or object streams; its pages are written as they are given
+   * their overlays, the rest now. */
+  if (j->status == RMR_OK && fresh) {
+    header(&u->w, source, size);
+    for (size_t i = 0; i < f->count && tick(j); i++) {
+      entry* e = &f->entries[i];
+      if (!e->live || absent(e) || u->skip[i]) continue;
+      node* n = object(f, e, 0);
+      if (!n) break;
+      node* type = n->type == DICT ? get(n, "Type") : nullptr;
+      if (e->stream && (named(type, "ObjStm") || named(type, "XRef"))) continue;
+      copy_object(&u->w, f, e);
+    }
+  }
+
+  rmr_status s = update_status(u, error);
+  if (s != RMR_OK) {
+    rmr_pdf_update_free(u);
+    return s;
+  }
+  *out = u;
+  return RMR_OK;
+}
+
+rmr_status rmr_pdf_update_page(rmr_pdf_update* u, const rmr_pdf_overlay* parts,
+                               size_t count, rmr_error* error) {
+  job* j = &u->j;
+  writer* w = &u->w;
+  if (!parts || !count || count > MAXIMUM_PARTS)
+    stop(j, RMR_ERR_INVALID_ARGUMENT, "missing PDF update input");
+  else if (u->updated >= j->limits.maximum_draws)
+    stop(j, RMR_ERR_LIMIT, "overlay count limit");
+  if (!tick(j)) return update_status(u, error);
+
+  const rmr_pdf_overlay* o = &parts[0];
+  double determinant =
+      o->transform.a * o->transform.d - o->transform.b * o->transform.c;
+  bool valid =
+      isfinite(determinant) && determinant != 0 &&
+      (!o->replace_box ||
+       (isfinite(o->box.x) && isfinite(o->box.y) && isfinite(o->box.width) &&
+        isfinite(o->box.height) && o->box.width > 0 && o->box.height > 0));
+  for (size_t i = 0; i < count; i++)
+    valid = valid && parts[i].pdf && parts[i].size && parts[i].page == o->page;
+  if (!valid)
+    stop(j, RMR_ERR_INVALID_ARGUMENT, "invalid overlay transform/box");
+  else if (o->page >= u->f.page_count)
+    stop(j, RMR_ERR_INVALID_ARGUMENT, "overlay page outside source");
+  else if (u->done[o->page])
+    stop(j, RMR_ERR_INVALID_ARGUMENT, "duplicate page overlay");
+  if (j->status != RMR_OK) return update_status(u, error);
+  u->done[o->page] = 1;
+
+  /* An incremental update starts on a line of its own. */
+  if (!u->fresh && !u->started) text(w, "\n");
+  u->started = true;
+  if (!u->open) {
+    u->open = stream_text(w, "q\n");
+    u->close = stream_text(w, "Q\n");
+  }
+
+  /* The overlays' parse, import and work are this page's alone; their xref
+   * rows stay with the update. */
+  job scratch = {
+      .limits = j->limits, .cancel = j->cancel, .context = j->context};
+  if (j->status == RMR_OK) {
+    w->j = &scratch;
+    w->records = j;
+    overlay(w, &u->f, u->pages[o->page], parts, count, u->open, u->close);
+    w->j = j;
+    w->records = nullptr;
+    if (scratch.status != RMR_OK)
+      stop(j, scratch.status,
+           scratch.reason ? scratch.reason : "PDF update failed");
+    release(&scratch);
+  }
+  if (j->status == RMR_OK) u->updated++;
+  return update_status(u, error);
+}
+
+rmr_status rmr_pdf_update_finish(rmr_pdf_update* u, rmr_buffer* out,
+                                 rmr_pdf_incremental_report* report,
+                                 rmr_error* error) {
+  job* j = &u->j;
+  writer* w = &u->w;
+  file* f = &u->f;
+  if (!out && !w->output)
+    stop(j, RMR_ERR_INVALID_ARGUMENT, "missing PDF update output");
+
+  if (u->fresh) {
+    for (size_t i = 0; i < f->page_count && tick(j); i++)
+      if (!u->done[i]) copy_object(w, f, u->pages[i]->object);
+    if (j->status == RMR_OK) {
+      f->last = 0;
+      f->xref_streams = false;
+      finish(w, f);
+    }
+  } else if (u->started && j->status == RMR_OK)
+    finish(w, f);
+
+  /* Zero overlays leave an exact copy of the source. */
+  if (j->status == RMR_OK) assemble(w, out);
+  rmr_status s = update_status(u, error);
+  if (s == RMR_OK && report)
+    *report = (rmr_pdf_incremental_report){u->updated, u->original, !u->fresh};
+  stop(j, RMR_ERR_INVALID_ARGUMENT, "PDF update already finished");
+  return s;
+}
+
+rmr_status rmr_pdf_incremental(const uint8_t* source, size_t size,
+                               const rmr_pdf_overlay* overlays, size_t count,
+                               const rmr_limits* limits, rmr_cancel_fn cancel,
+                               void* context, rmr_buffer* out,
+                               rmr_pdf_incremental_report* report,
+                               rmr_error* error) {
+  if (!out)
+    return rmr_fail(error, RMR_ERR_INVALID_ARGUMENT, 0,
+                    "missing PDF update input");
+  return rmr_pdf_incremental_output(source, size, overlays, count, limits,
+                                    cancel, context, nullptr, out, report,
+                                    error);
+}
+
+rmr_status rmr_pdf_incremental_output(const uint8_t* source, size_t size,
+                                      const rmr_pdf_overlay* overlays,
+                                      size_t count, const rmr_limits* given,
+                                      rmr_cancel_fn cancel, void* context,
+                                      const rmr_output* output, rmr_buffer* out,
+                                      rmr_pdf_incremental_report* report,
+                                      rmr_error* error) {
+  if (!source || !size || (!out && !output) || (count && !overlays))
+    return rmr_fail(error, RMR_ERR_INVALID_ARGUMENT, 0,
+                    "missing PDF update input");
+  rmr_limits limits = given ? *given : rmr_limits_default();
+  if (count > limits.maximum_draws)
+    return rmr_fail(error, RMR_ERR_LIMIT, 0, "overlay count limit");
+
+  rmr_pdf_update* u = nullptr;
+  rmr_status s = rmr_pdf_update_create(source, size, false, &limits, cancel,
+                                       context, output, &u, error);
+  for (size_t i = 0; s == RMR_OK && i < count; i++)
+    s = rmr_pdf_update_page(u, &overlays[i], 1, error);
+  if (s == RMR_OK) s = rmr_pdf_update_finish(u, out, report, error);
+  rmr_pdf_update_free(u);
+  return s;
 }

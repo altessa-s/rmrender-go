@@ -13,8 +13,9 @@
  * and fonts stay explicit. Imported PDF pages use native point sizing; notebook
  * pages use paper. No source file is changed. Parsing errors fail the
  * operation; recoverable parser losses are counted in report. Dependency/native
- * allocations are outside portable plan accounting; aggregate retained plans
- * share limits. */
+ * allocations are outside portable plan accounting. Each page is planned as it
+ * is drawn and its plan freed after, so maximum_plan_bytes bounds one page's
+ * plan rather than the document's. */
 [[nodiscard]] RMR_API rmr_status rmr_apple_document_pdf(
     const rmr_archive_document* document, const rmr_page_resources* resources,
     const rmr_apple_fonts* fonts, rmr_paper paper, size_t maximum_pages,
@@ -55,5 +56,70 @@
     double raster_dpi, const rmr_limits* limits, rmr_cancel_fn cancel,
     void* context, rmr_svg_pages* out, rmr_document_report* report,
     rmr_error* error);
+
+/* rmr_apple_document_svg drawing the pages as options say: of them it reads
+ * only what the document exports do with an unreadable page (see
+ * rmr_unreadable_policy in output.h); null selects the defaults, which
+ * rmr_apple_document_svg uses. */
+[[nodiscard]] RMR_API rmr_status rmr_apple_document_svg_with_options(
+    const rmr_archive_document* document, const rmr_page_resources* resources,
+    const rmr_apple_fonts* fonts, rmr_paper paper, size_t maximum_pages,
+    double raster_dpi, const rmr_limits* limits, const rmr_pdf_options* options,
+    rmr_cancel_fn cancel, void* context, rmr_svg_pages* out,
+    rmr_document_report* report, rmr_error* error);
+
+/* rmr_apple_document_pdf, _preserving and _recomposed drawing the marks as
+ * options say (see rmr_pdf_options in output.h; null selects the defaults,
+ * which the functions without options use). */
+[[nodiscard]] RMR_API rmr_status rmr_apple_document_pdf_with_options(
+    const rmr_archive_document* document, const rmr_page_resources* resources,
+    const rmr_apple_fonts* fonts, rmr_paper paper, size_t maximum_pages,
+    const rmr_limits* limits, const rmr_pdf_options* options,
+    rmr_cancel_fn cancel, void* context, rmr_buffer* out,
+    rmr_document_report* report, rmr_error* error);
+[[nodiscard]] RMR_API rmr_status rmr_apple_document_pdf_preserving_with_options(
+    const rmr_archive_document* document, const rmr_page_resources* resources,
+    const rmr_apple_fonts* fonts, rmr_paper paper, size_t maximum_pages,
+    const rmr_limits* limits, const rmr_pdf_options* options,
+    rmr_cancel_fn cancel, void* context, rmr_buffer* out,
+    rmr_document_report* report, rmr_error* error);
+[[nodiscard]] RMR_API rmr_status rmr_apple_document_pdf_recomposed_with_options(
+    const rmr_archive_document* document, const rmr_page_resources* resources,
+    const rmr_apple_fonts* fonts, rmr_paper paper, size_t maximum_pages,
+    const rmr_limits* limits, const rmr_pdf_options* options,
+    rmr_cancel_fn cancel, void* context, rmr_buffer* out,
+    rmr_document_report* report, rmr_error* error);
+
+/* rmr_apple_document_pdf_with_options, _preserving_with_options and
+ * _recomposed_with_options writing the file to output as it is produced (see
+ * rmr_output in output.h) instead of returning it in a buffer; the bytes are
+ * the same. A fresh export writes each page as it is finished, then the page
+ * tree, outline and cross-reference table, so memory no longer grows with the
+ * file; CoreGraphics' own part of it (pages, text and everything the ink
+ * writer leaves to it) is still collected until its context closes and then
+ * written after the ink. A preserving export holds the overlays it appends, as
+ * the buffer function does, then writes the original file followed by them. A
+ * recomposed export builds its intermediate files in memory, as the buffer
+ * function does, and writes only the final rewrite as it goes.
+ * maximum_pdf_bytes bounds the whole file. On failure the output has received
+ * part of a file. */
+[[nodiscard]] RMR_API rmr_status rmr_apple_document_pdf_to_output(
+    const rmr_archive_document* document, const rmr_page_resources* resources,
+    const rmr_apple_fonts* fonts, rmr_paper paper, size_t maximum_pages,
+    const rmr_limits* limits, const rmr_pdf_options* options,
+    rmr_cancel_fn cancel, void* context, const rmr_output* output,
+    rmr_document_report* report, rmr_error* error);
+[[nodiscard]] RMR_API rmr_status rmr_apple_document_pdf_preserving_to_output(
+    const rmr_archive_document* document, const rmr_page_resources* resources,
+    const rmr_apple_fonts* fonts, rmr_paper paper, size_t maximum_pages,
+    const rmr_limits* limits, const rmr_pdf_options* options,
+    rmr_cancel_fn cancel, void* context, const rmr_output* output,
+    rmr_document_report* report, rmr_error* error);
+[[nodiscard]] RMR_API rmr_status rmr_apple_document_pdf_recomposed_to_output(
+    const rmr_archive_document* document, const rmr_page_resources* resources,
+    const rmr_apple_fonts* fonts, rmr_paper paper, size_t maximum_pages,
+    const rmr_limits* limits, const rmr_pdf_options* options,
+    rmr_cancel_fn cancel, void* context, const rmr_output* output,
+    rmr_document_report* report, rmr_error* error);
 
 #endif

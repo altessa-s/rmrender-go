@@ -171,7 +171,9 @@ func archive(t testing.TB, files ...file) []byte {
 // docID is the document of the test archives.
 const docID = "a1b2"
 
-// notebook packs a notebook of pages, p1, p2 and on, each on template.
+// notebook packs a notebook of pages, p1, p2 and on, each on template; a nil
+// page is listed without a .rm file, as the tablet leaves a page nobody wrote
+// on.
 func notebook(t testing.TB, template string, pages ...[]byte) []byte {
 	t.Helper()
 	var entries []string
@@ -179,7 +181,9 @@ func notebook(t testing.TB, template string, pages ...[]byte) []byte {
 	for i, p := range pages {
 		id := fmt.Sprintf("p%d", i+1)
 		entries = append(entries, fmt.Sprintf(`{"id":%q,"idx":{"value":"b%c"},"template":{"value":%q}}`, id, 'a'+i, template))
-		files = append(files, file{docID + "/" + id + ".rm", p})
+		if p != nil {
+			files = append(files, file{docID + "/" + id + ".rm", p})
+		}
 	}
 	content := `{"fileType":"notebook","cPages":{"pages":[` + strings.Join(entries, ",") + `]}}`
 	files = append(files, file{docID + ".content", []byte(content)})

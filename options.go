@@ -67,6 +67,55 @@ const (
 	PDFRecomposed
 )
 
+// PDFGrain is how PDF output draws grained ink: pencils, brushes and
+// ballpoints, whose 1-bit grain is a stencil mask clipped to the stroke's
+// outline. Translucent ink is drawn in a transparency group either way.
+type PDFGrain int
+
+// The grain drawings. They differ only on the Cairo backend (linux, windows,
+// and darwin with the rmrender_cairo tag); CoreGraphics always draws
+// PDFGrainMask's way and accepts both.
+const (
+	// PDFGrainMask draws opaque ink's stencil straight onto the page: about
+	// half the bytes of PDFGrainGroup, with edges matching the CoreGraphics
+	// backend.
+	PDFGrainMask PDFGrain = iota
+	// PDFGrainGroup wraps each grained stroke in a transparency group of its
+	// own, as the Cairo backend did up to 1.4.1: viewers antialias the
+	// clipped edge twice and draw it lighter.
+	PDFGrainGroup
+)
+
+// Unreadable is what a document's calls do with an unreadable page: one whose
+// .rm file is in the archive but does not parse, because it is truncated,
+// malformed or of a version this package does not read. A listed page
+// without a .rm file is not one: the tablet writes none for a page nobody
+// wrote on, and such a page is always drawn as an empty page on its
+// template. A page that cannot be parsed for want of memory, or past a
+// [Limits] bound, fails the call whatever this says.
+type Unreadable int
+
+// The ways of drawing an unreadable page. Exports count the pages they drew
+// so in [Report.UnreadablePages].
+const (
+	// UnreadableStrict fails the call with an *Error whose cause is an
+	// *UnreadablePageError naming the page; its Status is StatusBackend, or
+	// StatusUnsupported for a page of a newer version.
+	UnreadableStrict Unreadable = iota
+	// UnreadableBlank draws the page as one without a .rm file: an empty
+	// page on its template or, over an imported PDF, the PDF page without
+	// marks.
+	UnreadableBlank
+	// UnreadablePlaceholder draws "Rendering error" in the middle of the
+	// page, dark grey on a light rounded box, its type a twentieth of the
+	// page's width, in Noto Sans, the face typed text is set in, so that a
+	// PDF embeds it as it embeds typed text: on a plain sheet of the page's
+	// size, without its template or, over an imported PDF, on the PDF page
+	// without marks. It needs [Options.Fonts]. Bitmaps and SVG carry it
+	// too, which a text recogniser reads.
+	UnreadablePlaceholder
+)
+
 // Limits bounds what one call may build: counts of points, path elements and
 // draw commands, the bytes of plans, bitmaps and PDFs, the side of a bitmap,
 // and the magnitude of coordinates and widths. They cover memory the C
@@ -165,8 +214,13 @@ type Options struct {
 	// PNG beneath the marks, which stay vectors. Zero means the C library's
 	// default, 150; the most is 10,000, and the bitmap limits apply.
 	PDFRasterDPI float64
+	// PDFGrain is how [PagePDF] and [Document.PDF] draw grained ink.
+	PDFGrain PDFGrain
 	// MaximumPages caps the pages of a document PDF; zero means all.
 	MaximumPages int
+	// Unreadable is what the calls of a [Document] do with a page whose
+	// .rm file does not parse; the zero value, UnreadableStrict, fails.
+	Unreadable Unreadable
 	// Limits bound the work; nil means [DefaultLimits]. MaximumPDFBytes
 	// bounds SVG output too, all pages of a document together.
 	Limits *Limits
@@ -188,10 +242,19 @@ func (o *Options) request() (C.rmrgo_request, error) {
 	if o.Edge < EdgeRibbon || o.Edge > EdgeCentreline {
 		return r, errInvalid("unknown edge")
 	}
+	if o.PDFGrain < PDFGrainMask || o.PDFGrain > PDFGrainGroup {
+		return r, errInvalid("unknown PDF grain")
+	}
+	if o.Unreadable < UnreadableStrict || o.Unreadable > UnreadablePlaceholder {
+		return r, errInvalid("unknown unreadable page policy")
+	}
 	r.paper = C.rmr_paper(o.Paper)
 	r.edge = C.rmr_ink_edge(o.Edge)
 	r.margin = C.double(o.Margin)
 	r.raster_dpi = C.double(o.PDFRasterDPI)
+	r.pdf = C.rmr_pdf_options_default()
+	r.pdf.grain = C.rmr_pdf_grain(o.PDFGrain)
+	r.pdf.unreadable = C.rmr_unreadable_policy(o.Unreadable)
 	r.limits = limits
 	return r, nil
 }

@@ -775,19 +775,29 @@ void rmr_linux_fonts_free(rmr_linux_fonts* f) {
   free(f);
 }
 
-#ifdef _WIN32
-/* Points Fontconfig's default configuration at an empty one in cache, once
- * per process, unless the user configured Fontconfig or its default
- * fonts.conf is found. Pango loads that default in a thread of its own when
- * the first font map is created, although rendering only ever uses the
- * private configuration of each font map. Fontconfig looks for it relative to
- * its DLL (etc\fonts of an installation tree such as MSYS2's), which an
- * application shipping only the DLLs lacks, and then prints "Cannot load
- * default config file" on stderr. This runs before this library's first font
- * map. FONTCONFIG_FILE only redirects that lookup, and only where it would
- * fail: unlike FcConfigSetCurrent it replaces no configuration a host
- * application already loaded or relies on, and once a default is loaded it
- * has no effect. The Windows C runtime serializes environment access. */
+/* Points Fontconfig's default configuration at an empty one, once per
+ * process, unless the user configured Fontconfig or its default fonts.conf is
+ * found. Pango loads that default in a thread of its own when the first font
+ * map is created, although rendering only ever uses the private configuration
+ * of each font map. Without it Fontconfig prints "Cannot load default config
+ * file" on stderr. On Windows it looks relative to its DLL (etc\fonts of an
+ * installation tree such as MSYS2's), which an application shipping only the
+ * DLLs lacks; elsewhere at the path it was built with (/etc/fonts/fonts.conf),
+ * which minimal containers and relocated builds lack. This runs before this
+ * library's first font map. FONTCONFIG_FILE only redirects that lookup, and
+ * only where it would fail: unlike FcConfigSetCurrent it replaces no
+ * configuration a host application already loaded or relies on, and once a
+ * default is loaded it has no effect.
+ *
+ * Fontconfig reads the configuration by path, so the empty one is a file, in
+ * the font cache on Windows (cache) and elsewhere, where fonts need no files,
+ * in the user cache directory, created only here. Child processes inherit the
+ * variable, so the file is a named, content-addressed one that outlives this
+ * process, not a descriptor of it. Where no such file can be written nothing
+ * changes and Fontconfig reports as before; rendering never depends on it.
+ * The Windows C runtime serializes environment access; elsewhere setenv is
+ * not safe against concurrent getenv, which is why it happens at most once,
+ * before this library creates any font map. */
 static void default_config(const char* cache, FcConfig* config) {
   static gsize initialized;
   if (!g_once_init_enter(&initialized)) return;
@@ -800,14 +810,23 @@ static void default_config(const char* cache, FcConfig* config) {
     if (found)
       FcStrFree(found);
     else {
-      char* file = rmr_font_cache_config(cache, nullptr);
-      if (file) g_setenv("FONTCONFIG_FILE", file, false);
+      char* directory = nullptr;
+#ifndef _WIN32
+      char* user =
+          g_build_filename(g_get_user_cache_dir(), "rmrender", nullptr);
+      cache = directory = rmr_font_cache_directory(user);
+      g_free(user);
+#endif
+      char* file = cache ? rmr_font_cache_config(cache, nullptr) : nullptr;
+      /* Fontconfig resolves a relative name against its own directories. */
+      if (file && g_path_is_absolute(file))
+        g_setenv("FONTCONFIG_FILE", file, false);
       g_free(file);
+      g_free(directory);
     }
   }
   g_once_init_leave(&initialized, 1);
 }
-#endif
 
 /* Builds a private Fontconfig/Pango font map from resolve's bundled fonts,
  * including per-face base-character sets used to pick calibration script. */
@@ -848,6 +867,8 @@ rmr_status rmr_linux_fonts_create(rmr_font_resolve_fn resolve, void* context,
     } else
       default_config(cache, f->config);
   }
+#else
+  if (s == RMR_OK) default_config(nullptr, f->config);
 #endif
 
   size_t total = 0;

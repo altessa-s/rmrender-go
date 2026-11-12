@@ -2,6 +2,8 @@
  * Use of this source code is governed by an MIT-style license that can be
  * found in the LICENSE file. */
 
+#include <rmrender/output.h>
+
 #include "rmr_internal.h"
 #ifdef RMRENDER_TESTING
 static thread_local size_t remaining = SIZE_MAX;
@@ -58,6 +60,16 @@ const char* rmr_status_string(rmr_status s) {
                                       "backend failed",
                                       "cancelled"};
   return (size_t)s < sizeof names / sizeof *names ? names[s] : "unknown status";
+}
+
+rmr_pdf_options rmr_pdf_options_default(void) {
+  return (rmr_pdf_options){RMR_PDF_OPTIONS_ABI,
+                           sizeof(rmr_pdf_options),
+                           RMR_PDF_GRAIN_MASK,
+                           0,
+                           RMR_UNREADABLE_STRICT,
+                           nullptr,
+                           nullptr};
 }
 
 rmr_limits rmr_limits_default(void) {

@@ -8,6 +8,7 @@
 #ifndef RMR_PDF_PLATFORM_H
 #define RMR_PDF_PLATFORM_H
 #include <rmrender/apple_pdf.h>
+#include <rmrender/output.h>
 
 #include "../common/rmr_pdf_marks.h"
 
@@ -23,20 +24,35 @@ size_t rmr_apple_pdf_source_length(const rmr_apple_pdf_source* s);
 /* Fill `e` with `s` and `message`. */
 rmr_status rmr_apple_pdf_fail(rmr_error* e, rmr_status s, const char* message);
 
-/* rmr_apple_pdf_overlay, _incremental and _recompose taking each page's marks
- * from marks when it is given (pages[i].marks may then be null). */
+/* rmr_apple_pdf_overlay, _incremental and _recompose with options taking each
+ * page's marks from marks when it is given (pages[i].marks may then be
+ * null) and, when output is given, writing the file to it as it is produced,
+ * leaving out unused. */
 RMR_API rmr_status rmr_apple_pdf_overlay_marks(
     const rmr_apple_pdf_source* source, const rmr_pdf_page* pages, size_t count,
-    const rmr_pdf_marks* marks, const rmr_limits* limits, rmr_cancel_fn cancel,
-    void* context, rmr_buffer* out, rmr_pdf_report* report, rmr_error* error);
+    const rmr_pdf_marks* marks, const rmr_limits* limits,
+    const rmr_pdf_options* options, rmr_cancel_fn cancel, void* context,
+    const rmr_output* output, rmr_buffer* out, rmr_pdf_report* report,
+    rmr_error* error);
 RMR_API rmr_status rmr_apple_pdf_incremental_marks(
     const rmr_apple_pdf_source* source, const rmr_pdf_page* pages, size_t count,
-    const rmr_pdf_marks* marks, const rmr_limits* limits, rmr_cancel_fn cancel,
-    void* context, rmr_buffer* out, rmr_pdf_incremental_report* report,
-    rmr_error* error);
+    const rmr_pdf_marks* marks, const rmr_limits* limits,
+    const rmr_pdf_options* options, rmr_cancel_fn cancel, void* context,
+    const rmr_output* output, rmr_buffer* out,
+    rmr_pdf_incremental_report* report, rmr_error* error);
+/* rmr_apple_pdf_incremental_marks, or with fresh set, a fresh rewrite of
+ * the source carrying the same overlays (as rmr_pdf_rewrite would rewrite the
+ * update), each page's overlay written as soon as it is drawn. */
+RMR_API rmr_status rmr_apple_pdf_update_marks(
+    const rmr_apple_pdf_source* source, const rmr_pdf_page* pages, size_t count,
+    const rmr_pdf_marks* marks, const rmr_limits* limits,
+    const rmr_pdf_options* options, rmr_cancel_fn cancel, void* context,
+    bool fresh, const rmr_output* output, rmr_buffer* out,
+    rmr_pdf_incremental_report* report, rmr_error* error);
 RMR_API rmr_status rmr_apple_pdf_recompose_marks(
     const rmr_apple_pdf_source* source, const rmr_pdf_page* pages, size_t count,
-    const rmr_pdf_marks* marks, const rmr_limits* limits, rmr_cancel_fn cancel,
-    void* context, rmr_buffer* out, rmr_error* error);
+    const rmr_pdf_marks* marks, const rmr_limits* limits,
+    const rmr_pdf_options* options, rmr_cancel_fn cancel, void* context,
+    const rmr_output* output, rmr_buffer* out, rmr_error* error);
 
 #endif

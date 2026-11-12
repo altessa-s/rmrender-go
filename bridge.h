@@ -48,7 +48,9 @@ void rmrgo_fonts_free(rmrgo_fonts *fonts);
 // What one render call is given. handle reaches the Go callbacks for
 // templates and, for a lone page, images; cancel is a flag or null.
 // raster_dpi is the resolution SVG output rasterizes imported PDF pages at,
-// in pixels per inch of sheet, zero for the library's default.
+// in pixels per inch of sheet, zero for the library's default; pdf is how PDF
+// output draws, and what a document's calls do with an unreadable page,
+// which they tell the Go callback of handle of.
 typedef struct {
     const rmrgo_fonts *fonts;
     uintptr_t handle;
@@ -56,6 +58,7 @@ typedef struct {
     rmr_ink_edge edge;
     double margin;
     double raster_dpi;
+    rmr_pdf_options pdf;
     rmr_limits limits;
     void *cancel;
 } rmrgo_request;
@@ -96,6 +99,12 @@ rmr_status rmrgo_document_page_svg(const rmrgo_request *request, rmrgo_document 
 rmr_status rmrgo_document_marks(const rmrgo_request *request, rmrgo_document *document,
                                 size_t index, rmr_page_marks **out, rmr_error *error);
 
+// Whether listed page index parses: unreadable receives RMR_OK, or the
+// status parsing it fails with, error then worded as a strict drawing of
+// the page fails.
+rmr_status rmrgo_document_check(rmrgo_document *document, size_t index, rmr_status *unreadable,
+                                rmr_error *error);
+
 // The three document exports, as the library names them: fresh, preserving
 // (an incremental update) and recomposed.
 #define RMRGO_PDF_FRESH 0
@@ -105,6 +114,12 @@ rmr_status rmrgo_document_marks(const rmrgo_request *request, rmrgo_document *do
 rmr_status rmrgo_document_pdf(const rmrgo_request *request, rmrgo_document *document,
                               uint32_t mode, size_t maximum_pages, rmr_buffer *out,
                               rmr_document_report *report, rmr_error *error);
+
+// The same exports written as they are produced, through the Go writer of
+// the request's handle, instead of returned in a buffer.
+rmr_status rmrgo_document_pdf_write(const rmrgo_request *request, rmrgo_document *document,
+                                    uint32_t mode, size_t maximum_pages,
+                                    rmr_document_report *report, rmr_error *error);
 
 // The whole document as SVG, one document per page, as the library's
 // document export makes it.

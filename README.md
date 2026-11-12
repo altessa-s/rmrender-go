@@ -54,7 +54,7 @@ library in Finder.
 
   The official Go for Windows works with it (or MSYS2's `mingw-w64-clang-x86_64-go`), with `CC=clang` and CLANG64's `bin` ahead on `PATH`.
   PDFium comes from the same script, as the `win-x64` SDK: `include/`, the import library `lib/pdfium.dll.lib` (the package links it with
-  `-l:pdfium.dll.lib`) and `bin/pdfium.dll`. Give cgo the paths in Windows form, as `cygpath -m` writes them:
+  `-lpdfium.dll`) and `bin/pdfium.dll`. Give cgo the paths in Windows form, as `cygpath -m` writes them:
 
   ```sh
   module=$(go list -m -f '{{.Dir}}' github.com/altessa-s/rmrender-go)
@@ -265,8 +265,85 @@ three modes, which differ only for an imported PDF:
 - `PDFRecomposed` writes a new single-revision PDF from the imported one's objects, allowing pages to be reordered, removed or repeated and
   keeping forms and annotations. Existing signatures stop verifying.
 
-A page that does not parse fails the call. What could be recovered from is counted in the `Report`: blocks of a page left out, pages that name
-an imported page the PDF does not have, and the links a fresh export could not carry over. `MaximumPages` caps the pages drawn.
+What could be recovered from is counted in the `Report`: blocks of a page left out, pages that name an imported page the PDF does not have,
+the links a fresh export could not carry over, and unreadable pages. `MaximumPages` caps the pages drawn.
+
+An **unreadable page** is one whose `.rm` file is in the archive but does not parse: truncated, malformed, or of a version the parser does not
+read. (A listed page without a `.rm` file is not one: the tablet writes none for a page nobody wrote on, and it is drawn as an empty page on its
+template.) `Options.Unreadable` says what every call of a `Document` does with it:
+
+| `Unreadable` | Notebook page | Page over an imported PDF | `Report.UnreadablePages` |
+|---|---|---|---|
+| `UnreadableStrict` (zero value) | the call fails with an `*Error` naming the page, its cause an `*UnreadablePageError` | the same | — |
+| `UnreadableBlank` | an empty page on its template, as a page without a `.rm` file | the PDF page without marks | counted |
+| `UnreadablePlaceholder` | a plain sheet of the page's size, no template, "Rendering error" in the middle | the PDF page with the label over it | counted |
+
+The label is dark grey on a light rounded box, its type a twentieth of the page's width, set in Noto Sans, the face typed text is set in, so a
+PDF embeds it as it embeds typed text; it needs `Fonts`. Bitmaps and SVG carry it too, which a text recogniser reads. `CheckPage` answers
+whether one page parses, with the error a strict drawing of it fails with. A page that cannot be parsed for want of memory or past a `Limits`
+bound fails the call whatever the option says.
+
+`WritePDF` writes the same file to an `io.Writer` as it is produced instead of answering it whole, so a long document's PDF need not fit in
+memory twice, or at all: the bytes are those of `PDF`, handed to the writer in order in pieces of at most 4 MiB, on the calling goroutine. A
+fresh export writes each page as it is finished; a preserving one writes the imported PDF and then the update, and a recomposed one its
+final rewrite, as they go. `Limits.MaximumPDFBytes` still bounds the file, 256 MiB by default: raise it for larger ones. The writer's
+failure stops the export with `StatusBackend` and the writer's error as its cause; on any failure the writer has received part of a file,
+so write to a temporary file and rename it once `WritePDF` succeeds.
+
+```go
+data, err := os.ReadFile("testdata/pages/Notes.rmdoc")
+if err != nil {
+	log.Fatal(err)
+}
+f, err := rmrender.NewFonts(fonts.FS)
+if err != nil {
+	log.Fatal(err)
+}
+defer f.Close()
+doc, err := rmrender.OpenDocument(data, nil)
+if err != nil {
+	fmt.Println(err)
+	return
+}
+defer doc.Close()
+dir, err := os.MkdirTemp("", "notes")
+if err != nil {
+	fmt.Println(err)
+	return
+}
+defer os.RemoveAll(dir)
+// The file is written as it is produced, into a temporary file renamed
+// once it is whole.
+out, err := os.CreateTemp(dir, "notes-*.pdf")
+if err != nil {
+	fmt.Println(err)
+	return
+}
+opts := &rmrender.Options{Fonts: f}
+report, err := doc.WritePDF(context.Background(), out, rmrender.PDFFresh, opts)
+if closeErr := out.Close(); err == nil {
+	err = closeErr
+}
+pdf := filepath.Join(dir, "notes.pdf")
+if err == nil {
+	err = os.Rename(out.Name(), pdf)
+}
+if err != nil {
+	fmt.Println(err)
+	return
+}
+head := make([]byte, 5)
+if file, err := os.Open(pdf); err == nil {
+	_, _ = io.ReadFull(file, head)
+	file.Close()
+}
+fmt.Println(string(head), report.RenderedPages, "pages")
+```
+
+`PDFGrain` says how `PDF` and `PagePDF` draw grained ink, pencils, brushes and ballpoints, whose grain is a stencil clipped to the stroke.
+`PDFGrainMask`, the zero value, draws opaque ink's stencil straight onto the page; `PDFGrainGroup` wraps each grained stroke in a transparency
+group of its own, as the Cairo backend did up to 1.4.1, which doubles the PDF's size and draws the edges lighter in most viewers. Translucent
+ink is grouped either way. Only the Cairo backend tells them apart: CoreGraphics always draws the mask way, and its output is the same for both.
 
 ## SVG
 
@@ -376,7 +453,8 @@ such as decoding one image, is not interrupted.
 Every failure is an `*Error` whose `Status` mirrors the C library's, matched with `errors.Is` against the sentinels: `ErrInvalidArgument`,
 `ErrOutOfMemory`, `ErrLimit`, `ErrUnsupported`, `ErrBackend` and `ErrCancelled`. Beside the status, it carries the C library's message, the
 `Index` of the input it concerns where there is one, and in `Err` what reading a font, template or image failed with. A page that does not
-parse is `StatusBackend`, or `StatusUnsupported` for a format generation the parser does not read, as in the document export; an archive that
+parse is `StatusBackend`, or `StatusUnsupported` for a format generation the parser does not read, as in the document export, and a page of a
+`Document` that does not parse has an `*UnreadablePageError` for its cause and its place for `Index`; an archive that
 is not one is `StatusInvalidArgument`. `Limits` bound points, path elements, draw commands, plan, bitmap and PDF bytes, bitmap sides,
 coordinates and widths, and the PDF byte limit bounds SVG output too; `DefaultLimits` answers the C library's defaults, and a call over one
 fails with `StatusLimit`.
@@ -425,12 +503,15 @@ same bytes.
 | `scripts/vendor.py` | Re-vendors the four libraries from their checkouts and regenerates the wrappers and headers |
 | `testdata/pages/` | Sample `.rm` pages and a `.rmdoc` built from them, with their licence |
 
+The script reads the PDFium headers of the SDK rmrender-lib pins: it fetches that SDK once, checksum-verified, into the user's cache
+directory, and `--pdfium` names one already on disk.
+
 miniz, the deflate codec rmdoc-lib compiles in, is vendored under `internal/clib/rmdoc/miniz/` rather than a `vendor/` directory, because the Go
 module zip leaves out files below any directory named `vendor`; the vendoring script points the library's two codec includes there.
 
 ```sh
 python3 scripts/vendor.py --rmrender ../rmrender-lib --rmlines ../rmlines-lib --rmdoc ../rmdoc-lib \
-    --rmmarks ../rmmarks-lib --pdfium /path/to/pdfium
+    --rmmarks ../rmmarks-lib
 go test -race ./...
 GOEXPERIMENT=cgocheck2 go test ./...
 go test -run='^$' -fuzz=FuzzPage -fuzztime=30s .

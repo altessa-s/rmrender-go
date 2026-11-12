@@ -43,6 +43,20 @@ rmr_linux_pdf(const rmr_plan* const* plans, size_t count, double scale,
     const rmr_limits* limits, rmr_cancel_fn cancel, void* cancel_context,
     rmr_buffer* out, rmr_error* error);
 
+/* rmr_linux_pdf and rmr_linux_pdf_sheets drawing as options say (see
+ * rmr_pdf_options in output.h; null selects the defaults, which the functions
+ * without options use). */
+[[nodiscard]] RMR_API rmr_status rmr_linux_pdf_with_options(
+    const rmr_plan* const* plans, size_t count, double scale,
+    const rmr_limits* limits, const rmr_pdf_options* options,
+    rmr_cancel_fn cancel, void* cancel_context, rmr_buffer* out,
+    rmr_error* error);
+[[nodiscard]] RMR_API rmr_status rmr_linux_pdf_sheets_with_options(
+    const rmr_plan* const* plans, const rmr_sheet* sheets, size_t count,
+    const rmr_limits* limits, const rmr_pdf_options* options,
+    rmr_cancel_fn cancel, void* cancel_context, rmr_buffer* out,
+    rmr_error* error);
+
 /* Stateless Pango sans-serif metrics, matching Linux TEXT drawing. */
 RMR_API rmr_text_provider rmr_linux_text_provider(void);
 

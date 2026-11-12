@@ -3,6 +3,7 @@
  * found in the LICENSE file. */
 
 #include "rmr_internal.h"
+#include "rmr_pdf_edit.h"
 
 /* Grows the bounding box [*x0,*y0]-[*x1,*y1] to also cover point p. */
 static void include(rmr_point p, double* x0, double* y0, double* x1,
@@ -350,11 +351,19 @@ const rmr_draw* rmr_plan_draw(const rmr_plan* p, size_t i) {
   return p && i < p->count ? &p->draws[i] : nullptr;
 }
 
+size_t rmr_plan_background(const rmr_plan* p) { return p ? p->background : 0; }
+
 rmr_status rmr_plan_execute(const rmr_plan* p, const rmr_backend* b,
                             rmr_cancel_fn cancel, void* context, rmr_error* e) {
-  if (!p || !b || b->abi_version != RMR_BACKEND_ABI ||
-      b->struct_size < sizeof *b || !b->begin || !b->draw || !b->end ||
-      !b->abort)
+  return rmr_plan_execute_range(p, 0, p ? p->count : 0, b, cancel, context, e);
+}
+
+rmr_status rmr_plan_execute_range(const rmr_plan* p, size_t first, size_t end,
+                                  const rmr_backend* b, rmr_cancel_fn cancel,
+                                  void* context, rmr_error* e) {
+  if (!p || !b || first > end || end > p->count ||
+      b->abi_version != RMR_BACKEND_ABI || b->struct_size < sizeof *b ||
+      !b->begin || !b->draw || !b->end || !b->abort)
     return rmr_fail(e, RMR_ERR_INVALID_ARGUMENT, 0,
                     "invalid backend ABI or callbacks");
   if ((p->caps & b->capabilities) != p->caps)
@@ -364,9 +373,9 @@ rmr_status rmr_plan_execute(const rmr_plan* p, const rmr_backend* b,
     return rmr_fail(e, RMR_ERR_CANCELLED, 0, nullptr);
 
   rmr_status s = b->begin(b->context, p->viewport);
-  size_t index = 0;
+  size_t index = first;
   if (s == RMR_OK)
-    for (; index < p->count; index++) {
+    for (; index < end; index++) {
       if (cancel && cancel(context)) {
         s = RMR_ERR_CANCELLED;
         break;
