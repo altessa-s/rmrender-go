@@ -16,13 +16,15 @@ import (
 	"runtime"
 	"runtime/cgo"
 	"strings"
+	"sync/atomic"
 	"unsafe"
 )
 
 // call is what one call into C hands its callbacks, through a cgo.Handle:
 // where fonts, templates and page images are read from, and where an export
-// writes its file. The callbacks run on the calling goroutine, one at a
-// time, so its fields need no lock.
+// writes its file. Caller code runs on a helper goroutine, one callback
+// at a time. Fields it writes are read only after the wait, so they need no
+// lock.
 type call struct {
 	fonts     fs.FS
 	templates *Templates
@@ -46,34 +48,50 @@ type call struct {
 	// can unwind through C and raised again once C has returned.
 	panicked   bool
 	panicValue any
+	// exited keeps Goexit until the same cleanup has run.
+	exited    bool
+	callbacks callbackRunner
 }
+
+// liveHandles counts calls whose callback state has not yet been released.
+var liveHandles atomic.Int64
 
 // fail records the first failure of a callback.
 func (c *call) fail(err error) {
-	if c.err == nil && !c.panicked {
+	if c.err == nil && !c.panicked && !c.exited {
 		c.err = err
 	}
 }
 
-// recovered keeps a panic of a callback, which then answers failure.
-func (c *call) recovered(status *C.rmr_status) {
-	if p := recover(); p != nil {
-		c.panicked = true
-		c.panicValue = p
-		*status = C.RMR_ERR_BACKEND
+// invoke keeps a callback's panic or exit until C has stopped and released
+// its memory. Only the caller's code runs on the helper goroutine.
+func (c *call) invoke(fn func()) bool {
+	if c.panicked || c.exited {
+		return false
 	}
+	returned, p := c.callbacks.run(fn)
+	c.panicked = p != nil
+	c.panicValue = p
+	c.exited = !returned && p == nil
+	return returned
 }
 
 // run calls C with a handle to c, deleting the handle and unpinning what was
-// lent afterwards, and raising any panic of a callback.
+// lent afterwards, and raising any panic or exit of a callback.
 func (c *call) run(f func(handle C.uintptr_t) C.rmr_status) C.rmr_status {
+	liveHandles.Add(1)
 	h := cgo.NewHandle(c)
 	status := f(C.uintptr_t(h))
 	h.Delete()
 	c.pinner.Unpin()
 	c.lent = nil
+	c.callbacks.stop()
+	liveHandles.Add(-1)
 	if c.panicked {
 		panic(c.panicValue)
+	}
+	if c.exited {
+		runtime.Goexit()
 	}
 	return status
 }
@@ -105,8 +123,16 @@ func (c *call) read(fsys fs.FS, name string) ([]byte, error) {
 	if fsys == nil || !fs.ValidPath(name) {
 		return nil, nil
 	}
-	data, err := fs.ReadFile(fsys, name)
-	if errors.Is(err, fs.ErrNotExist) {
+	var data []byte
+	var err error
+	missing := false
+	if !c.invoke(func() {
+		data, err = fs.ReadFile(fsys, name)
+		missing = errors.Is(err, fs.ErrNotExist)
+	}) {
+		return nil, nil
+	}
+	if missing {
 		return nil, nil
 	}
 	if err != nil {
@@ -131,8 +157,10 @@ func resourceName(p *C.char, length C.size_t) (string, bool) {
 //export rmrgoFont
 func rmrgoFont(handle C.uintptr_t, name *C.char, out *C.rmr_asset_view) (status C.rmr_status) {
 	c := cgo.Handle(handle).Value().(*call)
-	defer c.recovered(&status)
 	data, err := c.read(c.fonts, C.GoString(name)+".ttf")
+	if c.panicked || c.exited {
+		return C.RMR_ERR_BACKEND
+	}
 	if err != nil {
 		c.fail(err)
 		return C.RMR_ERR_BACKEND
@@ -151,7 +179,6 @@ func rmrgoFont(handle C.uintptr_t, name *C.char, out *C.rmr_asset_view) (status 
 //export rmrgoTemplate
 func rmrgoTemplate(handle C.uintptr_t, name *C.char, length C.size_t, out *C.rmr_asset_view) (status C.rmr_status) {
 	c := cgo.Handle(handle).Value().(*call)
-	defer c.recovered(&status)
 	*out = C.rmr_asset_view{}
 	n, ok := resourceName(name, length)
 	if !ok {
@@ -159,6 +186,9 @@ func rmrgoTemplate(handle C.uintptr_t, name *C.char, length C.size_t, out *C.rmr
 	}
 	for _, layer := range c.templates.layers() {
 		data, err := c.read(layer, n+".template")
+		if c.panicked || c.exited {
+			return C.RMR_ERR_BACKEND
+		}
 		if err != nil {
 			c.fail(err)
 			return C.RMR_ERR_BACKEND
@@ -184,14 +214,19 @@ type output struct {
 
 // write passes C's bytes p on to w, failing as w fails, or with
 // [io.ErrShortWrite] when w takes less than it is given without saying why.
-func (o *output) write(p []byte) error {
+// An abnormal return is kept by invoke and checked before answering C.
+func (o *output) write(p []byte, invoke func(func()) bool) error {
 	for len(p) > 0 {
 		n := min(len(p), outputPiece)
 		if len(o.buffer) < n {
 			o.buffer = make([]byte, n)
 		}
 		copy(o.buffer, p[:n])
-		written, err := o.w.Write(o.buffer[:n])
+		var written int
+		var err error
+		if !invoke(func() { written, err = o.w.Write(o.buffer[:n]) }) {
+			return nil
+		}
 		if err != nil {
 			return err
 		}
@@ -209,7 +244,6 @@ func (o *output) write(p []byte) error {
 //export rmrgoWrite
 func rmrgoWrite(handle C.uintptr_t, bytes *C.uint8_t, size C.size_t) (status C.rmr_status) {
 	c := cgo.Handle(handle).Value().(*call)
-	defer c.recovered(&status)
 	if c.out == nil {
 		return C.RMR_ERR_INVALID_ARGUMENT
 	}
@@ -218,8 +252,11 @@ func rmrgoWrite(handle C.uintptr_t, bytes *C.uint8_t, size C.size_t) (status C.r
 		c.fail(err)
 		return C.RMR_ERR_OUT_OF_MEMORY
 	}
-	if err := c.out.write(unsafe.Slice((*byte)(unsafe.Pointer(bytes)), n)); err != nil {
+	if err := c.out.write(unsafe.Slice((*byte)(unsafe.Pointer(bytes)), n), c.invoke); err != nil {
 		c.fail(err)
+		return C.RMR_ERR_BACKEND
+	}
+	if c.panicked || c.exited {
 		return C.RMR_ERR_BACKEND
 	}
 	return C.RMR_OK
@@ -243,17 +280,68 @@ func rmrgoUnreadable(handle C.uintptr_t, page C.size_t, _ C.rmr_status) {
 //export rmrgoImage
 func rmrgoImage(handle C.uintptr_t, name *C.char, length C.size_t, out *C.rmr_asset_view) (status C.rmr_status) {
 	c := cgo.Handle(handle).Value().(*call)
-	defer c.recovered(&status)
 	*out = C.rmr_asset_view{}
 	n, ok := resourceName(name, length)
 	if !ok {
 		return C.RMR_OK
 	}
 	data, err := c.read(c.images, n)
+	if c.panicked || c.exited {
+		return C.RMR_ERR_BACKEND
+	}
 	if err != nil {
 		c.fail(err)
 		return C.RMR_ERR_BACKEND
 	}
 	c.lend(data, out)
 	return C.RMR_OK
+}
+
+// callbackRunner reuses one goroutine for a call's reads and output pieces.
+// Waiting for each answer keeps caller code synchronous without allowing it
+// to unwind a C frame. An abnormal answer ends the worker as well.
+type callbackRunner struct {
+	jobs    chan func()
+	answers chan callbackResult
+	stopped chan struct{}
+}
+
+type callbackResult struct {
+	returned   bool
+	panicValue any
+}
+
+func (r *callbackRunner) run(fn func()) (bool, any) {
+	if r.jobs == nil {
+		r.jobs = make(chan func())
+		r.answers = make(chan callbackResult)
+		r.stopped = make(chan struct{})
+		go func() {
+			defer close(r.stopped)
+			finished := false
+			defer func() {
+				if !finished {
+					r.answers <- callbackResult{panicValue: recover()}
+				}
+			}()
+			for fn := range r.jobs {
+				fn()
+				// Drop the closure before answering so borrowed data is not kept
+				// while the worker waits for its next piece.
+				fn = nil
+				r.answers <- callbackResult{returned: true}
+			}
+			finished = true
+		}()
+	}
+	r.jobs <- fn
+	answer := <-r.answers
+	return answer.returned, answer.panicValue
+}
+
+func (r *callbackRunner) stop() {
+	if r.jobs != nil {
+		close(r.jobs)
+		<-r.stopped
+	}
 }
