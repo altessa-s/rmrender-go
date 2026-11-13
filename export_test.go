@@ -14,7 +14,14 @@ var CVersion = cVersion
 var PDFPageCount = pdfPageCount
 
 // WriteOutput passes p to w as an export's file is passed, in pieces.
-func WriteOutput(w io.Writer, p []byte) error { return (&output{w: w}).write(p) }
+func WriteOutput(w io.Writer, p []byte) error {
+	c := &call{}
+	defer c.callbacks.stop()
+	return (&output{w: w}).write(p, c.invoke)
+}
 
 // OutputPiece is the most a writer is handed at once.
 const OutputPiece = outputPiece
+
+// LiveHandles answers how many calls still hold a C callback handle.
+func LiveHandles() int64 { return liveHandles.Load() }

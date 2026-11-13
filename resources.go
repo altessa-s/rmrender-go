@@ -34,6 +34,10 @@ type Fonts struct {
 //
 // Every font is read and handed to the backend before NewFonts returns;
 // fsys is not kept.
+//
+// Resource reads run on a separate goroutine, synchronously with this call.
+// A panic or runtime.Goexit stops C; after its memory and callback state are
+// released, the calling goroutine panics or exits, running its defers.
 func NewFonts(fsys fs.FS) (*Fonts, error) {
 	if fsys == nil {
 		return nil, errInvalid("no font files")
@@ -90,7 +94,10 @@ type Templates struct {
 }
 
 // NewTemplates answers templates looked up in layers, in order, before the
-// bundled ones. Each layer holds name.template files at its root.
+// bundled ones. Each layer holds name.template files at its root. Reads run
+// on a separate goroutine, synchronously with the render or export using
+// them; a panic or runtime.Goexit stops C and is raised again on the calling
+// goroutine after cleanup.
 func NewTemplates(layers ...fs.FS) *Templates {
 	t := &Templates{}
 	for _, l := range layers {

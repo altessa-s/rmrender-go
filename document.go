@@ -391,8 +391,11 @@ func (d *Document) PDF(ctx context.Context, mode PDFMode, o *Options) ([]byte, R
 // w's failure stops the export with StatusBackend, the message "PDF output
 // write failed" and w's error as the cause; w is not called again. On any
 // failure, cancellation included, w has received part of a file, which the
-// caller discards. w is called on the calling goroutine, during the call
-// only, and must not call back into this package.
+// caller discards. w runs on a separate goroutine, synchronously with this
+// call only, and must not call back into this package. A panic or
+// runtime.Goexit in w stops C and is raised again on the calling goroutine
+// after the handle is deleted, lent bytes dropped and their pins released.
+// The worker does not inherit goroutine-bound state such as LockOSThread.
 func (d *Document) WritePDF(ctx context.Context, w io.Writer, mode PDFMode, o *Options) (Report, error) {
 	if w == nil {
 		return Report{}, errInvalid("nil writer")

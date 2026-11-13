@@ -284,11 +284,13 @@ whether one page parses, with the error a strict drawing of it fails with. A pag
 bound fails the call whatever the option says.
 
 `WritePDF` writes the same file to an `io.Writer` as it is produced instead of answering it whole, so a long document's PDF need not fit in
-memory twice, or at all: the bytes are those of `PDF`, handed to the writer in order in pieces of at most 4 MiB, on the calling goroutine. A
+memory twice, or at all: the bytes are those of `PDF`, handed to the writer in order in pieces of at most 4 MiB, on a separate goroutine synchronously with the export. A
 fresh export writes each page as it is finished; a preserving one writes the imported PDF and then the update, and a recomposed one its
 final rewrite, as they go. `Limits.MaximumPDFBytes` still bounds the file, 256 MiB by default: raise it for larger ones. The writer's
 failure stops the export with `StatusBackend` and the writer's error as its cause; on any failure the writer has received part of a file,
-so write to a temporary file and rename it once `WritePDF` succeeds.
+so write to a temporary file and rename it once `WritePDF` succeeds. A panic or `runtime.Goexit` in the writer stops C and is raised again
+on the calling goroutine after cleanup, running its deferred functions. The worker does not inherit goroutine-bound state such as
+`runtime.LockOSThread`.
 
 ```go
 data, err := os.ReadFile("testdata/pages/Notes.rmdoc")
@@ -471,7 +473,9 @@ for the length of every call that uses it, and `Close` waits for those in flight
 
 **Resources through `fs.FS`, never through paths.** Fonts, templates and images reach C through callbacks: a `runtime/cgo.Handle` carried as an
 integer, and exported Go functions that read the file and lend its bytes to C, pinned with `runtime.Pinner` until the call returns. A read
-failure becomes the error's cause; a panic is recovered before it can unwind through C and raised again once C has returned. The fonts are
+failure becomes the error's cause. Reads run on a separate goroutine, synchronously with the call. A panic or `runtime.Goexit` stops C;
+after C returns, the handle is deleted, lent bytes dropped and pins released, then the calling goroutine panics or exits, running its
+deferred functions. One worker is reused for the reads and writer pieces of each call. The fonts are
 loaded from memory, so no temporary files are written, except by the Cairo backend on macOS, where Fontconfig needs files, and on Windows,
 where it keeps them in the font cache the requirements describe.
 
