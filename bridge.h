@@ -50,7 +50,8 @@ void rmrgo_fonts_free(rmrgo_fonts *fonts);
 // raster_dpi is the resolution SVG output rasterizes imported PDF pages at,
 // in pixels per inch of sheet, zero for the library's default; pdf is how PDF
 // output draws, and what a document's calls do with an unreadable page,
-// which they tell the Go callback of handle of.
+// which they tell the Go callback of handle of. progress enables document
+// progress reports through that handle; false leaves the C callback null.
 typedef struct {
     const rmrgo_fonts *fonts;
     uintptr_t handle;
@@ -59,6 +60,7 @@ typedef struct {
     double margin;
     double raster_dpi;
     rmr_pdf_options pdf;
+    bool progress;
     rmr_limits limits;
     void *cancel;
 } rmrgo_request;

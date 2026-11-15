@@ -225,6 +225,19 @@ type Options struct {
 	PDFGrain PDFGrain
 	// MaximumPages caps the pages of a document PDF; zero means all.
 	MaximumPages int
+	// Progress reports whole-document PDF exports (all modes, buffer or
+	// writer) and SVG exports. Runs synchronously on the callback worker:
+	// first (0, total), then (1, total) through (total, total), in order.
+	// Total is the output page count after MaximumPages. A completed page
+	// is settled: its output is written and its work can no longer fail.
+	// Reports may lag drawing by the pipeline window; failed, cancelled or
+	// still-pending pages are not reported. Final PDF assembly may still
+	// fail after all pages settle. Validation may fail before any report.
+	// Nil installs no callback. Progress must be quick and must not call
+	// back into rmrender: the Cairo backend may hold the PDFium lock.
+	// A panic or runtime.Goexit stops C and is raised again on the calling
+	// goroutine after cleanup, like the other callbacks.
+	Progress func(completed, total int)
 	// Unreadable is what the calls of a [Document] do with a page whose
 	// .rm file does not parse; the zero value, UnreadableStrict, fails.
 	Unreadable Unreadable
@@ -262,6 +275,7 @@ func (o *Options) request() (C.rmrgo_request, error) {
 	r.pdf = C.rmr_pdf_options_default()
 	r.pdf.grain = C.rmr_pdf_grain(o.PDFGrain)
 	r.pdf.unreadable = C.rmr_unreadable_policy(o.Unreadable)
+	r.progress = C.bool(o.Progress != nil)
 	r.limits = limits
 	return r, nil
 }

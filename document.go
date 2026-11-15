@@ -328,6 +328,8 @@ func (d *Document) SVG(ctx context.Context, o *Options) ([][]byte, Report, error
 	told := &call{}
 	err = d.use(ctx, func(c *C.rmrgo_document) error {
 		var out C.rmr_svg_pages
+		// The last progress callback can exit after C has produced its result.
+		defer C.rmr_svg_pages_free(&out)
 		err := renderCall(ctx, o, told, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
 			return C.rmrgo_document_svg(r, c, C.size_t(maximum), &out, &cr, cerr)
 		})
@@ -393,6 +395,8 @@ func (d *Document) PDF(ctx context.Context, mode PDFMode, o *Options) ([]byte, R
 	told := &call{}
 	err = d.use(ctx, func(c *C.rmrgo_document) error {
 		var out C.rmr_buffer
+		// The last progress callback can exit after C has produced its result.
+		defer C.rmr_buffer_free(&out)
 		err := renderCall(ctx, o, told, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
 			return C.rmrgo_document_pdf(r, c, cmode, C.size_t(maximum), &out, &cr, cerr)
 		})
