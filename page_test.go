@@ -11,6 +11,8 @@ import (
 	"image/color"
 	"io/fs"
 	"math"
+	"os"
+	"strings"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -20,8 +22,18 @@ import (
 )
 
 func TestVersionIsTheCLibrarys(t *testing.T) {
-	if got := rmrender.CVersion(); got != rmrender.Version {
-		t.Fatalf("C library is %s, Version says %s", got, rmrender.Version)
+	data, err := os.ReadFile("internal/clib/VERSION")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := strings.Fields(strings.SplitN(string(data), "\n", 2)[0])
+	if len(fields) != 3 || fields[0] != "rmrender-lib" || fields[1] != "v"+rmrender.Version {
+		t.Fatalf("vendored checkout %q, Version says %s", data, rmrender.Version)
+	}
+	// An untagged checkout keeps its last release's C version macros.
+	base, _, _ := strings.Cut(rmrender.Version, "-")
+	if got := rmrender.CVersion(); got != base {
+		t.Fatalf("C library is %s, checkout version says %s", got, rmrender.Version)
 	}
 }
 

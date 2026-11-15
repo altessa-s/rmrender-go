@@ -76,7 +76,7 @@ func TestResourceExitCleansUp(t *testing.T) {
 func TestCallbacksStopOnSecondExit(t *testing.T) {
 	d := openDocument(t, imported(t, largePDF(9<<20), loadPage(t, strokesPage)))
 	options := withFonts(t, rmrender.Options{})
-	for _, which := range []string{"font", "writer"} {
+	for _, which := range []string{"font", "writer", "progress"} {
 		t.Run(which, func(t *testing.T) {
 			before := rmrender.LiveHandles()
 			calls := 0
@@ -89,10 +89,15 @@ func TestCallbacksStopOnSecondExit(t *testing.T) {
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
-				if which == "font" {
+				switch which {
+				case "font":
 					_, _ = rmrender.NewFonts(callbackFS{next})
-				} else {
+				case "writer":
 					_, _ = d.WritePDF(context.Background(), callbackWriter{next}, rmrender.PDFPreserving, options)
+				case "progress":
+					o := *options
+					o.Progress = func(int, int) { next() }
+					_, _, _ = d.PDF(context.Background(), rmrender.PDFPreserving, &o)
 				}
 				t.Error("call returned after exit")
 			}()
@@ -126,10 +131,13 @@ func TestCallbackAbnormalConcurrency(t *testing.T) {
 				}
 				runtime.Goexit()
 			}
-			if i%2 == 0 {
+			switch i % 3 {
+			case 0:
 				_, _ = rmrender.NewFonts(callbackFS{next})
-			} else {
+			case 1:
 				_, _ = d.WritePDF(context.Background(), callbackWriter{next}, rmrender.PDFFresh, nil)
+			case 2:
+				_, _, _ = d.PDF(context.Background(), rmrender.PDFFresh, &rmrender.Options{Progress: func(int, int) { next() }})
 			}
 			t.Error("abnormal callback returned")
 		}()
@@ -147,10 +155,13 @@ func TestRepeatedCallbackExit(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			if i%2 == 0 {
+			switch i % 3 {
+			case 0:
 				_, _ = rmrender.NewFonts(callbackFS{runtime.Goexit})
-			} else {
+			case 1:
 				_, _ = d.WritePDF(context.Background(), exitingWriter{}, rmrender.PDFFresh, nil)
+			case 2:
+				_, _, _ = d.PDF(context.Background(), rmrender.PDFFresh, &rmrender.Options{Progress: func(int, int) { runtime.Goexit() }})
 			}
 		}()
 		<-done
@@ -159,6 +170,50 @@ func TestRepeatedCallbackExit(t *testing.T) {
 		}
 	}
 	runtime.GC()
+}
+
+func TestDocumentProgressAbnormal(t *testing.T) {
+	d := progressDocuments(t)[1]
+	for _, export := range documentExports(d) {
+		for _, at := range []int{0, 1, d.Len()} {
+			for _, panics := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/at%d/panic%t", export.name, at, panics), func(t *testing.T) {
+					before := rmrender.LiveHandles()
+					calls := 0
+					done := make(chan struct{})
+					o := withFonts(t, rmrender.Options{PDFRasterDPI: 36})
+					o.Progress = func(completed, _ int) {
+						calls++
+						if completed == at {
+							if panics {
+								panic("progress stop")
+							}
+							runtime.Goexit()
+						}
+					}
+					go func() {
+						defer close(done)
+						defer func() {
+							p := recover()
+							if panics && p != "progress stop" || !panics && p != nil {
+								t.Errorf("panic = %v, want panic = %t", p, panics)
+							}
+						}()
+						_ = export.run(context.Background(), o)
+						t.Error("abnormal progress callback returned")
+					}()
+					<-done
+					if calls != at+1 || rmrender.LiveHandles() != before {
+						t.Fatalf("calls = %d, handles = %d, want %d and %d", calls, rmrender.LiveHandles(), at+1, before)
+					}
+					o.Progress = nil
+					if err := export.run(context.Background(), o); err != nil {
+						t.Fatal(err)
+					}
+				})
+			}
+		}
+	}
 }
 
 // A failed subtest also fails its parent, so exercise Fatal in a child test
