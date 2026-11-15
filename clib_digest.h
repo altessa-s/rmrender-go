@@ -11,9 +11,9 @@
 //   rmdoc-lib v1.1.0 aea7ed1670e2aa34ee0281d00eedc372b80b3f7c
 //   rmmarks-lib v1.1.0 565f2dfe0d2e31a218c4a874bdba96417d1ddc83
 //
-// Each clib_*.c includes this file, so a change to the vendored sources
-// changes a file in the package directory, which is what Go's build cache
-// tracks.
+// TestVendoredDigest recomputes the digest from the committed tree, so that a
+// hand edit or a partial update of the vendored sources fails a test instead
+// of shipping unnoticed.
 
 #ifndef RMRENDER_GO_CLIB_DIGEST_H
 #define RMRENDER_GO_CLIB_DIGEST_H

@@ -14,7 +14,6 @@ import (
 	"errors"
 	"image"
 	"io"
-	"sync"
 	"unsafe"
 )
 
@@ -66,9 +65,12 @@ type Report struct {
 // templates, attachments and imported PDF.
 //
 // A Document holds its archive in C memory until it is closed; it has no
-// finalizer. Its calls take turns.
+// finalizer. Its calls take turns: a call made while another runs waits for
+// it, until its context ends; a call that takes no context waits as long as
+// it takes.
 type Document struct {
-	mu    sync.Mutex
+	owner owner
+	// c is read only by a call that has borrowed it from owner.
 	c     *C.rmrgo_document
 	id    string
 	pages []PageInfo
@@ -104,13 +106,19 @@ func OpenDocument(data []byte, o *DocumentOptions) (*Document, error) {
 		return nil, cError(status, &cerr)
 	}
 	d := &Document{c: out, id: C.GoString(C.rmrgo_document_id(out))}
+	liveDocuments.Add(1)
+	d.owner.hold(func() {
+		C.rmrgo_document_free(d.c)
+		d.c = nil
+		liveDocuments.Add(-1)
+	})
 	if d.count, err = goLength(C.rmrgo_document_count(out), "page count"); err != nil {
-		C.rmrgo_document_free(out)
+		d.owner.close()
 		return nil, err
 	}
 	listed, err := goLength(C.rmrgo_document_listed(out), "page count")
 	if err != nil {
-		C.rmrgo_document_free(out)
+		d.owner.close()
 		return nil, err
 	}
 	sources := uint64(C.rmrgo_document_source_pages(out))
@@ -145,24 +153,26 @@ func (d *Document) Pages() []PageInfo {
 	return append([]PageInfo(nil), d.pages...)
 }
 
-// Close releases the document's C memory, after any call in flight. A closed
-// Document makes a call fail with StatusInvalidArgument; closing it again
-// does nothing.
+// Close releases the document's C memory. It returns at once, even while a
+// call is in flight, and from a callback of that call too: the memory is
+// then released when that call finishes, after it has freed its results and
+// released its callback state, so it may outlive Close. A closed Document
+// makes a call fail with StatusInvalidArgument, a call that was waiting for
+// its turn too; closing it again does nothing.
 func (d *Document) Close() error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	C.rmrgo_document_free(d.c)
-	d.c = nil
+	d.owner.close()
 	return nil
 }
 
-// use runs f with the document locked and open.
-func (d *Document) use(f func(c *C.rmrgo_document) error) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.c == nil {
-		return errInvalid("document is closed")
+// use runs f with the document borrowed, after the calls before it, unless
+// the document is closed or ctx ends first. f takes the call's results from
+// C before the document is given back, so that a Close made meanwhile
+// releases the document only after them.
+func (d *Document) use(ctx context.Context, f func(c *C.rmrgo_document) error) error {
+	if err := d.owner.acquire(ctx, "document is closed"); err != nil {
+		return err
 	}
+	defer d.owner.release()
 	return f(d.c)
 }
 
@@ -183,7 +193,7 @@ func (d *Document) CheckPage(i int) error {
 	if err != nil {
 		return err
 	}
-	return d.use(func(c *C.rmrgo_document) error {
+	return d.use(context.Background(), func(c *C.rmrgo_document) error {
 		if i >= len(d.pages) {
 			return nil
 		}
@@ -231,17 +241,23 @@ func (d *Document) PageImage(ctx context.Context, i int, scale float64, o *Optio
 		return nil, err
 	}
 	background := cColor(o.background())
-	var out C.rmr_bitmap
+	var img *image.RGBA
 	told := &call{}
-	err = d.use(func(c *C.rmrgo_document) error {
-		return renderCall(ctx, o, told, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
+	err = d.use(ctx, func(c *C.rmrgo_document) error {
+		var out C.rmr_bitmap
+		err := renderCall(ctx, o, told, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
 			return C.rmrgo_document_bitmap(r, c, index, C.double(scale), background, &out, cerr)
 		})
+		if err != nil {
+			return d.explain(err, o, told)
+		}
+		img, err = takeBitmap(&out)
+		return err
 	})
 	if err != nil {
-		return nil, d.explain(err, o, told)
+		return nil, err
 	}
-	return takeBitmap(&out)
+	return img, nil
 }
 
 // PagePNG is [Document.PageImage], encoded as PNG.
@@ -276,17 +292,23 @@ func (d *Document) PageSVG(ctx context.Context, i int, o *Options) ([]byte, erro
 	if err != nil {
 		return nil, err
 	}
-	var out C.rmr_buffer
+	var svg []byte
 	told := &call{}
-	err = d.use(func(c *C.rmrgo_document) error {
-		return renderCall(ctx, o, told, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
+	err = d.use(ctx, func(c *C.rmrgo_document) error {
+		var out C.rmr_buffer
+		err := renderCall(ctx, o, told, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
 			return C.rmrgo_document_page_svg(r, c, index, &out, cerr)
 		})
+		if err != nil {
+			return d.explain(err, o, told)
+		}
+		svg, err = takeBuffer(&out)
+		return err
 	})
 	if err != nil {
-		return nil, d.explain(err, o, told)
+		return nil, err
 	}
-	return takeBuffer(&out)
+	return svg, nil
 }
 
 // SVG draws the whole document as SVG, one standalone document per page,
@@ -301,18 +323,20 @@ func (d *Document) SVG(ctx context.Context, o *Options) ([][]byte, Report, error
 	if err != nil {
 		return nil, Report{}, err
 	}
-	var out C.rmr_svg_pages
+	var pages [][]byte
 	var cr C.rmr_document_report
 	told := &call{}
-	err = d.use(func(c *C.rmrgo_document) error {
-		return renderCall(ctx, o, told, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
+	err = d.use(ctx, func(c *C.rmrgo_document) error {
+		var out C.rmr_svg_pages
+		err := renderCall(ctx, o, told, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
 			return C.rmrgo_document_svg(r, c, C.size_t(maximum), &out, &cr, cerr)
 		})
+		if err != nil {
+			return d.explain(err, o, told)
+		}
+		pages, err = takeSVGPages(&out)
+		return err
 	})
-	if err != nil {
-		return nil, Report{}, d.explain(err, o, told)
-	}
-	pages, err := takeSVGPages(&out)
 	if err != nil {
 		return nil, Report{}, err
 	}
@@ -330,18 +354,24 @@ func (d *Document) PageMarks(i int, o *Options) (*Marks, error) {
 	if err != nil {
 		return nil, err
 	}
-	var out *C.rmr_page_marks
+	var marks *Marks
 	told := &call{}
-	err = d.use(func(c *C.rmrgo_document) error {
-		return renderCall(context.Background(), o, told, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
+	err = d.use(context.Background(), func(c *C.rmrgo_document) error {
+		var out *C.rmr_page_marks
+		err := renderCall(context.Background(), o, told, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
 			return C.rmrgo_document_marks(r, c, index, &out, cerr)
 		})
+		if err != nil {
+			return d.explain(err, o, told)
+		}
+		defer C.rmr_page_marks_free(out)
+		marks, err = marksOf(C.rmr_page_marks_view(out))
+		return err
 	})
 	if err != nil {
-		return nil, d.explain(err, o, told)
+		return nil, err
 	}
-	defer C.rmr_page_marks_free(out)
-	return marksOf(C.rmr_page_marks_view(out))
+	return marks, nil
 }
 
 // PDF draws the whole document as one PDF, in the given mode: notebook pages
@@ -358,18 +388,20 @@ func (d *Document) PDF(ctx context.Context, mode PDFMode, o *Options) ([]byte, R
 	if err != nil {
 		return nil, report, err
 	}
-	var out C.rmr_buffer
+	var pdf []byte
 	var cr C.rmr_document_report
 	told := &call{}
-	err = d.use(func(c *C.rmrgo_document) error {
-		return renderCall(ctx, o, told, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
+	err = d.use(ctx, func(c *C.rmrgo_document) error {
+		var out C.rmr_buffer
+		err := renderCall(ctx, o, told, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
 			return C.rmrgo_document_pdf(r, c, cmode, C.size_t(maximum), &out, &cr, cerr)
 		})
+		if err != nil {
+			return d.explain(err, o, told)
+		}
+		pdf, err = takeBuffer(&out)
+		return err
 	})
-	if err != nil {
-		return nil, report, d.explain(err, o, told)
-	}
-	pdf, err := takeBuffer(&out)
 	if err != nil {
 		return nil, report, err
 	}
@@ -380,22 +412,36 @@ func (d *Document) PDF(ctx context.Context, mode PDFMode, o *Options) ([]byte, R
 }
 
 // WritePDF is [Document.PDF] writing the file to w as it is produced instead
-// of answering it whole: the same bytes, in order, handed to w in pieces of
-// at most 4 MiB, so that the file need not fit in memory. A fresh export
-// writes each page as it is finished; a preserving one writes the imported
-// PDF and then its update, and a recomposed one its final rewrite, as they
-// go, each holding what the [Document.PDF] of its mode holds before that.
-// o.Limits.MaximumPDFBytes still bounds the file: raise it for files past
-// its default.
+// of answering it whole: the same bytes, in order, so that the file need not
+// fit in memory. The export gathers what it has finished and hands it on
+// about 4 MiB at a time, and w is never handed more than 4 MiB at once: a
+// file smaller than that reaches w in one piece, when the export ends, and a
+// larger one in pieces of about 4 MiB as its pages are drawn, a 30 MB file
+// in eight. A preserving export writes the imported PDF and then its update,
+// and a recomposed one its final rewrite, each holding what the
+// [Document.PDF] of its mode holds before that. o.Limits.MaximumPDFBytes
+// still bounds the file: raise it for files past its default.
+//
+// ctx is checked while pages are drawn. Once the last of them is, the export
+// goes on writing whatever ctx does: a context that ends while w receives
+// the end of the file still leaves w with the whole file, and WritePDF
+// answers no error.
 //
 // w's failure stops the export with StatusBackend, the message "PDF output
 // write failed" and w's error as the cause; w is not called again. On any
-// failure, cancellation included, w has received part of a file, which the
-// caller discards. w runs on a separate goroutine, synchronously with this
-// call only, and must not call back into this package. A panic or
-// runtime.Goexit in w stops C and is raised again on the calling goroutine
-// after the handle is deleted, lent bytes dropped and their pins released.
-// The worker does not inherit goroutine-bound state such as LockOSThread.
+// other failure, cancellation included, w has received part of a file, which
+// the caller discards. w runs on a separate goroutine, synchronously with
+// this call only. A panic or runtime.Goexit in w stops C and is raised again
+// on the calling goroutine after the handle is deleted, lent bytes dropped
+// and their pins released. The worker does not inherit goroutine-bound state
+// such as LockOSThread.
+//
+// w may close this Document, the Fonts of this call, or any other, and may
+// draw another document, or a lone page, without the Fonts of this call. It
+// must not draw this document, nor with this call's Fonts: such a call waits
+// for this one, which waits for w, so it ends only when its own context does,
+// with that context's error, and one that takes no context, such as
+// [Document.CheckPage], only when what it waits for is closed.
 func (d *Document) WritePDF(ctx context.Context, w io.Writer, mode PDFMode, o *Options) (Report, error) {
 	if w == nil {
 		return Report{}, errInvalid("nil writer")
@@ -410,13 +456,14 @@ func (d *Document) WritePDF(ctx context.Context, w io.Writer, mode PDFMode, o *O
 	}
 	var cr C.rmr_document_report
 	c := &call{out: &output{w: w}}
-	err = d.use(func(doc *C.rmrgo_document) error {
-		return renderCall(ctx, o, c, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
+	err = d.use(ctx, func(doc *C.rmrgo_document) error {
+		err := renderCall(ctx, o, c, func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status {
 			return C.rmrgo_document_pdf_write(r, doc, cmode, C.size_t(maximum), &cr, cerr)
 		})
+		return d.explain(err, o, c)
 	})
 	if err != nil {
-		return Report{}, d.explain(err, o, c)
+		return Report{}, err
 	}
 	return reportOf(&cr, c)
 }

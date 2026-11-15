@@ -203,7 +203,14 @@ type Options struct {
 	Template string
 	// Images resolve the images a lone .rm page places, by file name; nil
 	// leaves them blank in their place. A document's pages take theirs from
-	// the archive.
+	// the archive. Reads run on a separate goroutine, synchronously with the
+	// call; a panic or runtime.Goexit stops C and is raised again on the
+	// calling goroutine after cleanup. A read may close Fonts, this call's
+	// included, and Documents, and may draw without this call's Fonts. It
+	// must not draw with them: such a call waits for this one, which waits
+	// for the read, so it ends only when its own context does, with that
+	// context's error, and one that takes no context only when the Fonts
+	// are closed.
 	Images fs.FS
 	// Background fills a bitmap before drawing; nil leaves it transparent,
 	// or white for a JPEG, which has no transparency.
@@ -226,7 +233,7 @@ type Options struct {
 	Limits *Limits
 }
 
-// request is the C side of opts, for a call that holds the fonts' lock.
+// request is the C side of opts, for a call that has borrowed the fonts.
 func (o *Options) request() (C.rmrgo_request, error) {
 	var r C.rmrgo_request
 	if o == nil {

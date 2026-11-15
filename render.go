@@ -57,9 +57,9 @@ func watch(ctx context.Context) (unsafe.Pointer, func()) {
 	}
 }
 
-// render makes one call into C for o: with o's fonts locked and in the
+// render makes one call into C for o: with o's fonts borrowed and in the
 // request, the callbacks reading o's templates and images, and ctx able to
-// cancel the drawing.
+// end the wait for the fonts' turn and to cancel the drawing.
 func render(ctx context.Context, o *Options, f func(r *C.rmrgo_request, cerr *C.rmr_error) C.rmr_status) error {
 	return renderCall(ctx, o, &call{}, f)
 }
@@ -81,11 +81,13 @@ func renderCall(ctx context.Context, o *Options, c *call, f func(r *C.rmrgo_requ
 		c.templates = o.Templates
 		c.images = o.Images
 		if o.Fonts != nil {
-			o.Fonts.mu.Lock()
-			defer o.Fonts.mu.Unlock()
-			if o.Fonts.c == nil {
-				return errInvalid("fonts are closed")
+			// Given back after c.run has released the callback state, so a
+			// Close made meanwhile, from a callback too, frees the fonts only
+			// once C has done with them.
+			if err := o.Fonts.owner.acquire(ctx, "fonts are closed"); err != nil {
+				return err
 			}
+			defer o.Fonts.owner.release()
 			r.fonts = o.Fonts.c
 		}
 	}
