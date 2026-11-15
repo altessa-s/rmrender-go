@@ -59,6 +59,11 @@ typedef enum rmr_unreadable_policy : uint32_t {
 typedef void (*rmr_unreadable_fn)(void* context, size_t page,
                                   rmr_status status);
 
+/* Document page progress, synchronous on the calling thread. The context
+ * is borrowed for the export call. On Linux it can run with the PDFium lock
+ * held: it must be quick and must not call back into rmrender. */
+typedef void (*rmr_progress_fn)(void* context, size_t completed, size_t total);
+
 /* PDF drawing options for the *_with_options entry points. Start from
  * rmr_pdf_options_default(), which fills abi_version and struct_size, and
  * change the fields needed. A null options pointer selects the defaults. A
@@ -87,10 +92,27 @@ typedef struct {
   rmr_unreadable_policy unreadable;
   rmr_unreadable_fn on_unreadable;
   void* unreadable_context;
+  /* Document exports only (all PDF modes, buffer or output, and SVG): called
+   * with (0, total) before any page is drawn, then once after each completed
+   * page, with completed increasing through total. Completed means settled:
+   * its page output is written and that page's work cannot fail any more.
+   * Reports may lag drawing by the pipeline window. No completion is reported
+   * for a failed or cancelled page, or for work still pending when export
+   * fails or is cancelled. Final PDF assembly can still fail after all pages
+   * settle; progress does not promise a successful export.
+   * total is the selected output page count after maximum_pages: live/recovered
+   * archive pages, or source PDF pages when none are listed, or one blank page
+   * for an empty notebook. Refused/hidden source references, skipped blocks,
+   * missing .rm files and BLANK/PLACEHOLDER pages do not remove output pages.
+   * STRICT or unsupported preserving/recomposed pages fail, without reducing
+   * total. Validation/preflight failures may occur before drawing begins.
+   * Read only when struct_size covers both fields; null means no calls. */
+  rmr_progress_fn progress;
+  void* progress_context; /* Borrowed; default null. */
 } rmr_pdf_options;
 
 /* {RMR_PDF_OPTIONS_ABI, sizeof(rmr_pdf_options), RMR_PDF_GRAIN_MASK, 0,
- * RMR_UNREADABLE_STRICT, nullptr, nullptr}. */
+ * RMR_UNREADABLE_STRICT, nullptr, nullptr, nullptr, nullptr}. */
 RMR_API rmr_pdf_options rmr_pdf_options_default(void);
 
 /* Where the *_to_output entry points write a PDF: write receives the file's

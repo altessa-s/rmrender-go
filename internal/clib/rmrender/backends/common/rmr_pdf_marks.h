@@ -17,7 +17,28 @@ typedef struct {
                         rmr_error* error);
   void (*release)(void* context, size_t page);
   void* context;
+  /* Document progress only; plan release also happens on drawing failure. */
+  rmr_progress_fn progress;
+  void* progress_context;
 } rmr_pdf_marks;
+
+/* Report a successfully completed page, after its pending output is settled.
+ * Never used when draining earlier pages during failure cleanup. */
+static inline void rmr_pdf_marks_progress(const rmr_pdf_marks* marks,
+                                          size_t completed, size_t total) {
+  if (marks && marks->progress)
+    marks->progress(marks->progress_context, completed, total);
+}
+
+/* Report the settled prefix, including pages with no writer batches. */
+static inline void rmr_pdf_marks_progress_until(const rmr_pdf_marks* marks,
+                                                size_t* reported,
+                                                size_t watermark,
+                                                size_t total) {
+  if (marks && marks->progress)
+    while (*reported < watermark)
+      rmr_pdf_marks_progress(marks, ++*reported, total);
+}
 
 /* Page i's marks: pages[i].marks, or acquired from marks when given. */
 static inline rmr_status rmr_pdf_marks_acquire(const rmr_pdf_marks* marks,

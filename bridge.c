@@ -448,6 +448,10 @@ static void unreadable_page(void *context, size_t page, rmr_status status) {
     rmrgoUnreadable((uintptr_t)context, page, status);
 }
 
+static void progress(void *context, size_t completed, size_t total) {
+    rmrgoProgress((uintptr_t)context, completed, total);
+}
+
 // The failure of an unreadable page under RMR_UNREADABLE_STRICT, worded and
 // indexed as the document export words and indexes it.
 static rmr_status unreadable_failure(rmr_error *e, rmr_status s, size_t index,
@@ -487,6 +491,10 @@ static rmr_pdf_options told(const rmrgo_request *r) {
     rmr_pdf_options options = r->pdf;
     options.on_unreadable = unreadable_page;
     options.unreadable_context = (void *)r->handle;
+    if (r->progress) {
+        options.progress = progress;
+        options.progress_context = (void *)r->handle;
+    }
     return options;
 }
 
