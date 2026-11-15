@@ -11,6 +11,7 @@
 
 #include "../../src/rmr_pdf_edit.h"
 #include "../common/rmr_pdf_options.h"
+#include "../common/rmr_pdf_output.h"
 #include "rmr_apple_internal.h"
 #include "rmr_pdf_platform.h"
 #include "rmr_pdf_writer.h"
@@ -451,15 +452,20 @@ static rmr_status links(CGContextRef cg, const rmr_apple_pdf_source* s,
   return RMR_OK;
 }
 
+/* Outline entries kept from a source PDF and how deep they may nest; a file
+ * past either is refused with RMR_ERR_LIMIT, as the Cairo backend refuses
+ * it. */
+enum { OUTLINE_ENTRIES = 65536, OUTLINE_DEPTH = 128 };
+
 /* Rebuild one level of the PDF outline tree into output, remapping each
  * item's page destination or splicing its children up when the destination
- * does not survive. */
+ * does not survive; *entries counts the items read. */
 static rmr_status outline_children(const rmr_apple_pdf_source* s,
                                    CFArrayRef input, CFMutableArrayRef output,
                                    const rmr_pdf_page* pages, size_t count,
                                    size_t* work, size_t maximum,
-                                   unsigned depth) {
-  if (depth > 128) return RMR_ERR_LIMIT;
+                                   size_t* entries, unsigned depth) {
+  if (depth > OUTLINE_DEPTH) return RMR_ERR_LIMIT;
 
   if (!input || CFGetTypeID(input) != CFArrayGetTypeID()) return RMR_OK;
 
@@ -470,14 +476,15 @@ static rmr_status outline_children(const rmr_apple_pdf_source* s,
 
     CFDictionaryRef old = CFArrayGetValueAtIndex(input, i);
     if (CFGetTypeID(old) != CFDictionaryGetTypeID()) continue;
+    if (++*entries > OUTLINE_ENTRIES) return RMR_ERR_LIMIT;
 
     CFMutableArrayRef children =
         CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
     if (!children) return RMR_ERR_OUT_OF_MEMORY;
 
-    rmr_status status =
-        outline_children(s, CFDictionaryGetValue(old, kCGPDFOutlineChildren),
-                         children, pages, count, work, maximum, depth + 1);
+    rmr_status status = outline_children(
+        s, CFDictionaryGetValue(old, kCGPDFOutlineChildren), children, pages,
+        count, work, maximum, entries, depth + 1);
     if (status != RMR_OK) {
       CFRelease(children);
       return status;
@@ -554,6 +561,114 @@ static rmr_status outline_children(const rmr_apple_pdf_source* s,
   return RMR_OK;
 }
 
+/* The source's outline entries seen so far, hashed by dictionary. */
+typedef struct {
+  CGPDFDictionaryRef* slots;
+  size_t capacity, count;
+} seen_entries;
+
+/* Records d, false when it was already there or (with *status set) memory
+ * runs out. */
+static bool first_sight(seen_entries* t, CGPDFDictionaryRef d,
+                        rmr_status* status) {
+  *status = RMR_OK;
+  if (2 * (t->count + 1) > t->capacity) {
+    size_t capacity = t->capacity ? 2 * t->capacity : 64;
+    CGPDFDictionaryRef* slots = calloc(capacity, sizeof *slots);
+    if (!slots) {
+      *status = RMR_ERR_OUT_OF_MEMORY;
+      return false;
+    }
+    for (size_t i = 0; i < t->capacity; i++)
+      if (t->slots[i]) {
+        size_t k =
+            ((uint64_t)(uintptr_t)t->slots[i] * 0x9e3779b97f4a7c15u >> 32) &
+            (capacity - 1);
+        while (slots[k]) k = (k + 1) & (capacity - 1);
+        slots[k] = t->slots[i];
+      }
+    free(t->slots);
+    t->slots = slots;
+    t->capacity = capacity;
+  }
+  size_t k =
+      ((uint64_t)(uintptr_t)d * 0x9e3779b97f4a7c15u >> 32) & (t->capacity - 1);
+  for (; t->slots[k]; k = (k + 1) & (t->capacity - 1))
+    if (t->slots[k] == d) return false;
+  t->slots[k] = d;
+  t->count++;
+  return true;
+}
+
+/* Whether CoreGraphics may be given the source's outline. It loops forever
+ * on an outline whose entries link back to one another, so the links are
+ * walked here first, as the Cairo backend walks them: depth first, an
+ * entry's children before its next sibling, each charged to work against
+ * maximum, and the first of these met decides. An entry met again drops the
+ * outline (*usable false); an entry past OUTLINE_ENTRIES or nested deeper
+ * than OUTLINE_DEPTH, or work past maximum, refuses the file with
+ * RMR_ERR_LIMIT. */
+static rmr_status outline_shape(CGPDFDocumentRef document, size_t maximum,
+                                bool* usable) {
+  size_t work = 0;
+  *usable = false;
+  CGPDFDictionaryRef catalog = CGPDFDocumentGetCatalog(document), root;
+  if (!catalog || !CGPDFDictionaryGetDictionary(catalog, "Outlines", &root))
+    return RMR_OK;
+  typedef struct {
+    CGPDFDictionaryRef entry;
+    size_t depth;
+  } pending;
+  pending* stack = nullptr;
+  size_t height = 0, room = 0;
+  seen_entries seen = {0};
+  rmr_status status = RMR_OK;
+  bool cyclic = !first_sight(&seen, root, &status);
+  CGPDFDictionaryRef first;
+  if (status == RMR_OK && CGPDFDictionaryGetDictionary(root, "First", &first)) {
+    stack = malloc(16 * sizeof *stack);
+    room = 16;
+    if (!stack)
+      status = RMR_ERR_OUT_OF_MEMORY;
+    else
+      stack[height++] = (pending){first, 0};
+  }
+  while (status == RMR_OK && !cyclic && height) {
+    pending p = stack[--height];
+    if (++work > maximum) {
+      status = RMR_ERR_LIMIT;
+      break;
+    }
+    if (!first_sight(&seen, p.entry, &status)) {
+      cyclic = status == RMR_OK;
+      break;
+    }
+    if (seen.count - 1 > OUTLINE_ENTRIES || p.depth > OUTLINE_DEPTH) {
+      status = RMR_ERR_LIMIT;
+      break;
+    }
+    CGPDFDictionaryRef next, child;
+    bool has_next = CGPDFDictionaryGetDictionary(p.entry, "Next", &next),
+         has_child = CGPDFDictionaryGetDictionary(p.entry, "First", &child);
+    if (height + 2 > room) {
+      size_t more = 2 * room;
+      pending* grown = realloc(stack, more * sizeof *stack);
+      if (!grown) {
+        status = RMR_ERR_OUT_OF_MEMORY;
+        break;
+      }
+      stack = grown;
+      room = more;
+    }
+    if (has_next) stack[height++] = (pending){next, p.depth};
+    if (has_child) stack[height++] = (pending){child, p.depth + 1};
+  }
+  free(stack);
+  free(seen.slots);
+  *usable = status == RMR_OK && !cyclic;
+  return status;
+}
+
 rmr_status rmr_apple_pdf_overlay_marks(
     const rmr_apple_pdf_source* source, const rmr_pdf_page* pages, size_t count,
     const rmr_pdf_marks* marks, const rmr_limits* given,
@@ -614,6 +729,19 @@ rmr_status rmr_apple_pdf_overlay_marks(
       }
     }
 
+  /* The outline is checked before anything is written, as on Cairo. */
+  bool usable = false;
+  if (source) {
+    rmr_status shape =
+        outline_shape(source->document, l.maximum_elements, &usable);
+    if (shape != RMR_OK) {
+      free(targets.items);
+      return fail(e, shape,
+                  shape == RMR_ERR_LIMIT ? "PDF outline limit"
+                                         : "PDF outline allocation failed");
+    }
+  }
+
   if (targets.count > 1)
     qsort(targets.items, targets.count, sizeof *targets.items,
           destination_order);
@@ -621,9 +749,14 @@ rmr_status rmr_apple_pdf_overlay_marks(
   /* Pages whose marks the writer can serialize get them from it, merged into
    * CoreGraphics' output once it is closed; CoreGraphics draws the rest. */
   rmr_apple_writer* writer = nullptr;
-  if (rmr_apple_writer_create(&l, checked.decimals, true, &writer) != RMR_OK) {
+  rmr_status created =
+      rmr_apple_writer_create(&l, checked.decimals, true, &writer);
+  if (created != RMR_OK) {
     free(targets.items);
-    return fail(e, RMR_ERR_OUT_OF_MEMORY, "PDF sink allocation failed");
+    /* A limit below the file header is the limit, as on Cairo. */
+    return fail(e, created,
+                created == RMR_ERR_LIMIT ? "PDF output byte limit"
+                                         : "PDF sink allocation failed");
   }
   sink drawn = {.limit = l.maximum_pdf_bytes};
   CGDataConsumerCallbacks callbacks = {put, nullptr};
@@ -644,9 +777,12 @@ rmr_status rmr_apple_pdf_overlay_marks(
   }
   /* The writer's pages go to output as they are deflated, under the header
    * CoreGraphics has just written; its own output is merged after them. */
-  if (output)
-    rmr_apple_writer_output(writer, output, drawn.bytes.bytes,
+  rmr_output_guard guard = {0}; /* output, closed once the export fails */
+  if (output) {
+    rmr_output_guard_init(&guard, output);
+    rmr_apple_writer_output(writer, &guard.output, drawn.bytes.bytes,
                             drawn.bytes.size);
+  }
 
   rmr_status status = RMR_OK;
   bool reported = false; /* set once a marks or drawing call has filled e */
@@ -765,7 +901,21 @@ rmr_status rmr_apple_pdf_overlay_marks(
     if (status != RMR_OK || drawn.status != RMR_OK) break;
   }
 
-  if (status == RMR_OK && source) {
+  /* The writer may still be deflating pages before the failing one: a
+   * failure writing them is earlier in the file and is the one reported,
+   * whichever thread got there first. They are finished with the output
+   * closed, as the export fails either way. A cancellation stops at once. */
+  if (status != RMR_OK && status != RMR_ERR_CANCELLED && !written) {
+    guard.closed = true;
+    rmr_status first = rmr_apple_writer_flush(writer, true);
+    if (first != RMR_OK) {
+      status = first;
+      written = true;
+      reported = false;
+    }
+  }
+
+  if (status == RMR_OK && source && usable) {
     CFDictionaryRef old = CGPDFDocumentGetOutline(source->document);
     if (old) {
       CFMutableArrayRef children =
@@ -773,9 +923,16 @@ rmr_status rmr_apple_pdf_overlay_marks(
       if (!children)
         status = RMR_ERR_OUT_OF_MEMORY;
       else {
+        size_t entries = 0;
         status = outline_children(
             source, CFDictionaryGetValue(old, kCGPDFOutlineChildren), children,
-            pages, count, &work, l.maximum_elements, 0);
+            pages, count, &work, l.maximum_elements, &entries, 0);
+        /* Past the outline's own bounds rather than the work limit. */
+        if (status == RMR_ERR_LIMIT &&
+            (entries > OUTLINE_ENTRIES || work < l.maximum_elements)) {
+          fail(e, status, "PDF outline limit");
+          reported = true;
+        }
         const void *keys[] = {kCGPDFOutlineChildren}, *values[] = {children};
         CFDictionaryRef root = CFDictionaryCreate(
             kCFAllocatorDefault, keys, values, 1,
@@ -808,19 +965,25 @@ rmr_status rmr_apple_pdf_overlay_marks(
     drawn.bytes = merged;
   } else if (status == RMR_OK && output) {
     /* CoreGraphics drew every page: its output is the file. */
-    status =
-        output->write(output->context, drawn.bytes.bytes, drawn.bytes.size);
+    status = guard.output.write(&guard, drawn.bytes.bytes, drawn.bytes.size);
     written = status != RMR_OK;
   }
+  /* A failure writing the file is named as on Cairo: the caller's output
+   * refusing it, else the document's own report of its cause, else
+   * CoreGraphics' share passing maximum_pdf_bytes. */
+  char cause[sizeof e->message] = "PDF overlay failed";
+  const char* document = rmr_apple_writer_failure(writer);
+  if (written)
+    snprintf(cause, sizeof cause, "%s",
+             output && guard.status != RMR_OK ? "PDF output write failed"
+             : document                       ? document
+             : status == RMR_ERR_LIMIT        ? "PDF output byte limit"
+                                              : "PDF overlay failed");
   rmr_apple_writer_free(writer);
 
   if (status != RMR_OK) {
     free(drawn.bytes.bytes);
-    return reported ? status
-                    : fail(e, status,
-                           written && status == RMR_ERR_LIMIT
-                               ? "PDF output byte limit"
-                               : "PDF overlay failed");
+    return reported ? status : fail(e, status, cause);
   }
 
   if (output)
@@ -991,13 +1154,17 @@ rmr_status rmr_apple_pdf_update_marks(
    * alone. */
   rmr_apple_writer* writer = nullptr;
   rmr_pdf_update* update = nullptr;
+  bool settled = false;         /* set once settling the queue has failed */
+  rmr_output_guard guard = {0}; /* output, closed once the export fails */
+  if (output) rmr_output_guard_init(&guard, output);
   if (status == RMR_OK && rmr_apple_writer_create(&limits, checked.decimals,
                                                   false, &writer) != RMR_OK)
     status = fail(e, RMR_ERR_OUT_OF_MEMORY, "incremental page allocation");
   if (status == RMR_OK)
     status = rmr_pdf_update_create(
         CFDataGetBytePtr(source->data), (size_t)CFDataGetLength(source->data),
-        fresh, &limits, cancel, context, output, &update, e);
+        fresh, &limits, cancel, context, output ? &guard.output : nullptr,
+        &update, e);
 
   for (size_t i = 0; status == RMR_OK && i < count; i++) {
     const rmr_pdf_page* p = &pages[i];
@@ -1074,8 +1241,22 @@ rmr_status rmr_apple_pdf_update_marks(
     }
     queue.count++;
     status = settle(&queue, writer, update, false, e);
+    settled = status != RMR_OK;
   }
 
+  /* Pages before the failing one may still be queued: a failure adding them
+   * to the update is earlier in the file and is the one reported, whichever
+   * thread finished first. They are added with the output closed, as the
+   * export fails either way. A cancellation stops at once. */
+  if (status != RMR_OK && status != RMR_ERR_CANCELLED && !settled && update) {
+    rmr_error earlier = {0};
+    guard.closed = true;
+    rmr_status first = settle(&queue, writer, update, true, &earlier);
+    if (first != RMR_OK) {
+      status = first;
+      if (e) *e = earlier;
+    }
+  }
   if (status == RMR_OK) status = settle(&queue, writer, update, true, e);
   for (; queue.count; queue.count--) {
     rmr_buffer_free(&queue.items[queue.head].native);

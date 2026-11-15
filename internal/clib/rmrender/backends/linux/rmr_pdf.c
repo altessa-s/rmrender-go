@@ -9,6 +9,7 @@
 
 #include "../../src/rmr_pdf_edit.h"
 #include "../common/rmr_pdf_options.h"
+#include "../common/rmr_pdf_output.h"
 #include "rmr_linux_internal.h"
 #include "rmr_pdf_platform.h"
 
@@ -293,12 +294,16 @@ rmr_status rmr_linux_pdf_incremental_with_options(
                                          report, e);
 }
 
+/* Outline entries kept from a source PDF and how deep they may nest, as the
+ * Apple backend bounds them (outline_shape says how). */
 typedef struct {
   rmr_pdf_local_link* links;
   rmr_pdf_outline* outline;
-  FPDF_BOOKMARK* bookmarks;
+  FPDF_BOOKMARK* bookmarks; /* each entry's, in outline order */
   size_t* page_map;
   size_t link_count, outline_count, bytes, work;
+  size_t link_capacity, outline_capacity;
+  bool outline_limit; /* set when the outline exceeds its bounds */
 } navigation;
 
 /* Frees a navigation collection's outline titles and arrays. */
@@ -309,6 +314,17 @@ static void navigation_free(navigation* n) {
   free(n->outline);
   free(n->bookmarks);
   free(n->page_map);
+}
+
+/* items, an array of *capacity size-byte items, with room for item `count`:
+ * reallocated to twice its capacity when full; null, items unchanged, when
+ * memory runs out. */
+static void* room(void* items, size_t* capacity, size_t count, size_t size) {
+  if (count < *capacity) return items;
+  size_t more = *capacity ? *capacity * 2 : 16;
+  void* grown = realloc(items, more * size);
+  if (grown) *capacity = more;
+  return grown;
 }
 
 /* Resolves dest to an output page and point through source geometry and the
@@ -353,6 +369,23 @@ static FPDF_DEST link_destination(FPDF_DOCUMENT doc, FPDF_LINK link) {
   if (!dest && action && FPDFAction_GetType(action) == PDFACTION_GOTO)
     dest = FPDFAction_GetDest(doc, action);
   return dest;
+}
+
+FPDF_BOOKMARK rmr_linux_bookmark_next(FPDF_DOCUMENT document,
+                                      FPDF_BOOKMARK parent,
+                                      FPDF_BOOKMARK previous, size_t* remaining,
+                                      bool* overflow) {
+  FPDF_BOOKMARK entry = previous
+                            ? FPDFBookmark_GetNextSibling(document, previous)
+                            : FPDFBookmark_GetFirstChild(document, parent);
+  if (entry) {
+    if (!*remaining) {
+      *overflow = true;
+      return nullptr;
+    }
+    --*remaining;
+  }
+  return entry;
 }
 
 /* Collects preserved local links and the bookmark outline from src, remapped
@@ -411,7 +444,8 @@ static rmr_status navigation_collect(navigation* n, FPDF_DOCUMENT src,
         break;
       }
 
-      void* next = realloc(n->links, (n->link_count + 1) * sizeof entry);
+      void* next =
+          room(n->links, &n->link_capacity, n->link_count, sizeof entry);
       if (!next) {
         status = RMR_ERR_OUT_OF_MEMORY;
         break;
@@ -425,12 +459,25 @@ static rmr_status navigation_collect(navigation* n, FPDF_DOCUMENT src,
     if (status != RMR_OK) return status;
   }
 
-  /* Breadth first traversal keeps parents before children and bounds cyclic
-   * trees. */
+  /* Breadth first keeps parents before children. PDFium can resolve malformed
+   * objects differently from the core reader, so its collection must also
+   * stop at the entry count the independent shape check accepted. */
+  bool usable = false;
+  size_t accepted_entries = 0;
+  rmr_status shape = rmr_pdf_outline_shape(
+      source->data.bytes, source->data.size, l, &usable, &accepted_entries);
+  if (shape != RMR_OK) {
+    n->outline_limit = shape == RMR_ERR_LIMIT;
+    return shape;
+  }
   size_t parent = SIZE_MAX;
-  for (;;) {
-    FPDF_BOOKMARK b = FPDFBookmark_GetFirstChild(
-        src, parent == SIZE_MAX ? nullptr : n->bookmarks[parent]);
+  size_t remaining = accepted_entries;
+  bool overflow = false;
+  while (usable) {
+    FPDF_BOOKMARK native_parent =
+        parent == SIZE_MAX ? nullptr : n->bookmarks[parent];
+    FPDF_BOOKMARK b = rmr_linux_bookmark_next(src, native_parent, nullptr,
+                                              &remaining, &overflow);
     while (b) {
       if (cancel && cancel(ctx)) return RMR_ERR_CANCELLED;
       if (++n->work > l->maximum_elements) return RMR_ERR_LIMIT;
@@ -449,20 +496,22 @@ static rmr_status navigation_collect(navigation* n, FPDF_DOCUMENT src,
         free(title);
         return RMR_ERR_INVALID_ARGUMENT;
       }
-      void* o =
-          realloc(n->outline, (n->outline_count + 1) * sizeof *n->outline);
-      if (!o) {
-        free(title);
-        return RMR_ERR_OUT_OF_MEMORY;
+      if (n->outline_count == n->outline_capacity) {
+        /* The two arrays grow together; one that grew is kept even if the
+         * other could not. */
+        size_t entries = n->outline_capacity, handles = entries;
+        void* o =
+            room(n->outline, &entries, n->outline_count, sizeof *n->outline);
+        if (o) n->outline = o;
+        void* h = room(n->bookmarks, &handles, n->outline_count,
+                       sizeof *n->bookmarks);
+        if (h) n->bookmarks = h;
+        if (!o || !h) {
+          free(title);
+          return RMR_ERR_OUT_OF_MEMORY;
+        }
+        n->outline_capacity = entries;
       }
-      n->outline = o;
-      void* handles =
-          realloc(n->bookmarks, (n->outline_count + 1) * sizeof *n->bookmarks);
-      if (!handles) {
-        free(title);
-        return RMR_ERR_OUT_OF_MEMORY;
-      }
-      n->bookmarks = handles;
 
       rmr_pdf_outline entry = {.parent = parent,
                                .title = title,
@@ -479,7 +528,14 @@ static rmr_status navigation_collect(navigation* n, FPDF_DOCUMENT src,
       n->outline[n->outline_count] = entry;
       n->bookmarks[n->outline_count++] = b;
       n->bytes += fixed + length;
-      b = FPDFBookmark_GetNextSibling(src, b);
+      b = rmr_linux_bookmark_next(src, native_parent, b, &remaining, &overflow);
+    }
+
+    if (overflow) {
+      for (size_t i = 0; i < n->outline_count; i++)
+        free((void*)(uintptr_t)n->outline[i].title);
+      n->outline_count = 0;
+      break;
     }
 
     parent = parent == SIZE_MAX ? 0 : parent + 1;
@@ -501,15 +557,16 @@ typedef struct {
  * the marks page (single precision box), and the page's local links. */
 static rmr_status compose_page(void* context, size_t page,
                                const uint32_t* forms, size_t count,
-                               rmr_buffer extra) {
+                               rmr_buffer extra, rmr_error* e) {
   composer* k = context;
   const rmr_pdf_page* p = &k->pages[page];
   uint32_t marks = 0;
   rmr_status s = RMR_OK;
+  rmr_error builder = {0};
   if (count)
     s = rmr_pdf_builder_wrap(k->builder, (double)(float)p->sheet.width,
                              (double)(float)p->sheet.height, forms, count,
-                             &marks, nullptr);
+                             &marks, &builder);
 
   /* Links were collected page by page. */
   size_t first = k->next_link;
@@ -522,9 +579,9 @@ static rmr_status compose_page(void* context, size_t page,
   if (s == RMR_OK)
     s = rmr_pdf_builder_page(k->builder, page, extra.bytes, extra.size, 0, 0,
                              marks ? &marks : nullptr, marks ? 1 : 0, links,
-                             k->next_link - first, nullptr);
+                             k->next_link - first, &builder);
   free(extra.bytes);
-  return s;
+  return s == RMR_OK ? s : rmr_linux_builder_error(e, s, &builder);
 }
 
 rmr_status rmr_linux_pdf_overlay_marks(
@@ -546,6 +603,8 @@ rmr_status rmr_linux_pdf_overlay_marks(
   rmr_buffer result = {0};
   rmr_status s = RMR_OK;
   bool reported = false; /* set once a marks or drawing call has filled e */
+  rmr_error why = {0}; /* a failure no call reported, once its cause is known */
+  bool drawn = false;  /* set once the failure is a page's own */
   rmr_pdf_report stats = {0};
 
   rmr_pdfium_lock();
@@ -559,31 +618,47 @@ rmr_status rmr_linux_pdf_overlay_marks(
    * written once, complete, into a file that never holds a whole document
    * in PDFium: only the page being composed is. */
   navigation nav = {0};
-  if (s == RMR_OK && src)
+  if (s == RMR_OK && src) {
     s = navigation_collect(&nav, src, source, pages, count, &l, cancel, ctx,
                            &stats);
+    if (s == RMR_ERR_CANCELLED)
+      rmr_linux_error(&why, s, "PDF collection cancelled");
+    else if (s == RMR_ERR_LIMIT && nav.outline_limit)
+      rmr_linux_error(&why, s, "PDF outline limit");
+  }
 
   rmr_pdf_builder* builder = nullptr;
   rmr_linux_parts* parts = nullptr;
   composer k = {.pages = pages, .nav = &nav};
+  rmr_output_guard guard = {0}; /* output, closed once the export fails */
   if (s == RMR_OK) {
     rmr_limits remaining = l;
     remaining.maximum_plan_bytes -= nav.bytes;
     s = rmr_pdf_builder_create(&remaining, nullptr, nullptr, &builder);
+    if (s != RMR_OK) /* Only the file's header is written yet. */
+      rmr_linux_error(
+          &why, s,
+          s == RMR_ERR_LIMIT ? RMR_LINUX_BYTE_LIMIT : RMR_LINUX_ALLOCATION);
   }
   if (s == RMR_OK) {
     k.builder = builder;
-    if (output) rmr_pdf_builder_output(builder, output);
+    if (output) {
+      rmr_output_guard_init(&guard, output);
+      rmr_pdf_builder_output(builder, &guard.output);
+    }
     if (!rmr_pdf_builder_pages(builder, count)) s = RMR_ERR_LIMIT;
   }
-  if (s == RMR_OK)
+  if (s == RMR_OK) {
     s = rmr_linux_parts_create(builder, compose_page, &k, &parts);
+    if (s != RMR_OK) rmr_linux_error(&why, s, RMR_LINUX_ALLOCATION);
+  }
 
   for (size_t i = 0; i < count && s == RMR_OK; i++) {
     if (cancel && cancel(ctx)) {
-      s = RMR_ERR_CANCELLED;
+      s = rmr_linux_error(&why, RMR_ERR_CANCELLED, "PDF composition cancelled");
       break;
     }
+    drawn = true;
 
     const rmr_pdf_page* p = &pages[i];
     if ((!provider && !p->marks) ||
@@ -697,17 +772,43 @@ rmr_status rmr_linux_pdf_overlay_marks(
     if (s == RMR_OK && !FPDFPage_GenerateContent(page)) s = RMR_ERR_BACKEND;
     if (page) FPDF_ClosePage(page);
     rmr_buffer composed = {0};
-    if (s == RMR_OK) s = rmr_pdfium_save(single, &l, &composed);
+    if (s == RMR_OK) {
+      s = rmr_pdfium_save(single, &l, &composed);
+      if (s == RMR_ERR_LIMIT) rmr_linux_error(&why, s, RMR_LINUX_BYTE_LIMIT);
+    }
     if (single) FPDF_CloseDocument(single);
-    if (s == RMR_OK) s = rmr_linux_parts_close(parts, i, composed);
-    if (s == RMR_OK) s = rmr_linux_parts_collect(parts, false);
+    if (s == RMR_OK) {
+      s = rmr_linux_parts_close(parts, i, composed);
+      if (s != RMR_OK) rmr_linux_error(&why, s, RMR_LINUX_ALLOCATION);
+    }
+    if (s == RMR_OK) {
+      s = rmr_linux_parts_collect(parts, false, &why);
+      drawn = false;
+    }
   }
 
-  if (s == RMR_OK) s = rmr_linux_parts_collect(parts, true);
+  if (s == RMR_OK) s = rmr_linux_parts_collect(parts, true, &why);
+  /* Pages before the failing one may still be queued: a failure in them is
+   * earlier in the file and is the one reported, whichever thread got there
+   * first. They are finished with the output closed, as the export fails
+   * either way. A cancellation stops at once. */
+  if (drawn && s != RMR_OK && s != RMR_ERR_CANCELLED) {
+    rmr_error earlier = {0};
+    guard.closed = true;
+    rmr_status first = rmr_linux_parts_collect(parts, true, &earlier);
+    if (first != RMR_OK) {
+      s = first;
+      why = earlier;
+      reported = false;
+    }
+  }
   rmr_linux_parts_free(parts);
-  if (s == RMR_OK)
+  if (s == RMR_OK) {
+    rmr_error builder_error = {0};
     s = rmr_pdf_builder_finish(builder, nav.outline, nav.outline_count, &result,
-                               nullptr);
+                               &builder_error);
+    if (s != RMR_OK) rmr_linux_builder_error(&why, s, &builder_error);
+  }
   rmr_pdf_builder_free(builder);
 
   navigation_free(&nav);
@@ -721,7 +822,9 @@ rmr_status rmr_linux_pdf_overlay_marks(
     rmr_buffer_free(&result);
   return s == RMR_OK || reported
              ? s
-             : rmr_linux_error(e, s, "PDF composition failed");
+             : rmr_linux_error(
+                   e, s,
+                   why.message[0] ? why.message : "PDF composition failed");
 }
 
 rmr_status rmr_linux_pdf_overlay(const rmr_linux_pdf_source* source,

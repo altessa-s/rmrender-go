@@ -79,6 +79,10 @@ size_t rmr_apple_writer_pending(const rmr_apple_writer* w);
  * failure (RMR_ERR_LIMIT past maximum_pdf_bytes) leaves error to the caller. */
 rmr_status rmr_apple_writer_flush(rmr_apple_writer* w, bool all);
 
+/* The document's own report of why flushing or merging failed (as "PDF
+ * output byte limit"), or null when it has not failed. */
+const char* rmr_apple_writer_failure(const rmr_apple_writer* w);
+
 /* Pages written by rmr_apple_writer_page. */
 size_t rmr_apple_writer_pages(const rmr_apple_writer* w);
 

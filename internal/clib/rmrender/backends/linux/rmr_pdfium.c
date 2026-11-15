@@ -32,6 +32,12 @@ rmr_status rmr_linux_error(rmr_error* e, rmr_status s, const char* message) {
   return s;
 }
 
+rmr_status rmr_linux_builder_error(rmr_error* e, rmr_status s,
+                                   const rmr_error* builder) {
+  return rmr_linux_error(
+      e, s, builder->message[0] ? builder->message : "PDF assembly failed");
+}
+
 cairo_status_t rmr_linux_write(void* ctx, const unsigned char* data,
                                unsigned int size) {
   rmr_sink* s = ctx;

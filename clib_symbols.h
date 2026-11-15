@@ -10,7 +10,7 @@
 // alike, so that the C names stay as written and the linker sees only the
 // prefixed ones: rmlines-go, rmdoc-go and rmmarks-go compile the same
 // libraries under their own names, and one program may link them all.
-// 571 symbols, read with nm from objects of both backends; Windows
+// 577 symbols, read with nm from objects of both backends; Windows
 // compiles the Cairo backend's sources, and its _WIN32 branches add no other.
 
 #ifndef RMRENDER_GO_CLIB_SYMBOLS_H
@@ -316,6 +316,7 @@
 #define rmr_apple_unit_raster rmrgo_rmr_apple_unit_raster
 #define rmr_apple_unreadable_plan rmrgo_rmr_apple_unreadable_plan
 #define rmr_apple_writer_create rmrgo_rmr_apple_writer_create
+#define rmr_apple_writer_failure rmrgo_rmr_apple_writer_failure
 #define rmr_apple_writer_flush rmrgo_rmr_apple_writer_flush
 #define rmr_apple_writer_free rmrgo_rmr_apple_writer_free
 #define rmr_apple_writer_lead rmrgo_rmr_apple_writer_lead
@@ -393,6 +394,8 @@
 #define rmr_lines_type_metrics rmrgo_rmr_lines_type_metrics
 #define rmr_linux_bitmap rmrgo_rmr_linux_bitmap
 #define rmr_linux_bitmap_on_sheet rmrgo_rmr_linux_bitmap_on_sheet
+#define rmr_linux_bookmark_next rmrgo_rmr_linux_bookmark_next
+#define rmr_linux_builder_error rmrgo_rmr_linux_builder_error
 #define rmr_linux_document_pdf rmrgo_rmr_linux_document_pdf
 #define rmr_linux_document_pdf_preserving rmrgo_rmr_linux_document_pdf_preserving
 #define rmr_linux_document_pdf_preserving_to_output rmrgo_rmr_linux_document_pdf_preserving_to_output
@@ -405,6 +408,8 @@
 #define rmr_linux_document_svg rmrgo_rmr_linux_document_svg
 #define rmr_linux_document_svg_with_options rmrgo_rmr_linux_document_svg_with_options
 #define rmr_linux_error rmrgo_rmr_linux_error
+#define rmr_linux_font_lock rmrgo_rmr_linux_font_lock
+#define rmr_linux_font_unlock rmrgo_rmr_linux_font_unlock
 #define rmr_linux_fonts_create rmrgo_rmr_linux_fonts_create
 #define rmr_linux_fonts_create_directory rmrgo_rmr_linux_fonts_create_directory
 #define rmr_linux_fonts_free rmrgo_rmr_linux_fonts_free
@@ -508,6 +513,7 @@
 #define rmr_pdf_navigation rmrgo_rmr_pdf_navigation
 #define rmr_pdf_number rmrgo_rmr_pdf_number
 #define rmr_pdf_options_default rmrgo_rmr_pdf_options_default
+#define rmr_pdf_outline_shape rmrgo_rmr_pdf_outline_shape
 #define rmr_pdf_pages rmrgo_rmr_pdf_pages
 #define rmr_pdf_pipeline_create rmrgo_rmr_pdf_pipeline_create
 #define rmr_pdf_pipeline_free rmrgo_rmr_pdf_pipeline_free

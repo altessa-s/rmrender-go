@@ -67,8 +67,8 @@ rmr_status rmr_linux_path_capture(cairo_t* cr, const rmr_limits* limits,
 
 /* rmr_svg_provider text callback: outlines of the same Pango line Linux TEXT
  * drawing shows, without hinting, as a vector PDF surface would embed it. */
-static rmr_status text_outline(void* context, const rmr_text_view* text,
-                               const rmr_limits* limits, rmr_path* out) {
+static rmr_status text_outline_locked(void* context, const rmr_text_view* text,
+                                      const rmr_limits* limits, rmr_path* out) {
   (void)context;
   if (!text || !limits || !out || (!text->utf8 && text->size) ||
       text->size > 65536 || !isfinite(text->font_size) ||
@@ -106,6 +106,14 @@ static rmr_status text_outline(void* context, const rmr_text_view* text,
   else
     rmr_path_free(&path);
   return s;
+}
+
+static rmr_status text_outline(void* context, const rmr_text_view* text,
+                               const rmr_limits* limits, rmr_path* out) {
+  rmr_linux_font_lock();
+  rmr_status status = text_outline_locked(context, text, limits, out);
+  rmr_linux_font_unlock();
+  return status;
 }
 
 /* rmr_svg_provider raster callback: Cairo/PDFium bitmap over transparency. */

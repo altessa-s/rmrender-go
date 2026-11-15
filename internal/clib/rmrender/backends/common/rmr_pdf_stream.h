@@ -43,9 +43,19 @@ typedef struct {
 bool rmr_pdf_text_reserve(rmr_pdf_text* t, size_t more);
 void rmr_pdf_text_append(rmr_pdf_text* t, const void* bytes, size_t size);
 void rmr_pdf_text_string(rmr_pdf_text* t, const char* s);
+/* GCC targeting MinGW reads the plain printf archetype as Microsoft's, which
+ * has no %zu; the C runtime these files are built against does format it. */
+#if defined(__MINGW32__) && !defined(__clang__)
+#define RMR_PRINTF(format_index, first_argument) \
+  [[gnu::format(gnu_printf, format_index, first_argument)]]
+#else
+#define RMR_PRINTF(format_index, first_argument) \
+  [[gnu::format(printf, format_index, first_argument)]]
+#endif
+
 /* printf-style; output longer than 255 bytes fails the text. */
-[[gnu::format(printf, 2, 3)]] void rmr_pdf_text_format(rmr_pdf_text* t,
-                                                       const char* format, ...);
+RMR_PRINTF(2, 3)
+void rmr_pdf_text_format(rmr_pdf_text* t, const char* format, ...);
 /* v through rmr_pdf_number, or rmr_pdf_decimal when decimals is nonzero. */
 void rmr_pdf_text_number(rmr_pdf_text* t, double v, unsigned decimals);
 void rmr_pdf_text_free(rmr_pdf_text* t);

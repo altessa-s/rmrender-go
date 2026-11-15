@@ -100,6 +100,15 @@ RMR_API rmr_status rmr_pdf_navigation(
     const rmr_limits* limits, rmr_cancel_fn cancel, void* context,
     rmr_buffer* out);
 
+/* Checks an imported outline before PDFium collects it.
+ * Walks children before siblings with a work budget of its own, including
+ * the root in cycle detection. Cycles drop the outline, *usable false;
+ * excessive work, depth or entry count returns RMR_ERR_LIMIT. The accepted
+ * entry count excludes the root and is zero when the outline is dropped. */
+RMR_API rmr_status rmr_pdf_outline_shape(const uint8_t* pdf, size_t size,
+                                         const rmr_limits* limits, bool* usable,
+                                         size_t* entries);
+
 /* rmr_plan_execute over draws first to end - 1 only: the same checks,
  * cancellation points and error reports, the failing draw's index counted
  * from the plan's start. */

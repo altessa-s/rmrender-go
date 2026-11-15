@@ -529,8 +529,14 @@ bool rm_log_wanted(void);
 
 /* `format(printf, ...)` is a GNU spelling. MSVC has no `__attribute__` at all
  * — unguarded it is a syntax error, not a warning — and the library declares
- * Windows a target in `export.h` and in the build. */
-#if defined(__GNUC__) || defined(__clang__)
+ * Windows a target in `export.h` and in the build. GCC targeting MinGW reads
+ * the plain `printf` archetype as Microsoft's, which has no `%zu`; the C
+ * runtime the library is built against does format it, so GCC there is told
+ * `gnu_printf`. */
+#if defined(__MINGW32__) && !defined(__clang__)
+#define RM_PRINTF(format_index, first_argument) \
+  __attribute__((format(gnu_printf, format_index, first_argument)))
+#elif defined(__GNUC__) || defined(__clang__)
 #define RM_PRINTF(format_index, first_argument) \
   __attribute__((format(printf, format_index, first_argument)))
 #else

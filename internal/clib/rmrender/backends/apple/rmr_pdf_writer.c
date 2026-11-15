@@ -99,6 +99,7 @@ struct rmr_apple_writer {
   catalog shared;
   rmr_pdf_page_objects* pages;
   size_t page_count, page_capacity;
+  rmr_error failure; /* the builder's report of its first failure */
 };
 
 /* A content stream being written, the resources it names and the graphics
@@ -1085,6 +1086,10 @@ void rmr_apple_writer_output(rmr_apple_writer* w, const rmr_output* output,
   rmr_pdf_builder_output(w->builder, output);
 }
 
+const char* rmr_apple_writer_failure(const rmr_apple_writer* w) {
+  return w->failure.message[0] ? w->failure.message : nullptr;
+}
+
 size_t rmr_apple_writer_pending(const rmr_apple_writer* w) {
   return rmr_pdf_pipeline_pending(w->pipeline);
 }
@@ -1107,7 +1112,7 @@ rmr_status rmr_apple_writer_flush(rmr_apple_writer* w, bool all) {
       else {
         for (size_t i = 0; i < b->count; i++) numbers[i] = b->objects[i].number;
         s = rmr_pdf_builder_append(w->builder, b->chunk.bytes, b->chunk.size,
-                                   numbers, b->offsets, b->count, nullptr);
+                                   numbers, b->offsets, b->count, &w->failure);
         free(numbers);
       }
     }
@@ -1329,7 +1334,7 @@ rmr_status rmr_apple_writer_merge(rmr_apple_writer* w, const uint8_t* base,
   rmr_status s = rmr_apple_writer_flush(w, true);
   if (s != RMR_OK) return s;
   return rmr_pdf_builder_merge(w->builder, base, size, w->pages, w->page_count,
-                               out, nullptr);
+                               out, &w->failure);
 }
 
 rmr_status rmr_apple_writer_overlay(rmr_apple_writer* w, size_t tag,
