@@ -11,6 +11,16 @@
 #include "../common/rmr_pdf_options.h"
 #include "rmr_linux_internal.h"
 
+/* Cairo's FT font map shares one FT_Library across faces. Protect glyph
+ * loading, layout and font subsetting, including retained-font cleanup.
+ * When both locks are needed, acquire PDFium's lock before this one; never
+ * enter PDFium while holding the font lock. */
+static GRecMutex font_lock;
+
+void rmr_linux_font_lock(void) { g_rec_mutex_lock(&font_lock); }
+
+void rmr_linux_font_unlock(void) { g_rec_mutex_unlock(&font_lock); }
+
 /* parts, set for PDF output, receives each finished segment as part `tag`'s
  * marks; sink is the segment's, on the heap so that a worker can finish it. */
 typedef struct {
@@ -25,7 +35,8 @@ typedef struct {
   rmr_linux_parts* parts;
   size_t tag;
   rmr_pdf_grain grain;
-  bool dirty, clip_viewport;
+  bool dirty, clip_viewport, has_text;
+  bool over; /* a part passed maximum_pdf_bytes */
 } drawing;
 
 /* Maps a blend mode to the matching Cairo compositing operator. */
@@ -118,7 +129,46 @@ typedef struct {
   cairo_t* cr;
   cairo_surface_t* surface;
   rmr_sink* sink;
+  bool has_text;
 } segment;
+
+/* Cairo PDF write callback for a segment's sink. The sink keeps its failure
+ * and drops later bytes, but Cairo is told every write succeeded: when its PDF
+ * stream fails part way, Cairo never releases what the page recorded (mask
+ * snapshots among it), so it is left to finish the page and free it. */
+static cairo_status_t segment_write(void* closure, const unsigned char* data,
+                                    unsigned int length) {
+  (void)rmr_linux_write(closure, data, length);
+  return CAIRO_STATUS_SUCCESS;
+}
+
+/* Cairo rasterizes unsupported paints at their page-level union, including
+ * enclosing transparency groups. At 300 ppi a rounded page side of 7,863
+ * points fits Cairo's 32,767-pixel image limit. Larger fallback images fail
+ * show_page and leave Cairo holding the page's recorded paints. */
+constexpr double FALLBACK_SIDE = 7863;
+
+/* Bound every fallback image by the whole rounded page. Set this before any
+ * drawing and leave it until show_page, when Cairo reads the resolution.
+ * Each segment has a fresh single-page surface, so a following short page
+ * starts at 300 ppi again without changing any preceding page. */
+static void fallback_resolution(cairo_surface_t* surface, double width,
+                                double height, size_t maximum_bytes) {
+  double w = fmax(1, ceil(width)), h = fmax(1, ceil(height));
+  double side = fmax(w, h), resolution = 300;
+  if (side > FALLBACK_SIDE) {
+    resolution = 300 * FALLBACK_SIDE / side;
+    double pixels = fmax(1, (double)(maximum_bytes / 4));
+    /* Reserve a pixel on each axis for Cairo's outward rounding. Solving
+     * (w * scale + 1) * (h * scale + 1) <= pixels also bounds narrow pages,
+     * where rounding the shorter axis can otherwise exceed the area budget.
+     * One pixel on the longer axis is the positive minimum. */
+    double scale = 2 * (pixels - 1) /
+                   (w + h + sqrt((w - h) * (w - h) + 4 * w * h * pixels));
+    resolution = fmax(72 / side, fmin(resolution, 72 * scale));
+  }
+  cairo_surface_set_fallback_resolution(surface, resolution, resolution);
+}
 
 /* Begins a new single-page Cairo PDF surface writing into a new sink, with
  * the sheet transform already applied. A failed sink allocation leaves an
@@ -128,21 +178,28 @@ static void segment_start(drawing* c) {
   if (c->sink) *c->sink = (rmr_sink){.maximum = c->limits.maximum_pdf_bytes};
   c->surface =
       c->sink ? cairo_pdf_surface_create_for_stream(
-                    rmr_linux_write, c->sink, c->sheet.width, c->sheet.height)
+                    segment_write, c->sink, c->sheet.width, c->sheet.height)
               : cairo_image_surface_create(CAIRO_FORMAT_INVALID, 0, 0);
+  if (c->sink)
+    fallback_resolution(c->surface, c->sheet.width, c->sheet.height,
+                        c->limits.maximum_bitmap_bytes);
   c->cr = cairo_create(c->surface);
   setup(c);
   c->dirty = false;
+  c->has_text = false;
 }
 
 /* Shows, finishes and destroys a segment's page; its bytes or failure. */
 static rmr_status segment_finish(segment* g, rmr_buffer* out) {
+  /* Only text-bearing surfaces subset fonts during PDF serialization. */
+  if (g->has_text) rmr_linux_font_lock();
   cairo_show_page(g->cr);
   cairo_status_t cs = cairo_status(g->cr);
   cairo_destroy(g->cr);
   cairo_surface_finish(g->surface);
   if (cs == CAIRO_STATUS_SUCCESS) cs = cairo_surface_status(g->surface);
   cairo_surface_destroy(g->surface);
+  if (g->has_text) rmr_linux_font_unlock();
 
   rmr_status s = g->sink ? g->sink->status : RMR_ERR_OUT_OF_MEMORY;
   if (s == RMR_OK && cs != CAIRO_STATUS_SUCCESS) s = RMR_ERR_BACKEND;
@@ -202,7 +259,7 @@ static rmr_status part_submit(rmr_linux_parts* parts, size_t tag, segment* g,
  * here and dropped. Returns the first failure encountered. */
 static rmr_status segment_end(drawing* c) {
   group_end(c);
-  segment g = {c->cr, c->surface, c->sink};
+  segment g = {c->cr, c->surface, c->sink, c->has_text};
   c->cr = nullptr;
   c->surface = nullptr;
   c->sink = nullptr;
@@ -216,6 +273,7 @@ static rmr_status segment_end(drawing* c) {
   rmr_buffer bytes = {0};
   rmr_status s = segment_finish(&g, &bytes);
   free(bytes.bytes);
+  if (s == RMR_ERR_LIMIT) c->over = true;
   return s == RMR_OK && c->dirty ? RMR_ERR_OUT_OF_MEMORY : s;
 }
 
@@ -236,8 +294,8 @@ PangoLayout* rmr_linux_label(cairo_t* cr, const char* text, size_t size,
 /* Computes ink and logical text metrics for text via Pango, rejecting
  * invalid UTF-8, oversized text, and non-finite or out-of-range font
  * sizes. */
-static rmr_status measure(void* ctx, const char* text, size_t size,
-                          double font_size, rmr_text_metrics* out) {
+static rmr_status measure_locked(void* ctx, const char* text, size_t size,
+                                 double font_size, rmr_text_metrics* out) {
   (void)ctx;
   if (!out || !text || size > 65536 || !isfinite(font_size) || font_size <= 0 ||
       font_size > 100000 || !g_utf8_validate(text, (gssize)size, nullptr))
@@ -264,6 +322,14 @@ static rmr_status measure(void* ctx, const char* text, size_t size,
   cairo_destroy(cr);
   cairo_surface_destroy(s);
   return RMR_OK;
+}
+
+static rmr_status measure(void* ctx, const char* text, size_t size,
+                          double font_size, rmr_text_metrics* out) {
+  rmr_linux_font_lock();
+  rmr_status status = measure_locked(ctx, text, size, font_size, out);
+  rmr_linux_font_unlock();
+  return status;
 }
 
 rmr_text_provider rmr_linux_text_provider(void) {
@@ -347,8 +413,11 @@ static rmr_status image_surface(const rmr_image_view* im, const rmr_limits* l,
  * wrapper document; otherwise rasterizes the page to a bitmap and
  * composites it as an image. Must be called with the PDFium lock held. */
 static rmr_status paint_pdf_locked(drawing* c, const rmr_draw* d) {
-  if (d->image.size > c->limits.maximum_pdf_bytes || d->pdf_page > INT_MAX)
+  if (d->image.size > c->limits.maximum_pdf_bytes) {
+    c->over = true;
     return RMR_ERR_LIMIT;
+  }
+  if (d->pdf_page > INT_MAX) return RMR_ERR_LIMIT;
 
   FPDF_DOCUMENT doc =
       FPDF_LoadMemDocument64(d->image.bytes, d->image.size, nullptr);
@@ -438,7 +507,10 @@ static rmr_status paint_pdf_locked(drawing* c, const rmr_draw* d) {
             s = RMR_ERR_BACKEND;
 
           rmr_buffer raw = {0}, clipped = {0};
-          if (s == RMR_OK) s = rmr_pdfium_save(wrapper, &c->limits, &raw);
+          if (s == RMR_OK) {
+            s = rmr_pdfium_save(wrapper, &c->limits, &raw);
+            if (s == RMR_ERR_LIMIT) c->over = true;
+          }
           if (s == RMR_OK)
             s = rmr_pdf_clip(raw.bytes, raw.size, d->path, q, &c->limits,
                              &clipped);
@@ -681,6 +753,8 @@ static rmr_status draw(void* ctx, const rmr_draw* d) {
       }
     }
   } else if (d->mode == RMR_TEXT) {
+    c->has_text = true;
+    rmr_linux_font_lock();
     PangoLayout* p =
         rmr_linux_label(cr, d->text.utf8, d->text.size, d->text.font_size);
     cairo_move_to(
@@ -775,6 +849,9 @@ static rmr_status draw(void* ctx, const rmr_draw* d) {
   }
 
   cairo_restore(cr);
+  /* Text has no erasers or groups; restore releases its retained font while
+   * the text draw's lock is still held. Other draws carry no font state. */
+  if (d->mode == RMR_TEXT) rmr_linux_font_unlock();
   c->dirty = true;
   if (s == RMR_OK && cairo_status(cr) != CAIRO_STATUS_SUCCESS)
     s = RMR_ERR_BACKEND;
@@ -859,7 +936,9 @@ static rmr_status bitmap_on_sheet(const rmr_plan* plan, const rmr_sheet* sheet,
   setup(&c);
   rmr_backend b = backend(&c);
   s = rmr_plan_execute(plan, &b, cancel, ctx, e);
+  if (c.has_text) rmr_linux_font_lock();
   cairo_destroy(c.cr);
+  if (c.has_text) rmr_linux_font_unlock();
   cairo_surface_flush(c.surface);
 
   if (s == RMR_OK) {
@@ -950,8 +1029,15 @@ rmr_status rmr_linux_parts_draw(rmr_linux_parts* parts, size_t page,
   rmr_status s = rmr_plan_execute(plan, &b, cancel, context, e);
   if (c.cr) {
     rmr_status finish = segment_end(&c);
-    if (s == RMR_OK) s = finish;
+    if (s == RMR_OK && finish != RMR_OK)
+      s = rmr_linux_error(e, finish,
+                          finish == RMR_ERR_LIMIT ? RMR_LINUX_BYTE_LIMIT
+                          : finish == RMR_ERR_OUT_OF_MEMORY
+                              ? RMR_LINUX_ALLOCATION
+                              : "PDF drawing failed");
   }
+  /* rmr_plan_execute cannot tell the drawing's own byte limit apart. */
+  if (s == RMR_ERR_LIMIT && c.over) rmr_linux_error(e, s, RMR_LINUX_BYTE_LIMIT);
   return s;
 }
 
@@ -967,7 +1053,7 @@ rmr_status rmr_linux_parts_close(rmr_linux_parts* parts, size_t page,
   return RMR_OK;
 }
 
-rmr_status rmr_linux_parts_collect(rmr_linux_parts* p, bool all) {
+rmr_status rmr_linux_parts_collect(rmr_linux_parts* p, bool all, rmr_error* e) {
   for (;;) {
     size_t pending = rmr_pdf_pipeline_pending(p->pipeline);
     if (!pending) return RMR_OK;
@@ -975,11 +1061,18 @@ rmr_status rmr_linux_parts_collect(rmr_linux_parts* p, bool all) {
         rmr_pdf_pipeline_next(p->pipeline, all || pending > p->window);
     if (!b) return RMR_OK;
     rmr_status s = b->status;
-    if (s == RMR_OK && b->last) {
-      s = p->done(p->context, b->tag, p->forms, p->count, b->extra);
+    rmr_error builder = {0};
+    if (s != RMR_OK)
+      /* A segment Cairo finished on a worker: its sink's failure. */
+      rmr_linux_error(e, s,
+                      s == RMR_ERR_LIMIT           ? RMR_LINUX_BYTE_LIMIT
+                      : s == RMR_ERR_OUT_OF_MEMORY ? RMR_LINUX_ALLOCATION
+                                                   : "PDF drawing failed");
+    else if (b->last) {
+      s = p->done(p->context, b->tag, p->forms, p->count, b->extra, e);
       b->extra = (rmr_buffer){0};
       p->count = 0;
-    } else if (s == RMR_OK) {
+    } else {
       if (p->count == p->capacity) {
         size_t capacity = p->capacity ? p->capacity * 2 : 8;
         void* grown = realloc(p->forms, capacity * sizeof *p->forms);
@@ -989,10 +1082,12 @@ rmr_status rmr_linux_parts_collect(rmr_linux_parts* p, bool all) {
         }
       }
       if (p->count == p->capacity)
-        s = RMR_ERR_OUT_OF_MEMORY;
-      else
+        s = rmr_linux_error(e, RMR_ERR_OUT_OF_MEMORY, RMR_LINUX_ALLOCATION);
+      else {
         s = rmr_pdf_builder_form(p->builder, b->chunk.bytes, b->chunk.size,
-                                 &p->forms[p->count++], nullptr);
+                                 &p->forms[p->count++], &builder);
+        if (s != RMR_OK) rmr_linux_builder_error(e, s, &builder);
+      }
     }
     rmr_pdf_batch_free(b);
     if (s != RMR_OK) return s;
@@ -1007,12 +1102,15 @@ typedef struct {
 /* rmr_linux_page_fn for rmr_linux_render_pdf: a page of its sheet's size
  * drawing the parts, as PDFium sized it (single precision). */
 static rmr_status sheet_page(void* context, size_t page, const uint32_t* forms,
-                             size_t count, rmr_buffer extra) {
+                             size_t count, rmr_buffer extra, rmr_error* e) {
   sheets_output* o = context;
   free(extra.bytes);
-  return rmr_pdf_builder_page(
-      o->builder, page, nullptr, 0, (double)(float)o->sheets[page].width,
-      (double)(float)o->sheets[page].height, forms, count, nullptr, 0, nullptr);
+  rmr_error builder = {0};
+  rmr_status s = rmr_pdf_builder_page(o->builder, page, nullptr, 0,
+                                      (double)(float)o->sheets[page].width,
+                                      (double)(float)o->sheets[page].height,
+                                      forms, count, nullptr, 0, &builder);
+  return s == RMR_OK ? s : rmr_linux_builder_error(e, s, &builder);
 }
 
 rmr_status rmr_linux_render_pdf(const rmr_plan* const* plans,
@@ -1033,30 +1131,59 @@ rmr_status rmr_linux_render_pdf(const rmr_plan* const* plans,
   rmr_pdf_builder* builder = nullptr;
   rmr_linux_parts* parts = nullptr;
   sheets_output output = {.sheets = sheets};
+  rmr_error why = {0}; /* the failure, once its cause is known */
   rmr_status s = rmr_pdf_builder_create(limits, nullptr, nullptr, &builder);
-  if (s == RMR_OK) {
+  if (s != RMR_OK) /* Only the file's header is written yet. */
+    rmr_linux_error(
+        &why, s,
+        s == RMR_ERR_LIMIT ? RMR_LINUX_BYTE_LIMIT : RMR_LINUX_ALLOCATION);
+  else {
     output.builder = builder;
     if (!rmr_pdf_builder_pages(builder, count)) s = RMR_ERR_LIMIT;
   }
-  if (s == RMR_OK)
+  if (s == RMR_OK) {
     s = rmr_linux_parts_create(builder, sheet_page, &output, &parts);
+    if (s != RMR_OK) rmr_linux_error(&why, s, RMR_LINUX_ALLOCATION);
+  }
 
+  bool drawn = false; /* set once the failure is a page's */
   for (size_t i = 0; i < count && s == RMR_OK; i++) {
     if (cancel && cancel(ctx)) {
-      s = RMR_ERR_CANCELLED;
+      s = rmr_linux_error(&why, RMR_ERR_CANCELLED, "PDF composition cancelled");
       break;
     }
     s = rmr_linux_parts_draw(parts, i, plans[i], &sheets[i], limits, grain,
-                             cancel, ctx, e);
-    if (s == RMR_OK) s = rmr_linux_parts_close(parts, i, (rmr_buffer){0});
-    if (s == RMR_OK) s = rmr_linux_parts_collect(parts, false);
+                             cancel, ctx, &why);
+    drawn = s != RMR_OK;
+    if (s == RMR_OK) {
+      s = rmr_linux_parts_close(parts, i, (rmr_buffer){0});
+      if (s != RMR_OK) rmr_linux_error(&why, s, RMR_LINUX_ALLOCATION);
+      drawn = s != RMR_OK;
+    }
+    if (s == RMR_OK) s = rmr_linux_parts_collect(parts, false, &why);
   }
-  if (s == RMR_OK) s = rmr_linux_parts_collect(parts, true);
+  if (s == RMR_OK) s = rmr_linux_parts_collect(parts, true, &why);
+  /* Pages before the failing one may still be queued: a failure in them is
+   * earlier in the file and is the one reported, whichever thread got there
+   * first. A cancellation stops at once. */
+  if (drawn && s != RMR_ERR_CANCELLED) {
+    rmr_error earlier = {0};
+    rmr_status first = rmr_linux_parts_collect(parts, true, &earlier);
+    if (first != RMR_OK) {
+      s = first;
+      why = earlier;
+    }
+  }
   rmr_linux_parts_free(parts);
-  if (s == RMR_OK)
-    s = rmr_pdf_builder_finish(builder, nullptr, 0, out, nullptr);
+  if (s == RMR_OK) {
+    rmr_error builder_error = {0};
+    s = rmr_pdf_builder_finish(builder, nullptr, 0, out, &builder_error);
+    if (s != RMR_OK) rmr_linux_builder_error(&why, s, &builder_error);
+  }
   rmr_pdf_builder_free(builder);
-  return s == RMR_OK ? s : rmr_linux_error(e, s, "Linux PDF rendering failed");
+  if (s == RMR_OK) return s;
+  return rmr_linux_error(
+      e, s, why.message[0] ? why.message : "Linux PDF rendering failed");
 }
 
 /* Serializes count plans/sheets into a single PDF, holding the

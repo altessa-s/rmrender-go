@@ -225,8 +225,8 @@ static double end_pair_adjustment(PangoLayoutLine* line) {
 /* Caret-provider callback: computes the primary and line-start x offsets
  * for a character index within paragraph pi's line li, after validating
  * that pi, li, and index are all in range. */
-static rmr_status caret(void* ctx, size_t pi, size_t li, size_t index,
-                        rmr_caret_offsets* out) {
+static rmr_status caret_locked(void* ctx, size_t pi, size_t li, size_t index,
+                               rmr_caret_offsets* out) {
   rmr_linux_layout* l = ctx;
   if (!l || !out || pi >= l->anchors.count ||
       li >= l->paragraphs[pi].line_count)
@@ -273,9 +273,17 @@ static rmr_status caret(void* ctx, size_t pi, size_t li, size_t index,
   return RMR_OK;
 }
 
+static rmr_status caret(void* ctx, size_t pi, size_t li, size_t index,
+                        rmr_caret_offsets* out) {
+  rmr_linux_font_lock();
+  rmr_status status = caret_locked(ctx, pi, li, index, out);
+  rmr_linux_font_unlock();
+  return status;
+}
+
 /* Frees a layout together with its native Pango objects, retained paragraph
  * text, and font reference. A null layout is a no-op. */
-void rmr_linux_layout_free(rmr_linux_layout* l) {
+static void rmr_linux_layout_free_locked(rmr_linux_layout* l) {
   if (!l) return;
 
   for (size_t i = 0; i < l->anchors.count; i++) {
@@ -294,6 +302,12 @@ void rmr_linux_layout_free(rmr_linux_layout* l) {
   free(l->native);
   rmr_linux_fonts_free(l->fonts);
   free(l);
+}
+
+void rmr_linux_layout_free(rmr_linux_layout* l) {
+  rmr_linux_font_lock();
+  rmr_linux_layout_free_locked(l);
+  rmr_linux_font_unlock();
 }
 
 /* Returns the layout's accounted byte size, or zero for a null layout. */
@@ -575,10 +589,9 @@ done:
   return status;
 }
 
-rmr_status rmr_linux_layout_create(const rm_text_block* text, double page_width,
-                                   const rmr_linux_fonts* fonts,
-                                   const rmr_limits* given,
-                                   rmr_linux_layout** out, rmr_error* e) {
+static rmr_status rmr_linux_layout_create_locked(
+    const rm_text_block* text, double page_width, const rmr_linux_fonts* fonts,
+    const rmr_limits* given, rmr_linux_layout** out, rmr_error* e) {
   rmr_limits limits = given ? *given : rmr_limits_default();
   if (!text || !fonts || !out || (!text->paragraphs && text->paragraph_count) ||
       !isfinite(page_width) || page_width <= 0 || !isfinite(text->origin_x) ||
@@ -848,10 +861,23 @@ rmr_status rmr_linux_layout_create(const rm_text_block* text, double page_width,
   return RMR_OK;
 }
 
+rmr_status rmr_linux_layout_create(const rm_text_block* text, double page_width,
+                                   const rmr_linux_fonts* fonts,
+                                   const rmr_limits* given,
+                                   rmr_linux_layout** out, rmr_error* e) {
+  rmr_linux_font_lock();
+  rmr_status status =
+      rmr_linux_layout_create_locked(text, page_width, fonts, given, out, e);
+  rmr_linux_font_unlock();
+  return status;
+}
+
 /* Computes the visual start/end x and baseline of paragraph pi's line li,
  * accounting for RTL alignment within the column and trailing whitespace. */
-rmr_status rmr_linux_layout_line(const rmr_linux_layout* l, size_t pi,
-                                 size_t li, rmr_text_line* out, rmr_error* e) {
+static rmr_status rmr_linux_layout_line_locked(const rmr_linux_layout* l,
+                                               size_t pi, size_t li,
+                                               rmr_text_line* out,
+                                               rmr_error* e) {
   if (!l || !out || pi >= l->anchors.count ||
       li >= l->paragraphs[pi].line_count)
     return rmr_linux_error(e, RMR_ERR_INVALID_ARGUMENT,
@@ -873,6 +899,14 @@ rmr_status rmr_linux_layout_line(const rmr_linux_layout* l, size_t pi,
   *out = (rmr_text_line){pi,         v.location, v.location + v.length,
                          v.baseline, x,          x + width};
   return RMR_OK;
+}
+
+rmr_status rmr_linux_layout_line(const rmr_linux_layout* l, size_t pi,
+                                 size_t li, rmr_text_line* out, rmr_error* e) {
+  rmr_linux_font_lock();
+  rmr_status status = rmr_linux_layout_line_locked(l, pi, li, out, e);
+  rmr_linux_font_unlock();
+  return status;
 }
 
 typedef struct {
@@ -1020,10 +1054,9 @@ static rmr_status text_layer(const rmr_linux_layout* l, cairo_t* cr,
   return s;
 }
 
-rmr_status rmr_linux_layout_outline_plan(const rmr_linux_layout* l,
-                                         rmr_rect viewport,
-                                         const rmr_limits* given,
-                                         rmr_plan** out, rmr_error* e) {
+static rmr_status rmr_linux_layout_outline_plan_locked(
+    const rmr_linux_layout* l, rmr_rect viewport, const rmr_limits* given,
+    rmr_plan** out, rmr_error* e) {
   if (!l || !out)
     return rmr_linux_error(e, RMR_ERR_INVALID_ARGUMENT,
                            "missing layout/output");
@@ -1063,9 +1096,21 @@ rmr_status rmr_linux_layout_outline_plan(const rmr_linux_layout* l,
   return s;
 }
 
-rmr_status rmr_linux_layout_plan(const rmr_linux_layout* l, rmr_rect viewport,
-                                 const rmr_limits* given, rmr_plan** out,
-                                 rmr_error* e) {
+rmr_status rmr_linux_layout_outline_plan(const rmr_linux_layout* l,
+                                         rmr_rect viewport,
+                                         const rmr_limits* given,
+                                         rmr_plan** out, rmr_error* e) {
+  rmr_linux_font_lock();
+  rmr_status status =
+      rmr_linux_layout_outline_plan_locked(l, viewport, given, out, e);
+  rmr_linux_font_unlock();
+  return status;
+}
+
+static rmr_status rmr_linux_layout_plan_locked(const rmr_linux_layout* l,
+                                               rmr_rect viewport,
+                                               const rmr_limits* given,
+                                               rmr_plan** out, rmr_error* e) {
   if (!l || !out)
     return rmr_linux_error(e, RMR_ERR_INVALID_ARGUMENT,
                            "missing layout/output");
@@ -1126,13 +1171,23 @@ rmr_status rmr_linux_layout_plan(const rmr_linux_layout* l, rmr_rect viewport,
   return s == RMR_OK ? s : rmr_linux_error(e, s, "text PDF rendering failed");
 }
 
+rmr_status rmr_linux_layout_plan(const rmr_linux_layout* l, rmr_rect viewport,
+                                 const rmr_limits* given, rmr_plan** out,
+                                 rmr_error* e) {
+  rmr_linux_font_lock();
+  rmr_status status = rmr_linux_layout_plan_locked(l, viewport, given, out, e);
+  rmr_linux_font_unlock();
+  return status;
+}
+
 /* Measures the Pango-shaped width of text; when less_rightmost is set, the
  * advance of whichever glyph extends furthest to the right is excluded. */
-rmr_status rmr_linux_text_width(rm_str text, double size, rmr_type_face face,
-                                bool bold, bool italic, bool less_rightmost,
-                                const rmr_linux_fonts* fonts,
-                                const rmr_limits* given, double* out,
-                                rmr_error* e) {
+static rmr_status rmr_linux_text_width_locked(rm_str text, double size,
+                                              rmr_type_face face, bool bold,
+                                              bool italic, bool less_rightmost,
+                                              const rmr_linux_fonts* fonts,
+                                              const rmr_limits* given,
+                                              double* out, rmr_error* e) {
   rmr_limits l = given ? *given : rmr_limits_default();
   if (!fonts || !out || (!text.bytes && text.length) || !isfinite(size) ||
       size <= 0 || size > 100000 || face > RMR_FACE_SERIF)
@@ -1182,10 +1237,21 @@ rmr_status rmr_linux_text_width(rm_str text, double size, rmr_type_face face,
   return RMR_OK;
 }
 
-rmr_status rmr_linux_unreadable_plan(rmr_rect page, rmr_rect viewport,
-                                     const rmr_linux_fonts* fonts,
-                                     bool outlines, const rmr_limits* given,
-                                     rmr_plan** out, rmr_error* e) {
+rmr_status rmr_linux_text_width(rm_str text, double size, rmr_type_face face,
+                                bool bold, bool italic, bool less_rightmost,
+                                const rmr_linux_fonts* fonts,
+                                const rmr_limits* given, double* out,
+                                rmr_error* e) {
+  rmr_linux_font_lock();
+  rmr_status status = rmr_linux_text_width_locked(
+      text, size, face, bold, italic, less_rightmost, fonts, given, out, e);
+  rmr_linux_font_unlock();
+  return status;
+}
+
+static rmr_status rmr_linux_unreadable_plan_locked(
+    rmr_rect page, rmr_rect viewport, const rmr_linux_fonts* fonts,
+    bool outlines, const rmr_limits* given, rmr_plan** out, rmr_error* e) {
   if (!out)
     return rmr_linux_error(e, RMR_ERR_INVALID_ARGUMENT, "missing label output");
   rmr_limits limits = given ? *given : rmr_limits_default();
@@ -1279,4 +1345,15 @@ rmr_status rmr_linux_unreadable_plan(rmr_rect page, rmr_rect viewport,
   rmr_path_free(&glyphs);
   rmr_buffer_free(&output.sink.data);
   return s;
+}
+
+rmr_status rmr_linux_unreadable_plan(rmr_rect page, rmr_rect viewport,
+                                     const rmr_linux_fonts* fonts,
+                                     bool outlines, const rmr_limits* given,
+                                     rmr_plan** out, rmr_error* e) {
+  rmr_linux_font_lock();
+  rmr_status status = rmr_linux_unreadable_plan_locked(page, viewport, fonts,
+                                                       outlines, given, out, e);
+  rmr_linux_font_unlock();
+  return status;
 }

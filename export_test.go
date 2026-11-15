@@ -25,3 +25,9 @@ const OutputPiece = outputPiece
 
 // LiveHandles answers how many calls still hold a C callback handle.
 func LiveHandles() int64 { return liveHandles.Load() }
+
+// LiveDocuments and LiveFonts answer how many C documents and font sets have
+// not yet been released.
+func LiveDocuments() int64 { return liveDocuments.Load() }
+
+func LiveFonts() int64 { return liveFonts.Load() }

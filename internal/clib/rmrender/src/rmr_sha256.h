@@ -152,9 +152,10 @@ static inline rmr_sha256_digest rmr_sha256_final(rmr_sha256* h) {
   rmr_sha256_update(h, &pad, 1);
   pad = 0;
   while (h->used != 56) rmr_sha256_update(h, &pad, 1);
-  uint8_t tail[8];
-  for (unsigned i = 0; i < 8; i++) tail[i] = (uint8_t)(bits >> (56 - 8 * i));
-  rmr_sha256_update(h, tail, sizeof tail);
+  /* The length fills the block's last eight bytes. */
+  for (unsigned i = 0; i < 8; i++)
+    h->block[56 + i] = (uint8_t)(bits >> (56 - 8 * i));
+  rmr_sha256_blocks(h->state, h->block, 1);
   rmr_sha256_digest d;
   for (unsigned i = 0; i < 8; i++)
     for (unsigned k = 0; k < 4; k++)

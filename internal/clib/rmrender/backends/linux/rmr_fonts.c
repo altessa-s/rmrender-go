@@ -741,7 +741,7 @@ static_assert(sizeof names / sizeof *names ==
 
 /* Releases fonts once its reference count reaches zero, shutting down the
  * font map and closing all font file descriptors. */
-void rmr_linux_fonts_free(rmr_linux_fonts* f) {
+static void rmr_linux_fonts_free_locked(rmr_linux_fonts* f) {
   if (!f || atomic_fetch_sub(&f->references, 1) != 1) return;
 
   if (f->map) {
@@ -773,6 +773,12 @@ void rmr_linux_fonts_free(rmr_linux_fonts* f) {
   }
 
   free(f);
+}
+
+void rmr_linux_fonts_free(rmr_linux_fonts* f) {
+  rmr_linux_font_lock();
+  rmr_linux_fonts_free_locked(f);
+  rmr_linux_font_unlock();
 }
 
 /* Points Fontconfig's default configuration at an empty one, once per
@@ -828,16 +834,11 @@ static void default_config(const char* cache, FcConfig* config) {
   g_once_init_leave(&initialized, 1);
 }
 
-/* Builds a private Fontconfig/Pango font map from resolve's bundled fonts,
+/* Builds a private Fontconfig/Pango font map from the gathered font bytes,
  * including per-face base-character sets used to pick calibration script. */
-rmr_status rmr_linux_fonts_create(rmr_font_resolve_fn resolve, void* context,
-                                  const rmr_limits* given,
-                                  rmr_linux_fonts** out, rmr_error* e) {
-  if (!resolve || !out)
-    return rmr_linux_error(e, RMR_ERR_INVALID_ARGUMENT,
-                           "missing font resolver/output");
-
-  rmr_limits l = given ? *given : rmr_limits_default();
+static rmr_status rmr_linux_fonts_create_locked(const rmr_buffer* bytes,
+                                                rmr_linux_fonts** out,
+                                                rmr_error* e) {
   rmr_linux_fonts* f = calloc(1, sizeof *f);
   if (!f) return rmr_linux_error(e, RMR_ERR_OUT_OF_MEMORY, "font allocation");
   atomic_init(&f->references, 1);
@@ -871,28 +872,9 @@ rmr_status rmr_linux_fonts_create(rmr_font_resolve_fn resolve, void* context,
   if (s == RMR_OK) default_config(nullptr, f->config);
 #endif
 
-  size_t total = 0;
   for (size_t i = 0; i < sizeof names / sizeof *names && s == RMR_OK; i++) {
-    rmr_asset_view v = {0};
-    s = resolve(context, names[i], &v);
-    /* Optional for existing resolvers and resource directories. Other
-     * errors, including malformed or oversized fonts, remain failures. */
-    if (i == 13 &&
-        (s == RMR_ERR_UNSUPPORTED || (s == RMR_OK && !v.bytes && !v.size))) {
-      s = RMR_OK;
-      continue;
-    }
-
-    if (s != RMR_OK) break;
-    if (!v.bytes || !v.size) {
-      s = RMR_ERR_UNSUPPORTED;
-      break;
-    }
-    if (v.size > l.maximum_plan_bytes - total || v.size > PTRDIFF_MAX) {
-      s = RMR_ERR_LIMIT;
-      break;
-    }
-    total += v.size;
+    rmr_asset_view v = {bytes[i].bytes, bytes[i].size};
+    if (!v.size) continue;
 
 #ifdef _WIN32
     /* Fontconfig reopens files lazily and FreeType keeps them mapped, so a
@@ -1010,6 +992,57 @@ rmr_status rmr_linux_fonts_create(rmr_font_resolve_fn resolve, void* context,
 
   *out = f;
   return RMR_OK;
+}
+
+rmr_status rmr_linux_fonts_create(rmr_font_resolve_fn resolve, void* context,
+                                  const rmr_limits* given,
+                                  rmr_linux_fonts** out, rmr_error* e) {
+  if (!resolve || !out)
+    return rmr_linux_error(e, RMR_ERR_INVALID_ARGUMENT,
+                           "missing font resolver/output");
+
+  rmr_limits l = given ? *given : rmr_limits_default();
+  rmr_buffer bytes[sizeof names / sizeof *names] = {0};
+  size_t total = 0;
+  rmr_status status = RMR_OK;
+  /* Host callbacks can wait for other text callers. Gather their bytes
+   * before locking, copying each view before the next callback can reuse it. */
+  for (size_t i = 0; i < sizeof names / sizeof *names; i++) {
+    rmr_asset_view v = {0};
+    status = resolve(context, names[i], &v);
+    /* Emoji remains optional; malformed or oversized resources do not. */
+    if (i == 13 && (status == RMR_ERR_UNSUPPORTED ||
+                    (status == RMR_OK && !v.bytes && !v.size))) {
+      status = RMR_OK;
+      continue;
+    }
+    if (status != RMR_OK) break;
+    if (!v.bytes || !v.size) {
+      status = RMR_ERR_UNSUPPORTED;
+      break;
+    }
+    if (v.size > l.maximum_plan_bytes - total || v.size > PTRDIFF_MAX) {
+      status = RMR_ERR_LIMIT;
+      break;
+    }
+    bytes[i].bytes = malloc(v.size);
+    if (!bytes[i].bytes) {
+      status = RMR_ERR_OUT_OF_MEMORY;
+      break;
+    }
+    memcpy(bytes[i].bytes, v.bytes, v.size);
+    bytes[i].size = v.size;
+    total += v.size;
+  }
+  if (status == RMR_OK) {
+    rmr_linux_font_lock();
+    status = rmr_linux_fonts_create_locked(bytes, out, e);
+    rmr_linux_font_unlock();
+  } else
+    rmr_linux_error(e, status, "font resources could not be loaded");
+  for (size_t i = 0; i < sizeof names / sizeof *names; i++)
+    rmr_buffer_free(&bytes[i]);
+  return status;
 }
 
 #include "../../adapters/rmr_files.h"

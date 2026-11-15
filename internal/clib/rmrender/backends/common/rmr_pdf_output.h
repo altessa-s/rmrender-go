@@ -20,19 +20,23 @@ static inline bool rmr_output_valid(const rmr_output* output) {
          output->write;
 }
 
-/* The caller's output and how its last write went. */
+/* The caller's output and how its last write went. Once closed, the export
+ * has decided to fail: it may still finish pages already under way to learn
+ * which failure came first, but nothing more reaches the caller. */
 typedef struct {
   const rmr_output* given;
   rmr_status status;
+  bool closed;
   rmr_output output; /* Writes through rmr_output_guarded_write. */
 } rmr_output_guard;
 
 /* rmr_output write passing bytes on to the guarded output while it has not
- * failed, remembering its failure. */
+ * failed, remembering its failure; dropping them once the guard is closed. */
 static inline rmr_status rmr_output_guarded_write(void* context,
                                                   const uint8_t* bytes,
                                                   size_t size) {
   rmr_output_guard* g = context;
+  if (g->closed) return g->status;
   if (g->status == RMR_OK)
     g->status = g->given->write(g->given->context, bytes, size);
   return g->status;

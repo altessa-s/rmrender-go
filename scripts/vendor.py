@@ -23,8 +23,10 @@ It then writes, in the package directory:
 * one clib_<library>_<name>.c per vendored C source, which compiles it into
   the package (cgo builds only the C files of the package directory), with
   the build constraint of its backend;
-* clib_digest.h, a digest of internal/clib, which every wrapper includes so
-  that a change down there rebuilds the package;
+* clib_digest.h, the versions vendored and a digest of internal/clib, which
+  TestVendoredDigest recomputes from the committed tree, so that a hand edit
+  or a partial update of the vendored sources fails a test instead of
+  shipping unnoticed;
 * clib_symbols.h, which renames every external symbol of the vendored code
   with the rmrgo_ prefix. clib_prelude.h includes it, and cgo force-includes
   the prelude into every C file of the package, so this module links beside
@@ -287,9 +289,9 @@ def digest(stage, version_lines):
 // A digest of every file under internal/clib, which holds:
 //
 {versions}//
-// Each clib_*.c includes this file, so a change to the vendored sources
-// changes a file in the package directory, which is what Go's build cache
-// tracks.
+// TestVendoredDigest recomputes the digest from the committed tree, so that a
+// hand edit or a partial update of the vendored sources fails a test instead
+// of shipping unnoticed.
 
 #ifndef RMRENDER_GO_CLIB_DIGEST_H
 #define RMRENDER_GO_CLIB_DIGEST_H

@@ -1449,7 +1449,7 @@ static void drain(writer* w) {
 static void put(writer* w, const void* bytes, size_t n) {
   if (w->j->status != RMR_OK || !n) return;
   if (n > w->j->limits.maximum_pdf_bytes - position(w)) {
-    stop(w->j, RMR_ERR_LIMIT, "PDF output size limit");
+    stop(w->j, RMR_ERR_LIMIT, "PDF output byte limit");
     return;
   }
 
@@ -2077,6 +2077,127 @@ rmr_status rmr_pdf_pages(const uint8_t* source, size_t size,
              ? RMR_OK
              : rmr_fail(error, j.status, 0,
                         j.reason ? j.reason : "PDF inspection failed");
+}
+
+/* A hash set of resolved outline dictionaries. Including the /Outlines
+ * root makes a link back to it a cycle before it can count as an entry. */
+typedef struct {
+  node** slots;
+  size_t capacity, count;
+} outline_seen;
+
+/* Records n, false on a repeat or an allocation failure. */
+static bool outline_visit(outline_seen* seen, node* n, rmr_status* status) {
+  if (2 * (seen->count + 1) > seen->capacity) {
+    size_t capacity = seen->capacity ? 2 * seen->capacity : 64;
+    node** slots = calloc(capacity, sizeof *slots);
+    if (!slots) {
+      *status = RMR_ERR_OUT_OF_MEMORY;
+      return false;
+    }
+    for (size_t i = 0; i < seen->capacity; i++)
+      if (seen->slots[i]) {
+        size_t k = ((uint64_t)(uintptr_t)seen->slots[i] *
+                        UINT64_C(0x9e3779b97f4a7c15) >>
+                    32) &
+                   (capacity - 1);
+        while (slots[k]) k = (k + 1) & (capacity - 1);
+        slots[k] = seen->slots[i];
+      }
+    free(seen->slots);
+    seen->slots = slots;
+    seen->capacity = capacity;
+  }
+  size_t k = ((uint64_t)(uintptr_t)n * UINT64_C(0x9e3779b97f4a7c15) >> 32) &
+             (seen->capacity - 1);
+  for (; seen->slots[k]; k = (k + 1) & (seen->capacity - 1))
+    if (seen->slots[k] == n) return false;
+  seen->slots[k] = n;
+  seen->count++;
+  return true;
+}
+
+/* Resolves an outline link, ignoring missing or non-dictionary values as
+ * the native readers do. Parser errors remain in the job. */
+static node* outline_dictionary(file* f, node* value) {
+  node* n = resolve(f, value, 0);
+  return n && n->type == DICT ? n : nullptr;
+}
+
+rmr_status rmr_pdf_outline_shape(const uint8_t* pdf, size_t size,
+                                 const rmr_limits* limits, bool* usable,
+                                 size_t* entries) {
+  job j = {.limits = *limits};
+  /* As with native bookmark parsing, scratch and syntax depth bound the
+   * parser; only visited outline dictionaries consume the walk's work. */
+  j.limits.maximum_elements = SIZE_MAX;
+  file f;
+  *usable = false;
+  *entries = 0;
+  if (!open_file(&f, &j, pdf, size)) {
+    release(&j);
+    return j.status;
+  }
+  node* root = outline_dictionary(&f, get(f.root, "Outlines"));
+  typedef struct {
+    node* entry;
+    size_t depth;
+  } pending;
+  pending* stack = nullptr;
+  size_t height = 0, room = 0, work = 0;
+  outline_seen seen = {0};
+  rmr_status status = j.status;
+  bool cyclic = false;
+  if (root && status == RMR_OK) {
+    (void)outline_visit(&seen, root, &status);
+    node* first = outline_dictionary(&f, get(root, "First"));
+    if (first && status == RMR_OK) {
+      room = 16;
+      stack = malloc(room * sizeof *stack);
+      if (!stack)
+        status = RMR_ERR_OUT_OF_MEMORY;
+      else
+        stack[height++] = (pending){first, 0};
+    }
+  }
+  /* Depth first, children before siblings: the first loop or bound met
+   * decides. This budget is independent of source parsing and the native
+   * link and destination collection. */
+  while (status == RMR_OK && j.status == RMR_OK && height) {
+    pending p = stack[--height];
+    if (++work > limits->maximum_elements) {
+      status = RMR_ERR_LIMIT;
+      break;
+    }
+    if (!outline_visit(&seen, p.entry, &status)) {
+      cyclic = status == RMR_OK;
+      break;
+    }
+    if (seen.count - 1 > 65536 || p.depth > 128) {
+      status = RMR_ERR_LIMIT;
+      break;
+    }
+    if (height + 2 > room) {
+      pending* grown = realloc(stack, 2 * room * sizeof *stack);
+      if (!grown) {
+        status = RMR_ERR_OUT_OF_MEMORY;
+        break;
+      }
+      stack = grown;
+      room *= 2;
+    }
+    node* next = outline_dictionary(&f, get(p.entry, "Next"));
+    node* child = outline_dictionary(&f, get(p.entry, "First"));
+    if (next) stack[height++] = (pending){next, p.depth};
+    if (child) stack[height++] = (pending){child, p.depth + 1};
+  }
+  if (status == RMR_OK) status = j.status;
+  *usable = status == RMR_OK && !cyclic;
+  if (*usable && seen.count) *entries = seen.count - 1;
+  free(stack);
+  free(seen.slots);
+  release(&j);
+  return status;
 }
 
 /* Writes t applied to p as two PDF numbers, each followed by a space. */

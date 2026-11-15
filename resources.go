@@ -12,7 +12,6 @@ import "C"
 import (
 	"embed"
 	"io/fs"
-	"sync"
 )
 
 // Fonts lay out typed text with the bundled open fonts: Noto Sans in four
@@ -20,11 +19,14 @@ import (
 // Korean and Thai, and, optionally, Noto Emoji. They are never registered
 // with the system and no other font is substituted for a missing one.
 //
-// A Fonts serves one call at a time: calls that share one take turns. Close
-// it to release its native fonts; it has no finalizer.
+// A Fonts serves one call at a time: calls that share one take turns, and a
+// call made while another uses the fonts waits for it, until its context
+// ends; a call that takes no context waits as long as it takes. Close it to
+// release its native fonts; it has no finalizer.
 type Fonts struct {
-	mu sync.Mutex
-	c  *C.rmrgo_fonts
+	owner owner
+	// c is read only by a call that has borrowed it from owner.
+	c *C.rmrgo_fonts
 }
 
 // NewFonts loads the fonts from fsys, which holds them as <name>.ttf at its
@@ -38,6 +40,11 @@ type Fonts struct {
 // Resource reads run on a separate goroutine, synchronously with this call.
 // A panic or runtime.Goexit stops C; after its memory and callback state are
 // released, the calling goroutine panics or exits, running its defers.
+//
+// NewFonts borrows no Document and no Fonts, so fsys may call into this
+// package, Close included, and draw anything. Called itself from a callback
+// of another call, as from a template read, NewFonts is bound by what that
+// callback may do, and its fsys with it.
 func NewFonts(fsys fs.FS) (*Fonts, error) {
 	if fsys == nil {
 		return nil, errInvalid("no font files")
@@ -52,17 +59,24 @@ func NewFonts(fsys fs.FS) (*Fonts, error) {
 	if err := c.errorOf(status, &cerr); err != nil {
 		return nil, err
 	}
-	return &Fonts{c: out}, nil
+	f := &Fonts{c: out}
+	liveFonts.Add(1)
+	f.owner.hold(func() {
+		C.rmrgo_fonts_free(f.c)
+		f.c = nil
+		liveFonts.Add(-1)
+	})
+	return f, nil
 }
 
-// Close releases the native fonts, after any call using them has finished.
-// A closed Fonts makes a call fail with StatusInvalidArgument; closing it
-// again does nothing.
+// Close releases the native fonts. It returns at once, even while a call
+// uses them, and from a callback of that call too: the fonts are then
+// released when that call finishes, after it has released its callback
+// state, so their memory may outlive Close. A closed Fonts makes a call fail
+// with StatusInvalidArgument, a call that was waiting for its turn too;
+// closing it again does nothing.
 func (f *Fonts) Close() error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	C.rmrgo_fonts_free(f.c)
-	f.c = nil
+	f.owner.close()
 	return nil
 }
 
@@ -98,6 +112,14 @@ type Templates struct {
 // on a separate goroutine, synchronously with the render or export using
 // them; a panic or runtime.Goexit stops C and is raised again on the calling
 // goroutine after cleanup.
+//
+// A read may close the Document or the Fonts of the call it serves, or any
+// other, and may draw a different document, or a lone page, without that
+// call's Fonts. It must not draw the call's own document, nor with the
+// call's Fonts: such a call waits for the call it serves, which waits for
+// the read, so it ends only when its own context does, with that context's
+// error, and one that takes no context only when what it waits for is
+// closed.
 func NewTemplates(layers ...fs.FS) *Templates {
 	t := &Templates{}
 	for _, l := range layers {

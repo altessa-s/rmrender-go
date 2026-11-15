@@ -284,13 +284,15 @@ whether one page parses, with the error a strict drawing of it fails with. A pag
 bound fails the call whatever the option says.
 
 `WritePDF` writes the same file to an `io.Writer` as it is produced instead of answering it whole, so a long document's PDF need not fit in
-memory twice, or at all: the bytes are those of `PDF`, handed to the writer in order in pieces of at most 4 MiB, on a separate goroutine synchronously with the export. A
-fresh export writes each page as it is finished; a preserving one writes the imported PDF and then the update, and a recomposed one its
-final rewrite, as they go. `Limits.MaximumPDFBytes` still bounds the file, 256 MiB by default: raise it for larger ones. The writer's
-failure stops the export with `StatusBackend` and the writer's error as its cause; on any failure the writer has received part of a file,
-so write to a temporary file and rename it once `WritePDF` succeeds. A panic or `runtime.Goexit` in the writer stops C and is raised again
-on the calling goroutine after cleanup, running its deferred functions. The worker does not inherit goroutine-bound state such as
-`runtime.LockOSThread`.
+memory twice, or at all: the bytes are those of `PDF`, in order, on a separate goroutine synchronously with the export. The export gathers
+what it has finished and hands it on about 4 MiB at a time, never more than 4 MiB in one `Write`: a file smaller than that reaches the
+writer in one piece when the export ends, and a larger one in pieces of about 4 MiB as its pages are drawn, a 30 MB file in eight. A
+preserving export writes the imported PDF and then the update, and a recomposed one its final rewrite. `Limits.MaximumPDFBytes` still bounds
+the file, 256 MiB by default: raise it for larger ones. The writer's failure stops the export with `StatusBackend` and the writer's error as
+its cause; on any failure, cancellation included, the writer has received part of a file, so write to a temporary file and rename it once
+`WritePDF` succeeds. The context is checked while pages are drawn: one that ends while the writer receives the end of the file leaves it
+whole, and `WritePDF` answers no error. A panic or `runtime.Goexit` in the writer stops C and is raised again on the calling goroutine after
+cleanup, running its deferred functions. The worker does not inherit goroutine-bound state such as `runtime.LockOSThread`.
 
 ```go
 data, err := os.ReadFile("testdata/pages/Notes.rmdoc")
@@ -467,9 +469,18 @@ fails with `StatusLimit`.
 released before the call returns. `Fonts` and `Document` are handles because the C library keeps the loaded fonts and the unpacked archive
 between calls; both must be closed, and neither has a finalizer.
 
-**One call at a time per font set.** rmrender-lib's fonts and the layouts made with them serve one thread at a time, so a `Fonts` holds a lock
-for the length of every call that uses it, and `Close` waits for those in flight. Calls with different `Fonts` run in parallel. The calls of one
-`Document` take turns the same way. `Templates` are read only and may be shared. PDFium is process-wide; the C library serializes its use.
+**One call at a time per font set.** rmrender-lib's fonts and the layouts made with them serve one thread at a time, so the calls that use one
+`Fonts` take turns, each holding it for its length. Calls with different `Fonts` run in parallel. The calls of one `Document` take turns the
+same way. A call waiting for its turn stops waiting when its context ends, with the context's error; the calls that take no context,
+`CheckPage` and `PageMarks`, wait as long as it takes. `Close` does not wait: it returns at once, and the C memory of a `Fonts` or `Document`
+a call is using is released when that call finishes, so it may outlive `Close`; calls after it, and those waiting for their turn, fail with
+`StatusInvalidArgument`. `Templates` are read only and may be shared. PDFium is process-wide; the C library serializes its use.
+
+**What a callback may call.** A template or image read, or the writer of `WritePDF`, runs while its call holds its `Document` and its `Fonts`.
+It may `Close` either, or any other, and may draw a different document, or a lone page, without that call's `Fonts`. It must not draw the
+call's own document, nor with the call's `Fonts`: such a call waits for the call it serves, which waits for the callback, so it ends only when
+its own context does, with that context's error, and one that takes no context only when what it waits for is closed. The font reads of
+`NewFonts` hold neither.
 
 **Resources through `fs.FS`, never through paths.** Fonts, templates and images reach C through callbacks: a `runtime/cgo.Handle` carried as an
 integer, and exported Go functions that read the file and lend its bytes to C, pinned with `runtime.Pinner` until the call returns. A read
@@ -484,9 +495,10 @@ library polls between draw operations.
 
 **One program, four libraries twice.** rmlines-go, rmdoc-go and rmmarks-go compile the same C libraries under their own names, and a program
 may import them beside this package. Every external symbol of the vendored C is renamed to `rmrgo_<name>` by `clib_symbols.h`, which
-`clib_prelude.h` includes and cgo force-includes into every C file of the package, so the sources stay byte for byte as vendored. A test reads
-the test binary's symbol table and fails on any name left unprefixed; `internal/coexist`, a module of its own, links all four packages into one
-test binary.
+`clib_prelude.h` includes and cgo force-includes into every C file of the package, so the sources stay byte for byte as vendored. A test builds
+an unstripped test binary, reads its symbol table and fails on any name left unprefixed, external or hidden; `internal/coexist`, a module of
+its own, links all four packages into one test binary. Another test recomputes the digest of the vendored tree recorded in `clib_digest.h` beside the
+upstream versions, so a hand edit or a partial update of the vendored sources fails it instead of shipping unnoticed.
 
 **The library's own pipeline.** A page of a document is laid out as rmrender-lib's document export lays it out, page by page, so the PNG of a
 page is the page of the PDF. A lone `.rm` page is laid out the same way, with the edge mode and template it is given. SVG output takes the
@@ -500,12 +512,13 @@ same bytes.
 | `*.go` | The API: `page.go`, `document.go`, `marks.go`, `resources.go` (fonts and templates), `options.go`, `errors.go`, `render.go` (locking and cancellation), `callbacks.go` (the exported callbacks), `memory.go`, `cgo.go` |
 | `bridge.c`, `bridge.h` | The C side: the backend chosen at build time behind one set of names, the callbacks into Go, and the page and document pipelines |
 | `clib_*.c` | One include each, compiling a vendored C source into the package with its backend's build constraint: cgo builds only the C files of the package directory |
-| `clib_prelude.h`, `clib_symbols.h`, `clib_digest.h` | The force-included prelude; generated, the symbol renames and a digest of `internal/clib`, so that a change there rebuilds the package |
+| `clib_prelude.h`, `clib_symbols.h`, `clib_digest.h` | The force-included prelude; generated, the symbol renames and a digest of `internal/clib`, which a test holds the vendored tree to |
 | `fonts/` | Package `fonts`: the bundled Noto and EB Garamond fonts with their OFL texts, embedded |
 | `internal/clib/` | The vendored libraries, `rmrender/`, `rmlines/`, `rmdoc/` and `rmmarks/`, each with its sources, headers, licence and notices, and the commit of each in `VERSION`; rmrender-lib's templates and `fetch-pdfium.py` |
-| `internal/coexist/` | A module of its own that links this package with rmlines-go, rmdoc-go and rmmarks-go |
+| `internal/coexist/` | A module of its own that links this package with rmlines-go, rmdoc-go and rmmarks-go; `authored/` writes the pages of `testdata/authored/` with rmlines-go |
 | `scripts/vendor.py` | Re-vendors the four libraries from their checkouts and regenerates the wrappers and headers |
 | `testdata/pages/` | Sample `.rm` pages and a `.rmdoc` built from them, with their licence |
+| `testdata/authored/` | Pages written for the tests with rmlines-go's writer, such as one that places an image |
 
 The script reads the PDFium headers of the SDK rmrender-lib pins: it fetches that SDK once, checksum-verified, into the user's cache
 directory, and `--pdfium` names one already on disk.

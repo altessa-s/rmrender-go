@@ -52,8 +52,12 @@
 // Results are Go values, copied out of C memory before a call returns. A
 // [Fonts] and a [Document] own C memory until they are closed, and have no
 // finalizer. A Fonts serves one call at a time, as the C library requires,
-// so calls that share one take turns; so do the calls of one Document.
-// [Templates] are read only and may be shared freely. The Cairo backend's
-// PDFium is process-wide; the C library serializes its use and keeps it for
-// the life of the process.
+// so calls that share one take turns; so do the calls of one Document. A
+// call waiting for its turn stops when its context ends. Close returns at
+// once; a call in flight releases the memory when it finishes. A callback
+// may close a Fonts or a Document, but drawing its own call's document, or
+// with its own call's Fonts, waits for that call and ends only with the
+// context: see [Document.WritePDF]. [Templates] are read only and may be
+// shared freely. The Cairo backend's PDFium is process-wide; the C library
+// serializes its use and keeps it for the life of the process.
 package rmrender
