@@ -1094,6 +1094,10 @@ size_t rmr_apple_writer_pending(const rmr_apple_writer* w) {
   return rmr_pdf_pipeline_pending(w->pipeline);
 }
 
+size_t rmr_apple_writer_watermark(rmr_apple_writer* w, size_t submitted) {
+  return rmr_pdf_pipeline_watermark(w->pipeline, submitted);
+}
+
 /* Moves serialized batches into the builder, oldest first: every pending one
  * when all is set, otherwise those ready, waiting only while more than the
  * window are queued. */
@@ -1319,6 +1323,7 @@ rmr_status rmr_apple_writer_page(rmr_apple_writer* w, size_t index,
                              .space_count = spaces ? 1 : 0,
                              .before = before};
   p.s.xobjects = p.s.states = nullptr;
+  p.batch->tag = index;
   rmr_pdf_pipeline_submit(w->pipeline, p.batch);
   p.batch = nullptr;
   page_free(&p);

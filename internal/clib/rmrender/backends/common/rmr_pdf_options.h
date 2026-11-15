@@ -38,6 +38,11 @@ static inline bool rmr_pdf_options_read(const rmr_pdf_options* given,
     out->on_unreadable = given->on_unreadable;
     out->unreadable_context = given->unreadable_context;
   }
+  if (given->struct_size >= offsetof(rmr_pdf_options, progress_context) +
+                                sizeof given->progress_context) {
+    out->progress = given->progress;
+    out->progress_context = given->progress_context;
+  }
   return true;
 }
 

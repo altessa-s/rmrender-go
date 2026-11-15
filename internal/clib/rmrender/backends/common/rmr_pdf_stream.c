@@ -497,6 +497,13 @@ size_t rmr_pdf_pipeline_pending(const rmr_pdf_pipeline* p) {
   return p->pending;
 }
 
+size_t rmr_pdf_pipeline_watermark(rmr_pdf_pipeline* p, size_t submitted) {
+  pthread_mutex_lock(&p->lock);
+  size_t watermark = p->head ? p->head->tag : submitted;
+  pthread_mutex_unlock(&p->lock);
+  return watermark;
+}
+
 rmr_pdf_batch* rmr_pdf_pipeline_next(rmr_pdf_pipeline* p, bool wait) {
   pthread_mutex_lock(&p->lock);
   rmr_pdf_batch* b = p->head;

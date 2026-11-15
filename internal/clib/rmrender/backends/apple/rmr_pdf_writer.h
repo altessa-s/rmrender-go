@@ -73,6 +73,8 @@ bool rmr_apple_writer_mask(void* context, const rmr_mask_view* mask,
 
 /* Batches queued and not yet taken back. */
 size_t rmr_apple_writer_pending(const rmr_apple_writer* w);
+/* Pages before this index have no pending writer batches. */
+size_t rmr_apple_writer_watermark(rmr_apple_writer* w, size_t submitted);
 
 /* Merged documents: appends the deflated pages to the document, waiting for
  * all of them when all is set, otherwise only while too many are queued. A
