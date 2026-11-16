@@ -65,6 +65,16 @@ func cVersion() string {
 	return C.GoString(C.rmr_version())
 }
 
+// optionsProgress inspects both sides of the progress wiring without
+// invoking a callback. cgo is unavailable in _test.go files.
+func optionsProgress(o *Options) (request, callback bool, err error) {
+	r, err := o.request()
+	if err != nil {
+		return false, false, err
+	}
+	return bool(r.progress), bool(C.rmrgo_progress_enabled(&r)), nil
+}
+
 // pdfPageCount answers how many pages the PDF data has, read by the C
 // library's own PDF parser, so that tests need no other.
 func pdfPageCount(data []byte) (int, error) {

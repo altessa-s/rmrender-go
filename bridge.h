@@ -65,6 +65,9 @@ typedef struct {
     void *cancel;
 } rmrgo_request;
 
+// Inspect the same document options used by the exports, for binding tests.
+bool rmrgo_progress_enabled(const rmrgo_request *request);
+
 // A parsed .rm page, with the template name set when one is given.
 rmr_status rmrgo_page_parse(const uint8_t *bytes, size_t size, const char *template_name,
                             rm_page **out, rmr_error *error);
