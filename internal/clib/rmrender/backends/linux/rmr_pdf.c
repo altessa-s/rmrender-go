@@ -225,6 +225,7 @@ rmr_status rmr_linux_pdf_update_marks(
     if (s != RMR_OK) break;
     if (!rmr_plan_count(plan)) {
       rmr_pdf_marks_release(marks, i);
+      rmr_pdf_marks_progress(marks, i + 1, count);
       continue;
     }
     rmr_transform t = inverse(placement(source->geometry[i], p));
@@ -252,6 +253,7 @@ rmr_status rmr_linux_pdf_update_marks(
     s = rmr_pdf_update_page(update, &overlay, 1, e);
     reported = s != RMR_OK;
     rmr_buffer_free(&pdf);
+    if (s == RMR_OK) rmr_pdf_marks_progress(marks, i + 1, count);
   }
 
   if (s == RMR_OK) {
@@ -649,7 +651,9 @@ rmr_status rmr_linux_pdf_overlay_marks(
     if (!rmr_pdf_builder_pages(builder, count)) s = RMR_ERR_LIMIT;
   }
   if (s == RMR_OK) {
-    s = rmr_linux_parts_create(builder, compose_page, &k, &parts);
+    s = rmr_linux_parts_create(
+        builder, compose_page, &k, provider ? provider->progress : nullptr,
+        provider ? provider->progress_context : nullptr, count, &parts);
     if (s != RMR_OK) rmr_linux_error(&why, s, RMR_LINUX_ALLOCATION);
   }
 
@@ -795,6 +799,7 @@ rmr_status rmr_linux_pdf_overlay_marks(
   if (drawn && s != RMR_OK && s != RMR_ERR_CANCELLED) {
     rmr_error earlier = {0};
     guard.closed = true;
+    rmr_linux_parts_stop_progress(parts);
     rmr_status first = rmr_linux_parts_collect(parts, true, &earlier);
     if (first != RMR_OK) {
       s = first;

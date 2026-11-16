@@ -56,12 +56,22 @@ import "C"
 import "unsafe"
 
 // Version is the version of the vendored rmrender-lib.
-const Version = "1.5.2"
+const Version = "1.6.0"
 
 // cVersion answers the C library's own version, so that a test can hold
 // [Version] to it.
 func cVersion() string {
 	return C.GoString(C.rmr_version())
+}
+
+// optionsProgress inspects both sides of the progress wiring without
+// invoking a callback. cgo is unavailable in _test.go files.
+func optionsProgress(o *Options) (request, callback bool, err error) {
+	r, err := o.request()
+	if err != nil {
+		return false, false, err
+	}
+	return bool(r.progress), bool(C.rmrgo_progress_enabled(&r)), nil
 }
 
 // pdfPageCount answers how many pages the PDF data has, read by the C

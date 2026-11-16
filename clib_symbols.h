@@ -10,7 +10,7 @@
 // alike, so that the C names stay as written and the linker sees only the
 // prefixed ones: rmlines-go, rmdoc-go and rmmarks-go compile the same
 // libraries under their own names, and one program may link them all.
-// 577 symbols, read with nm from objects of both backends; Windows
+// 580 symbols, read with nm from objects of both backends; Windows
 // compiles the Cairo backend's sources, and its _WIN32 branches add no other.
 
 #ifndef RMRENDER_GO_CLIB_SYMBOLS_H
@@ -329,6 +329,7 @@
 #define rmr_apple_writer_pages rmrgo_rmr_apple_writer_pages
 #define rmr_apple_writer_pending rmrgo_rmr_apple_writer_pending
 #define rmr_apple_writer_split rmrgo_rmr_apple_writer_split
+#define rmr_apple_writer_watermark rmrgo_rmr_apple_writer_watermark
 #define rmr_archive_document_canvas rmrgo_rmr_archive_document_canvas
 #define rmr_archive_document_count rmrgo_rmr_archive_document_count
 #define rmr_archive_document_create rmrgo_rmr_archive_document_create
@@ -435,6 +436,7 @@
 #define rmr_linux_parts_create rmrgo_rmr_linux_parts_create
 #define rmr_linux_parts_draw rmrgo_rmr_linux_parts_draw
 #define rmr_linux_parts_free rmrgo_rmr_linux_parts_free
+#define rmr_linux_parts_stop_progress rmrgo_rmr_linux_parts_stop_progress
 #define rmr_linux_path_capture rmrgo_rmr_linux_path_capture
 #define rmr_linux_pdf rmrgo_rmr_linux_pdf
 #define rmr_linux_pdf_incremental rmrgo_rmr_linux_pdf_incremental
@@ -520,6 +522,7 @@
 #define rmr_pdf_pipeline_next rmrgo_rmr_pdf_pipeline_next
 #define rmr_pdf_pipeline_pending rmrgo_rmr_pdf_pipeline_pending
 #define rmr_pdf_pipeline_submit rmrgo_rmr_pdf_pipeline_submit
+#define rmr_pdf_pipeline_watermark rmrgo_rmr_pdf_pipeline_watermark
 #define rmr_pdf_pipeline_workers rmrgo_rmr_pdf_pipeline_workers
 #define rmr_pdf_rewrite rmrgo_rmr_pdf_rewrite
 #define rmr_pdf_rewrite_output rmrgo_rmr_pdf_rewrite_output

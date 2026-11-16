@@ -34,9 +34,10 @@ func live(ctx context.Context) error {
 }
 
 // watch answers a C flag raised when ctx ends, and the function that stops
-// watching and releases it. A context that cannot end needs no flag.
-func watch(ctx context.Context) (unsafe.Pointer, func()) {
-	if ctx.Done() == nil {
+// watching and releases it. Progress needs a flag even if ctx cannot end,
+// so that an abnormal callback can stop C.
+func watch(ctx context.Context, progress bool) (unsafe.Pointer, func()) {
+	if ctx.Done() == nil && !progress {
 		return nil, func() {}
 	}
 	flag := C.rmrgo_flag_new()
@@ -91,9 +92,21 @@ func renderCall(ctx context.Context, o *Options, c *call, f func(r *C.rmrgo_requ
 			r.fonts = o.Fonts.c
 		}
 	}
-	flag, stop := watch(ctx)
+	flag, stop := watch(ctx, bool(r.progress))
 	defer stop()
 	r.cancel = flag
+	c.cancel = flag
+	if o != nil && o.Progress != nil {
+		progress := o.Progress
+		c.progress = func(completed, total int) {
+			progress(completed, total)
+			// Do not wait for AfterFunc to be scheduled when the callback
+			// itself cancels the context; C may settle more pages at once.
+			if ctx.Err() != nil && flag != nil {
+				C.rmrgo_flag_raise(flag)
+			}
+		}
+	}
 	var cerr C.rmr_error
 	status := c.run(func(handle C.uintptr_t) C.rmr_status {
 		r.handle = handle

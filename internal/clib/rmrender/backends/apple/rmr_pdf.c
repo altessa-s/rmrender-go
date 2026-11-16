@@ -787,6 +787,7 @@ rmr_status rmr_apple_pdf_overlay_marks(
   rmr_status status = RMR_OK;
   bool reported = false; /* set once a marks or drawing call has filled e */
   bool written = false;  /* set once writing the output has failed */
+  size_t completed = 0;  /* settled pages already reported */
   rmr_pdf_report result = {0};
   for (size_t i = 0; i < count; i++) {
     if (cancel && cancel(context)) {
@@ -899,6 +900,9 @@ rmr_status rmr_apple_pdf_overlay_marks(
 
     CGPDFContextEndPage(cg);
     if (status != RMR_OK || drawn.status != RMR_OK) break;
+    if (marks && marks->progress)
+      rmr_pdf_marks_progress_until(
+          marks, &completed, rmr_apple_writer_watermark(writer, i + 1), count);
   }
 
   /* The writer may still be deflating pages before the failing one: a
@@ -913,6 +917,13 @@ rmr_status rmr_apple_pdf_overlay_marks(
       written = true;
       reported = false;
     }
+  }
+
+  if (status == RMR_OK && drawn.status == RMR_OK && marks && marks->progress) {
+    status = rmr_apple_writer_flush(writer, true);
+    written = status != RMR_OK;
+    if (status == RMR_OK)
+      rmr_pdf_marks_progress_until(marks, &completed, count, count);
   }
 
   if (status == RMR_OK && source && usable) {
@@ -1155,6 +1166,7 @@ rmr_status rmr_apple_pdf_update_marks(
   rmr_apple_writer* writer = nullptr;
   rmr_pdf_update* update = nullptr;
   bool settled = false;         /* set once settling the queue has failed */
+  size_t completed = 0;         /* settled pages already reported */
   rmr_output_guard guard = {0}; /* output, closed once the export fails */
   if (output) rmr_output_guard_init(&guard, output);
   if (status == RMR_OK && rmr_apple_writer_create(&limits, checked.decimals,
@@ -1193,6 +1205,9 @@ rmr_status rmr_apple_pdf_update_marks(
     if (status != RMR_OK) break;
     if (!rmr_plan_count(plan)) {
       rmr_pdf_marks_release(marks, i);
+      rmr_pdf_marks_progress_until(
+          marks, &completed,
+          queue.count ? queue.items[queue.head].overlay.page : i + 1, count);
       continue;
     }
 
@@ -1242,6 +1257,10 @@ rmr_status rmr_apple_pdf_update_marks(
     queue.count++;
     status = settle(&queue, writer, update, false, e);
     settled = status != RMR_OK;
+    if (status == RMR_OK)
+      rmr_pdf_marks_progress_until(
+          marks, &completed,
+          queue.count ? queue.items[queue.head].overlay.page : i + 1, count);
   }
 
   /* Pages before the failing one may still be queued: a failure adding them
@@ -1257,7 +1276,11 @@ rmr_status rmr_apple_pdf_update_marks(
       if (e) *e = earlier;
     }
   }
-  if (status == RMR_OK) status = settle(&queue, writer, update, true, e);
+  if (status == RMR_OK) {
+    status = settle(&queue, writer, update, true, e);
+    if (status == RMR_OK)
+      rmr_pdf_marks_progress_until(marks, &completed, count, count);
+  }
   for (; queue.count; queue.count--) {
     rmr_buffer_free(&queue.items[queue.head].native);
     queue.head = (queue.head + 1) % queue.capacity;

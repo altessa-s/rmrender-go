@@ -69,6 +69,8 @@ rmr_pdf_options rmr_pdf_options_default(void) {
                            0,
                            RMR_UNREADABLE_STRICT,
                            nullptr,
+                           nullptr,
+                           nullptr,
                            nullptr};
 }
 

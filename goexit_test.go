@@ -76,7 +76,7 @@ func TestResourceExitCleansUp(t *testing.T) {
 func TestCallbacksStopOnSecondExit(t *testing.T) {
 	d := openDocument(t, imported(t, largePDF(9<<20), loadPage(t, strokesPage)))
 	options := withFonts(t, rmrender.Options{})
-	for _, which := range []string{"font", "writer"} {
+	for _, which := range []string{"font", "writer", "progress"} {
 		t.Run(which, func(t *testing.T) {
 			before := rmrender.LiveHandles()
 			calls := 0
@@ -89,10 +89,15 @@ func TestCallbacksStopOnSecondExit(t *testing.T) {
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
-				if which == "font" {
+				switch which {
+				case "font":
 					_, _ = rmrender.NewFonts(callbackFS{next})
-				} else {
+				case "writer":
 					_, _ = d.WritePDF(context.Background(), callbackWriter{next}, rmrender.PDFPreserving, options)
+				case "progress":
+					o := *options
+					o.Progress = func(int, int) { next() }
+					_, _, _ = d.PDF(context.Background(), rmrender.PDFPreserving, &o)
 				}
 				t.Error("call returned after exit")
 			}()
@@ -126,10 +131,13 @@ func TestCallbackAbnormalConcurrency(t *testing.T) {
 				}
 				runtime.Goexit()
 			}
-			if i%2 == 0 {
+			switch i % 3 {
+			case 0:
 				_, _ = rmrender.NewFonts(callbackFS{next})
-			} else {
+			case 1:
 				_, _ = d.WritePDF(context.Background(), callbackWriter{next}, rmrender.PDFFresh, nil)
+			case 2:
+				_, _, _ = d.PDF(context.Background(), rmrender.PDFFresh, &rmrender.Options{Progress: func(int, int) { next() }})
 			}
 			t.Error("abnormal callback returned")
 		}()
@@ -147,10 +155,13 @@ func TestRepeatedCallbackExit(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			if i%2 == 0 {
+			switch i % 3 {
+			case 0:
 				_, _ = rmrender.NewFonts(callbackFS{runtime.Goexit})
-			} else {
+			case 1:
 				_, _ = d.WritePDF(context.Background(), exitingWriter{}, rmrender.PDFFresh, nil)
+			case 2:
+				_, _, _ = d.PDF(context.Background(), rmrender.PDFFresh, &rmrender.Options{Progress: func(int, int) { runtime.Goexit() }})
 			}
 		}()
 		<-done
@@ -159,6 +170,130 @@ func TestRepeatedCallbackExit(t *testing.T) {
 		}
 	}
 	runtime.GC()
+}
+
+func TestDocumentProgressAbnormal(t *testing.T) {
+	d := progressDocuments(t)[1]
+	for _, export := range documentExports(d) {
+		for _, at := range []int{0, 1, d.Len()} {
+			for _, panics := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/at%d/panic%t", export.name, at, panics), func(t *testing.T) {
+					before := rmrender.LiveHandles()
+					calls := 0
+					done := make(chan struct{})
+					o := withFonts(t, rmrender.Options{PDFRasterDPI: 36})
+					o.Progress = func(completed, _ int) {
+						calls++
+						if completed == at {
+							if panics {
+								panic("progress stop")
+							}
+							runtime.Goexit()
+						}
+					}
+					go func() {
+						defer close(done)
+						defer func() {
+							p := recover()
+							if panics && p != "progress stop" || !panics && p != nil {
+								t.Errorf("panic = %v, want panic = %t", p, panics)
+							}
+						}()
+						_ = export.run(context.Background(), o)
+						t.Error("abnormal progress callback returned")
+					}()
+					<-done
+					if calls != at+1 || rmrender.LiveHandles() != before {
+						t.Fatalf("calls = %d, handles = %d, want %d and %d", calls, rmrender.LiveHandles(), at+1, before)
+					}
+					o.Progress = nil
+					if err := export.run(context.Background(), o); err != nil {
+						t.Fatal(err)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestDocumentProgressAbnormalStopsNative(t *testing.T) {
+	// Keep exports serial: the native report counter is package-wide.
+	const pages = 48
+	content := make([][]byte, pages)
+	page := loadPage(t, strokesPage)
+	for i := range content {
+		content[i] = page
+	}
+	notes := openDocument(t, notebook(t, "", content...))
+	pdf, _, err := notes.PDF(context.Background(), rmrender.PDFFresh, withFonts(t, rmrender.Options{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	documents := []*rmrender.Document{notes, openDocument(t, imported(t, pdf, content[0]))}
+	for i, d := range documents {
+		if d.Len() != pages {
+			t.Fatalf("document has %d pages, want %d", d.Len(), pages)
+		}
+		for _, export := range documentExports(d) {
+			for _, cancellable := range []bool{false, true} {
+				for _, panics := range []bool{false, true} {
+					t.Run(fmt.Sprintf("document%d/%s/cancellable%t/panic%t", i, export.name, cancellable, panics), func(t *testing.T) {
+						ctx := context.Background()
+						if cancellable {
+							var cancel context.CancelFunc
+							ctx, cancel = context.WithCancel(ctx)
+							defer cancel()
+						}
+						before := rmrender.NativeProgressReports()
+						handles := rmrender.LiveHandles()
+						var atFailure int64
+						calls := 0
+						o := withFonts(t, rmrender.Options{PDFRasterDPI: 36, Progress: func(completed, total int) {
+							if completed != calls || total != pages {
+								t.Errorf("progress = (%d, %d), want (%d, %d)", completed, total, calls, pages)
+							}
+							calls++
+							if completed == 1 {
+								atFailure = rmrender.NativeProgressReports()
+								if panics {
+									panic("progress stop")
+								}
+								runtime.Goexit()
+							}
+						}})
+						done := make(chan struct{})
+						go func() {
+							defer close(done)
+							defer func() {
+								p := recover()
+								if panics && p != "progress stop" || !panics && p != nil {
+									t.Errorf("panic = %v, want panic = %t", p, panics)
+								}
+							}()
+							_ = export.run(ctx, o)
+							t.Error("abnormal progress callback returned")
+						}()
+						<-done
+						if calls != 2 || atFailure-before != 2 {
+							t.Fatalf("caller reports = %d, native reports at failure = %d, want 2 each", calls, atFailure-before)
+						}
+						// Native PDF writers use at most eight workers and a
+						// window of 2*workers+2. Allow that window to settle,
+						// but never the rest of this much larger document.
+						const window = 2*8 + 2
+						after := rmrender.NativeProgressReports() - atFailure
+						if after > window {
+							t.Errorf("native reports after abnormal Progress = %d, want <= %d (document has %d pages)", after, window, pages)
+						}
+						t.Logf("native reports after abnormal Progress = %d (limit %d)", after, window)
+						if got := rmrender.LiveHandles(); got != handles {
+							t.Errorf("live handles = %d, want %d", got, handles)
+						}
+					})
+				}
+			}
+		}
+	}
 }
 
 // A failed subtest also fails its parent, so exercise Fatal in a child test

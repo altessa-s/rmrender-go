@@ -116,6 +116,9 @@ size_t rmr_pdf_pipeline_workers(void);
 void rmr_pdf_pipeline_submit(rmr_pdf_pipeline* p, rmr_pdf_batch* b);
 /* Batches submitted and not yet returned by rmr_pdf_pipeline_next. */
 size_t rmr_pdf_pipeline_pending(const rmr_pdf_pipeline* p);
+/* Oldest pending batch's tag, or submitted when the queue is empty. Tags
+ * must be assigned before submission and increase in submission order. */
+size_t rmr_pdf_pipeline_watermark(rmr_pdf_pipeline* p, size_t submitted);
 /* The oldest submitted batch once serialized, waiting for it when wait is
  * set; null when none is pending or (without wait) it is still running. */
 rmr_pdf_batch* rmr_pdf_pipeline_next(rmr_pdf_pipeline* p, bool wait);

@@ -57,10 +57,9 @@
     void* context, rmr_svg_pages* out, rmr_document_report* report,
     rmr_error* error);
 
-/* rmr_apple_document_svg drawing the pages as options say: of them it reads
- * only what the document exports do with an unreadable page (see
- * rmr_unreadable_policy in output.h); null selects the defaults, which
- * rmr_apple_document_svg uses. */
+/* rmr_apple_document_svg drawing the pages as options say: it reads
+ * the unreadable-page policy and progress callback (see output.h);
+ * null selects the defaults, which rmr_apple_document_svg uses. */
 [[nodiscard]] RMR_API rmr_status rmr_apple_document_svg_with_options(
     const rmr_archive_document* document, const rmr_page_resources* resources,
     const rmr_apple_fonts* fonts, rmr_paper paper, size_t maximum_pages,
@@ -69,8 +68,9 @@
     rmr_document_report* report, rmr_error* error);
 
 /* rmr_apple_document_pdf, _preserving and _recomposed drawing the marks as
- * options say (see rmr_pdf_options in output.h; null selects the defaults,
- * which the functions without options use). */
+ * options say, reporting per-page progress when requested (see
+ * rmr_pdf_options in output.h; null selects the defaults, which the functions
+ * without options use). */
 [[nodiscard]] RMR_API rmr_status rmr_apple_document_pdf_with_options(
     const rmr_archive_document* document, const rmr_page_resources* resources,
     const rmr_apple_fonts* fonts, rmr_paper paper, size_t maximum_pages,

@@ -268,6 +268,14 @@ three modes, which differ only for an imported PDF:
 What could be recovered from is counted in the `Report`: blocks of a page left out, pages that name an imported page the PDF does not have,
 the links a fresh export could not carry over, and unreadable pages. `MaximumPages` caps the pages drawn.
 
+`Options.Progress func(completed, total int)` reports `Document.PDF` and `Document.WritePDF` in every mode, and `Document.SVG`.
+It runs synchronously on the callback worker: `(0, total)` before drawing, then once per settled page, with `completed` increasing
+from 1 through `total`. Total is the output page count after `MaximumPages`. A settled page has had its output written and its work
+can no longer fail; reports can lag drawing by the pipeline window. Failed, cancelled and still-pending pages are not reported.
+Final PDF assembly can still fail after all pages settle, and validation can fail before any report. Nil installs no C callback.
+The callback must be quick and must not call into rmrender: the Cairo backend may hold the PDFium lock. A panic or `runtime.Goexit`
+stops C and is raised again on the calling goroutine after cleanup. To stop an export, cancel its context from the callback.
+
 An **unreadable page** is one whose `.rm` file is in the archive but does not parse: truncated, malformed, or of a version the parser does not
 read. (A listed page without a `.rm` file is not one: the tablet writes none for a page nobody wrote on, and it is drawn as an empty page on its
 template.) `Options.Unreadable` says what every call of a `Document` does with it:
@@ -486,7 +494,8 @@ its own context does, with that context's error, and one that takes no context o
 integer, and exported Go functions that read the file and lend its bytes to C, pinned with `runtime.Pinner` until the call returns. A read
 failure becomes the error's cause. Reads run on a separate goroutine, synchronously with the call. A panic or `runtime.Goexit` stops C;
 after C returns, the handle is deleted, lent bytes dropped and pins released, then the calling goroutine panics or exits, running its
-deferred functions. One worker is reused for the reads and writer pieces of each call. The fonts are
+deferred functions. One worker is reused for the reads, writer pieces and progress reports of each call. Progress must not call into
+rmrender, as described above. The fonts are
 loaded from memory, so no temporary files are written, except by the Cairo backend on macOS, where Fontconfig needs files, and on Windows,
 where it keeps them in the font cache the requirements describe.
 

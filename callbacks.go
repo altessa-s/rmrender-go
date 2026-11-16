@@ -29,6 +29,10 @@ type call struct {
 	fonts     fs.FS
 	templates *Templates
 	images    fs.FS
+	progress  func(completed, total int)
+	// cancel stops C after an abnormal progress callback, even for a
+	// context without a deadline or cancellation channel.
+	cancel unsafe.Pointer
 
 	// pinner keeps the bytes lent to C in place until the call returns;
 	// lent keeps them alive.
@@ -55,6 +59,10 @@ type call struct {
 
 // liveHandles counts calls whose callback state has not yet been released.
 var liveHandles atomic.Int64
+
+// nativeProgressReports includes reports suppressed after a callback fails,
+// so tests can distinguish stopping C from just stopping caller code.
+var nativeProgressReports atomic.Int64
 
 // fail records the first failure of a callback.
 func (c *call) fail(err error) {
@@ -274,6 +282,19 @@ func rmrgoUnreadable(handle C.uintptr_t, page C.size_t, _ C.rmr_status) {
 	}
 }
 
+// rmrgoProgress reports a settled document page through the callback worker.
+//
+//export rmrgoProgress
+func rmrgoProgress(handle C.uintptr_t, completed, total C.size_t) {
+	nativeProgressReports.Add(1)
+	c := cgo.Handle(handle).Value().(*call)
+	if c.progress != nil {
+		if !c.invoke(func() { c.progress(int(completed), int(total)) }) && c.cancel != nil {
+			C.rmrgo_flag_raise(c.cancel)
+		}
+	}
+}
+
 // rmrgoImage resolves an image a lone page places, by its file name. A
 // missing image keeps its place in the drawing order and paints nothing.
 //
@@ -297,7 +318,7 @@ func rmrgoImage(handle C.uintptr_t, name *C.char, length C.size_t, out *C.rmr_as
 	return C.RMR_OK
 }
 
-// callbackRunner reuses one goroutine for a call's reads and output pieces.
+// callbackRunner reuses one goroutine for a call's reads, output and progress.
 // Waiting for each answer keeps caller code synchronous without allowing it
 // to unwind a C frame. An abnormal answer ends the worker as well.
 type callbackRunner struct {
