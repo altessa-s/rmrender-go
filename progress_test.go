@@ -138,6 +138,27 @@ func TestDocumentProgress(t *testing.T) {
 	}
 }
 
+// delayedAfterFuncContext holds the watcher until its stop function runs,
+// modeling an AfterFunc goroutine that has not yet been scheduled.
+type delayedAfterFuncContext struct{ context.Context }
+
+// Hide the parent's internal cancellation state so context.AfterFunc uses
+// this context's AfterFunc method instead of registering with the parent.
+func (delayedAfterFuncContext) Value(any) any { return nil }
+
+func (c delayedAfterFuncContext) AfterFunc(f func()) func() bool {
+	release := make(chan struct{})
+	stop := context.AfterFunc(c.Context, func() {
+		<-release
+		f()
+	})
+	return func() bool {
+		stopped := stop()
+		close(release)
+		return stopped
+	}
+}
+
 func TestDocumentProgressCancellation(t *testing.T) {
 	for i, d := range progressDocuments(t) {
 		for _, export := range documentExports(d) {
@@ -175,6 +196,23 @@ func TestDocumentProgressCancellation(t *testing.T) {
 				o.Progress = nil
 				if err := export.run(context.Background(), o); err != nil {
 					t.Fatal(err)
+				}
+			})
+			t.Run(fmt.Sprintf("document%d/%s/delayed AfterFunc", i, export.name), func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				before := rmrender.NativeProgressReports()
+				var got []int
+				o := withFonts(t, rmrender.Options{PDFRasterDPI: 36, Progress: func(completed, _ int) {
+					got = append(got, completed)
+					cancel()
+				}})
+				err := export.run(delayedAfterFuncContext{ctx}, o)
+				if !errors.Is(err, context.Canceled) || !errors.Is(err, rmrender.ErrCancelled) {
+					t.Fatalf("progress = %v, cancellation = %v", got, err)
+				}
+				if reports := rmrender.NativeProgressReports() - before; reports != 1 || !slices.Equal(got, []int{0}) {
+					t.Fatalf("native reports = %d, progress = %v, want only the initial report", reports, got)
 				}
 			})
 		}

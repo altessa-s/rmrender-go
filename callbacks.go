@@ -10,6 +10,7 @@ package rmrender
 import "C"
 
 import (
+	"context"
 	"errors"
 	"io"
 	"io/fs"
@@ -30,8 +31,9 @@ type call struct {
 	templates *Templates
 	images    fs.FS
 	progress  func(completed, total int)
-	// cancel stops C after an abnormal progress callback, even for a
-	// context without a deadline or cancellation channel.
+	ctx       context.Context
+	// cancel stops C after a progress callback returns abnormally or ends
+	// ctx, even for a context without a deadline or cancellation channel.
 	cancel unsafe.Pointer
 
 	// pinner keeps the bytes lent to C in place until the call returns;
@@ -289,7 +291,10 @@ func rmrgoProgress(handle C.uintptr_t, completed, total C.size_t) {
 	nativeProgressReports.Add(1)
 	c := cgo.Handle(handle).Value().(*call)
 	if c.progress != nil {
-		if !c.invoke(func() { c.progress(int(completed), int(total)) }) && c.cancel != nil {
+		returned := c.invoke(func() { c.progress(int(completed), int(total)) })
+		// Do not wait for AfterFunc to be scheduled when the callback
+		// itself cancels the context; C may settle more pages at once.
+		if (!returned || c.ctx.Err() != nil) && c.cancel != nil {
 			C.rmrgo_flag_raise(c.cancel)
 		}
 	}

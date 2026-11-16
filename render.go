@@ -96,16 +96,9 @@ func renderCall(ctx context.Context, o *Options, c *call, f func(r *C.rmrgo_requ
 	defer stop()
 	r.cancel = flag
 	c.cancel = flag
-	if o != nil && o.Progress != nil {
-		progress := o.Progress
-		c.progress = func(completed, total int) {
-			progress(completed, total)
-			// Do not wait for AfterFunc to be scheduled when the callback
-			// itself cancels the context; C may settle more pages at once.
-			if ctx.Err() != nil && flag != nil {
-				C.rmrgo_flag_raise(flag)
-			}
-		}
+	c.ctx = ctx
+	if o != nil {
+		c.progress = o.Progress
 	}
 	var cerr C.rmr_error
 	status := c.run(func(handle C.uintptr_t) C.rmr_status {
