@@ -155,10 +155,15 @@ func TestDocumentProgressCancellation(t *testing.T) {
 					}
 				}})
 				err := export.run(ctx, o)
-				if !errors.Is(err, context.Canceled) || !errors.Is(err, rmrender.ErrCancelled) {
+				// Reports may lag drawing (Cairo settles pages after they are
+				// all drawn), so cancelling at the first report can come after
+				// the work is done; the export may then succeed, but only
+				// having reported every page.
+				finished := err == nil && len(got) == d.Len()+1
+				if !finished && (!errors.Is(err, context.Canceled) || !errors.Is(err, rmrender.ErrCancelled)) {
 					t.Fatalf("progress = %v, cancellation = %v", got, err)
 				}
-				if len(got) < 2 || len(got) > d.Len() {
+				if len(got) < 2 || len(got) > d.Len()+1 {
 					t.Fatalf("progress is not a cancelled prefix: %v", got)
 				}
 				for completed, n := range got {
