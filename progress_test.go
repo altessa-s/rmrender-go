@@ -48,6 +48,35 @@ func documentExports(d *rmrender.Document) []documentExport {
 	}})
 }
 
+func TestOptionsProgressWiring(t *testing.T) {
+	o := &rmrender.Options{}
+	for _, step := range []struct {
+		name string
+		opts *rmrender.Options
+		on   bool
+	}{
+		{"nil options", nil, false},
+		{"nil progress", o, false},
+		{"enabled", o, true},
+		{"disabled again", o, false},
+	} {
+		t.Run(step.name, func(t *testing.T) {
+			if step.on {
+				o.Progress = func(int, int) { t.Error("inspection invoked Progress") }
+			} else {
+				o.Progress = nil
+			}
+			request, callback, err := rmrender.OptionsProgress(step.opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if request != step.on || callback != step.on {
+				t.Fatalf("request.progress = %t, C options.progress != NULL = %t, want both %t", request, callback, step.on)
+			}
+		})
+	}
+}
+
 // Exercise both the notebook path and actual imported-PDF paths (including
 // pages without marks, which must settle too).
 func progressDocuments(t *testing.T) []*rmrender.Document {

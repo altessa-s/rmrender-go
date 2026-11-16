@@ -498,6 +498,10 @@ static rmr_pdf_options told(const rmrgo_request *r) {
     return options;
 }
 
+bool rmrgo_progress_enabled(const rmrgo_request *r) {
+    return told(r).progress != nullptr;
+}
+
 // The document's canvas: the first plausible page size in page order, else
 // the declared one. The first page that declares a plausible size decides,
 // so pages are parsed only up to it; an unreadable page declares none, as

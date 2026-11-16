@@ -60,6 +60,10 @@ type call struct {
 // liveHandles counts calls whose callback state has not yet been released.
 var liveHandles atomic.Int64
 
+// nativeProgressReports includes reports suppressed after a callback fails,
+// so tests can distinguish stopping C from just stopping caller code.
+var nativeProgressReports atomic.Int64
+
 // fail records the first failure of a callback.
 func (c *call) fail(err error) {
 	if c.err == nil && !c.panicked && !c.exited {
@@ -282,6 +286,7 @@ func rmrgoUnreadable(handle C.uintptr_t, page C.size_t, _ C.rmr_status) {
 //
 //export rmrgoProgress
 func rmrgoProgress(handle C.uintptr_t, completed, total C.size_t) {
+	nativeProgressReports.Add(1)
 	c := cgo.Handle(handle).Value().(*call)
 	if c.progress != nil {
 		if !c.invoke(func() { c.progress(int(completed), int(total)) }) && c.cancel != nil {
