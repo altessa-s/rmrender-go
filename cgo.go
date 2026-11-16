@@ -55,9 +55,8 @@ import "C"
 
 import "unsafe"
 
-// Version identifies the vendored rmrender-lib checkout. It is an untagged
-// commit after v1.5.2; the C library's version function still reports 1.5.2.
-const Version = "1.5.2-5-gb60e1fc"
+// Version is the version of the vendored rmrender-lib.
+const Version = "1.6.0"
 
 // cVersion answers the C library's own version, so that a test can hold
 // [Version] to it.
