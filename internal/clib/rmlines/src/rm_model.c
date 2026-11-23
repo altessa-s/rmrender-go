@@ -35,6 +35,8 @@ const char* rm_status_string(rm_status status) {
       return "items the page does not hold as living ones";
     case RM_ERR_UNVERIFIED:
       return "the edited page did not read back as meant";
+    case RM_ERR_UNSUPPORTED_BLOCK_VERSION:
+      return "a page block requires a newer reader";
     case RM_ERR_INCOMPLETE_PAGE:
       return "blocks of the page would not read";
   }
@@ -92,7 +94,8 @@ bool rm_item_id_parse(const char* text, rm_item_id* out) {
 }
 
 bool rm_pen_tool_is_eraser(rm_pen_tool tool) {
-  return tool == RM_TOOL_ERASER || tool == RM_TOOL_ERASER_AREA;
+  return tool == RM_TOOL_ERASER || tool == RM_TOOL_ERASER_AREA ||
+         tool == RM_TOOL_MASKED_ERASER;
 }
 
 bool rm_pen_tool_is_highlighter(rm_pen_tool tool) {

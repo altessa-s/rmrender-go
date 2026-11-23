@@ -10,6 +10,12 @@
 /* Shared by the RMLines adapter and the platform marks libraries, so exported
  * from the adapter; not part of the public API. */
 
+/* Older RMLines headers predate the masked eraser wire value. */
+static constexpr rm_pen_tool rmr_masked_eraser = (rm_pen_tool)22;
+static inline bool rmr_path_eraser(rm_pen_tool tool) {
+  return tool == RM_TOOL_ERASER || tool == rmr_masked_eraser;
+}
+
 /* The drawn line width for a raw stroke width, bounded to [0.7, 200]. */
 RMR_API double rmr_line_width(double raw);
 

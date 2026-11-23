@@ -55,6 +55,11 @@ void* rm_arena_alloc(rm_arena* arena, size_t size);
  * `count * size`. */
 void* rm_arena_calloc(rm_arena* arena, size_t count, size_t size);
 
+static inline rm_stroke_point* rm_alloc_stroke_points(rm_arena* arena,
+                                                      size_t count) {
+  return rm_arena_calloc(arena, count, sizeof(rm_stroke_point));
+}
+
 #ifdef RMLINES_TESTING
 /* Fail one arena allocation after this many successes; SIZE_MAX disables it. */
 void rm_test_arena_fail_after(size_t count);
@@ -143,8 +148,13 @@ size_t rm_utf8_scalar_count(const char* bytes, size_t length);
  * `out` must hold at least `rm_utf8_repair_bound(length)` bytes. */
 size_t rm_utf8_repair(const char* bytes, size_t length, char* out);
 
-/* Three bytes out for every byte in is the worst case: a run of continuation
- * bytes is one U+FFFD each. */
+typedef struct rm_text_counts {
+  uint64_t chars, lines;
+} rm_text_counts;
+/* Start with {1,1} for a text document's implicit final paragraph end. */
+void rm_text_counts_add(rm_text_counts* counts, const char* text,
+                        size_t length);
+/* Worst-case repair size including NUL, or zero if unrepresentable. */
 size_t rm_utf8_repair_bound(size_t length);
 
 /* Whether the scalar starting at `offset` is a newline, and where the next
@@ -164,6 +174,10 @@ typedef struct rm_crdt_id {
 
 /* Whether the two identifiers name the same record. */
 bool rm_crdt_equal(rm_crdt_id a, rm_crdt_id b);
+static inline bool rm_stamp_newer(rm_crdt_id a, rm_crdt_id b) {
+  return a.counter > b.counter ||
+         (a.counter == b.counter && a.author > b.author);
+}
 
 /* An identifier out of its two parts. */
 rm_crdt_id rm_crdt_make(uint8_t author, uint64_t counter);
@@ -429,6 +443,32 @@ bool rm_match_tag(rm_reader* reader, uint32_t index, uint8_t type);
 /* An identifier as the writer hands one out. */
 typedef rm_crdt_id rm_wid;
 
+struct rm_draft_stroke;
+void rm_write_line_item(rm_buf* out, const struct rm_draft_stroke* stroke,
+                        rm_wid parent, rm_wid id, rm_wid left, rm_wid right);
+
+struct rm_edit_session;
+static inline bool rm_id_overlaps(rm_crdt_id id, uint64_t span,
+                                  rm_item_id first, uint64_t count) {
+  if (!count || !span || id.author != first.author) return false;
+  return id.counter < first.counter ? first.counter - id.counter < span
+                                    : id.counter - first.counter < count;
+}
+rm_status rm_edit_check_ids(const uint8_t* data, size_t size, rm_item_id first,
+                            size_t count);
+rm_status rm_text_check_ids(rm_reader root, rm_item_id first, size_t count);
+rm_status rm_edit_check_location(const uint8_t* data, size_t size,
+                                 rm_item_id parent, rm_item_id left,
+                                 rm_item_id right, rm_crdt_id* successor,
+                                 rm_error* error);
+static inline rm_status rm_edit_result(rm_error* error, rm_status status) {
+  if (error && error->status != status) *error = (rm_error){.status = status};
+  return status;
+}
+void rm_edit_forget_previous(struct rm_edit_session* session);
+rm_status rm_edit_commit(struct rm_edit_session* s, uint8_t* bytes, size_t size,
+                         rm_error* error);
+
 /* Two bytes, little-endian. */
 void rm_write_u16(rm_buf* buf, uint16_t value);
 
@@ -497,13 +537,52 @@ rm_item_id rm_item_id_of(rm_crdt_id id);
 /* The internal spelling of a public identifier. */
 rm_crdt_id rm_crdt_of(rm_item_id id);
 
+/* One item of text: its own identifier, its neighbours in the CRDT list and
+ * the characters themselves. The characters get identifiers running on from
+ * the item's identifier. */
+typedef struct text_item {
+  size_t source; /* Original row for verbatim editor copies. */
+  bool fragment;
+  rm_crdt_id id;
+  rm_crdt_id left;
+  rm_crdt_id right;
+  rm_str text;
+  /* How many characters this record deletes. Deleted characters keep their
+   * identifiers, so the next record's `left` counts past them. */
+  uint32_t deleted;
+  /* The code a record carries when it is not text but a marker — any value
+   * but nought; absent for text. 1 bold on, 2 bold off, 3 italic on, 4
+   * italic off: odd switches on and even switches off — but not one pair for
+   * every purpose, or italic would use the same two numbers as bold. 5 and 6
+   * open and close a link, and the opening record's string is the address.
+   * 0xFFFFFFFF is an image in the flow of the text, and its string is the
+   * `{UUID}` key of the image's row in block 0x0E.
+   *
+   * Whatever its string, a marker takes exactly one identifier: the address
+   * of a link adds no characters to the text. */
+  bool has_marker;
+  uint32_t marker;
+} text_item;
+
+/* Byte ranges within a tree node for replacing the anchor stamp and target
+ * while preserving any extension fields. */
+typedef struct rm_anchor_field {
+  rm_crdt_id node, stamp;
+  rm_crdt_id target;
+  size_t length_at, target_end, field_end;
+} rm_anchor_field;
+rm_status rm_read_node_anchor(rm_reader body, rm_anchor_field* anchor);
+
+bool rm_split_text_runs(const text_item* rows, size_t count, rm_vec* parts);
+bool rm_text_record_order(const text_item* items, size_t count, uint32_t** out);
+
 /* The envelope every scene item starts with: the parent node, the item's own
  * identifier, its neighbours in the parent's list, and the count of what was
  * deleted here. The deleted count is the last four bytes it reads. */
 typedef struct rm_item_preamble {
   rm_crdt_id parent;
   rm_crdt_id id;
-  rm_crdt_id left;
+  rm_crdt_id left, right;
   uint32_t deleted;
 } rm_item_preamble;
 

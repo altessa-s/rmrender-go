@@ -218,7 +218,9 @@ rm_status rm_read_string(rm_reader* reader, size_t end, rm_arena* arena,
   const uint8_t* bytes;
   RM_TRY(rm_read_bytes(reader, available, &bytes));
 
-  char* repaired = rm_arena_alloc(arena, rm_utf8_repair_bound(available));
+  size_t bound = rm_utf8_repair_bound(available);
+  if (!bound) return RM_ERR_OUT_OF_MEMORY;
+  char* repaired = rm_arena_alloc(arena, bound);
   if (repaired == nullptr) return RM_ERR_OUT_OF_MEMORY;
   size_t length = rm_utf8_repair((const char*)bytes, available, repaired);
   *out = (rm_str){.bytes = repaired, .length = length};

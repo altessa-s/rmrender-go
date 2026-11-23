@@ -20,6 +20,7 @@
 
 #include "../../src/rmr_pdf_edit.h"
 #include "../common/rmr_pdf_stream.h"
+#include "../common/rmr_progress.h"
 
 /* Serializes font creation, shaping, drawing and destruction. Cairo shares
  * a FreeType library across font maps, even when their faces differ. The
@@ -107,11 +108,8 @@ typedef struct rmr_linux_parts rmr_linux_parts;
 
 rmr_status rmr_linux_parts_create(rmr_pdf_builder* builder,
                                   rmr_linux_page_fn done, void* context,
-                                  rmr_progress_fn progress,
-                                  void* progress_context, size_t total,
+                                  rmr_progress* progress,
                                   rmr_linux_parts** out);
-/* Failure cleanup may settle earlier pages, but must not report them. */
-void rmr_linux_parts_stop_progress(rmr_linux_parts* parts);
 void rmr_linux_parts_free(rmr_linux_parts* parts);
 
 /* Draws plan on sheet as page `page`'s parts and queues their finishing; the

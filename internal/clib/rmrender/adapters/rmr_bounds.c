@@ -70,7 +70,7 @@ rmr_status rmr_lines_content_bounds_with_text(const rm_page* page, double w,
       return fail(e, RMR_ERR_LIMIT, i, "bounds point limit");
     points += s->point_count;
     /* Erasers, including their coordinates, never participate in bounds. */
-    if (s->tool == RM_TOOL_ERASER || s->tool == RM_TOOL_ERASER_AREA) continue;
+    if (rmr_path_eraser(s->tool) || s->tool == RM_TOOL_ERASER_AREA) continue;
     for (size_t k = 0; k < s->point_count; k++) {
       rm_stroke_point p = s->points[k];
       if (!isfinite(p.x) || !isfinite(p.y) || !isfinite(p.width) ||

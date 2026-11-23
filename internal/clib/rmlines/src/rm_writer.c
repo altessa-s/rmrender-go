@@ -169,7 +169,9 @@ static image_ids image_ids_of(size_t number) {
 static char* well_formed(const char* text) {
   if (text == nullptr) text = "";
   size_t length = strlen(text);
-  char* out = malloc(rm_utf8_repair_bound(length));
+  size_t bound = rm_utf8_repair_bound(length);
+  if (!bound) return nullptr;
+  char* out = malloc(bound);
   if (out == nullptr) return nullptr;
   out[rm_utf8_repair(text, length, out)] = '\0';
   return out;
@@ -236,8 +238,9 @@ static void marks_author_derived_from(const uint8_t author[16],
  *
  * One writer for both kinds of stroke — the anchored ones differ only in which
  * node they name as their parent. */
-static void line_item(rm_buf* out, const rm_draft_stroke* stroke, rm_wid parent,
-                      rm_wid id, rm_wid previous) {
+void rm_write_line_item(rm_buf* out, const rm_draft_stroke* stroke,
+                        rm_wid parent, rm_wid id, rm_wid previous,
+                        rm_wid right) {
   rm_buf value;
   rm_buf_init(&value);
   rm_buf_append_byte(&value, 0x03); /* value type: line */
@@ -285,7 +288,7 @@ static void line_item(rm_buf* out, const rm_draft_stroke* stroke, rm_wid parent,
   rm_write_id(out, 1, parent);
   rm_write_id(out, 2, id);
   rm_write_id(out, 3, previous);
-  rm_write_id(out, 4, ID_NONE);
+  rm_write_id(out, 4, right);
   rm_write_tag(out, 5, RM_TAG_BYTE4);
   rm_write_u32(out, 0);
   rm_write_block(out, 6, value.bytes, value.count);
@@ -457,7 +460,8 @@ static void anchored_mark_blocks(rm_buf* file, const rm_draft_mark* mark,
    * stroke block on a tablet page declares 2 as its minimum too. */
   rm_buf line;
   rm_buf_init(&line);
-  line_item(&line, &mark->stroke, ids.node, ids.stroke, ID_NONE);
+  rm_write_line_item(&line, &mark->stroke, ids.node, ids.stroke, ID_NONE,
+                     ID_NONE);
   rm_write_top_block(file, 0x05, 2, 2, line.bytes, line.count);
   if (line.failed) file->failed = true;
   rm_buf_free(&line);
@@ -508,15 +512,15 @@ static void migration_block(rm_buf* out) {
 }
 
 /* `0x0A` PageInfo: the counters the tablet keeps per page. */
-static void page_info_block(rm_buf* out, size_t scalars, size_t paragraphs) {
+static void page_info_block(rm_buf* out, rm_text_counts stats) {
   rm_write_tag(out, 1, RM_TAG_BYTE4);
   rm_write_u32(out, 1); /* loads */
   rm_write_tag(out, 2, RM_TAG_BYTE4);
   rm_write_u32(out, 0); /* merges */
   rm_write_tag(out, 3, RM_TAG_BYTE4);
-  rm_write_u32(out, (uint32_t)scalars);
+  rm_write_u32(out, (uint32_t)stats.chars);
   rm_write_tag(out, 4, RM_TAG_BYTE4);
-  rm_write_u32(out, (uint32_t)paragraphs);
+  rm_write_u32(out, (uint32_t)stats.lines);
   rm_write_tag(out, 5, RM_TAG_BYTE4);
   rm_write_u32(out, 0); /* keyboardCount */
 }
@@ -740,6 +744,7 @@ typedef struct text_writer {
    * keys the next paragraph's style record. */
   rm_wid chain_tail;
   rm_wid last_newline;
+  rm_text_counts stats;
   size_t total_scalars;
   uint64_t mark_counter;
 } text_writer;
@@ -776,6 +781,7 @@ static void append_record(text_writer* state, const char* raw) {
   state->chain_tail = wid(DRAFT_AUTHOR, state->counter + span - 1u);
   state->counter += span;
   state->total_scalars += scalars;
+  rm_text_counts_add(&state->stats, text, strlen(text));
   free(text);
 }
 
@@ -813,6 +819,7 @@ static rm_wid append_mark(text_writer* state, uint32_t mark, rm_wid left,
 
 typedef struct text_block_result {
   rm_buf bytes;
+  rm_text_counts stats;
   size_t scalars;
   /* The identifier of each paragraph's first character; one entry per
    * paragraph, malloc'd, the caller frees. */
@@ -829,6 +836,7 @@ static bool text_block(const rm_draft_paragraph* paragraphs, size_t count,
       .counter = FIRST_CHARACTER,
       .chain_tail = ID_NONE,
       .last_newline = ID_NONE,
+      .stats = {count != 0, count != 0},
       .total_scalars = 0,
       .mark_counter = 1000000,
   };
@@ -981,6 +989,7 @@ static bool text_block(const rm_draft_paragraph* paragraphs, size_t count,
     free(first_characters);
     return false;
   }
+  out->stats = state.stats;
   out->scalars = state.total_scalars;
   out->first_characters = first_characters;
   return true;
@@ -1166,8 +1175,7 @@ rm_status rm_write_page(const rm_page_draft* draft, uint8_t** out_bytes,
 
   EMIT(0x09, 1, 1, authors_block(&block, draft->author, marks));
   EMIT(0x00, 1, 1, migration_block(&block));
-  EMIT(0x0A, 0, 1,
-       page_info_block(&block, text.scalars, draft->paragraph_count));
+  EMIT(0x0A, 0, 1, page_info_block(&block, text.stats));
   EMIT(0x0D, 0, 1,
        scene_info_block(&block, &draft->sheet, &draft->column,
                         draft->image_count != 0));
@@ -1205,8 +1213,8 @@ rm_status rm_write_page(const rm_page_draft* draft, uint8_t** out_bytes,
   rm_wid previous = ID_NONE;
   for (size_t number = 0; number < draft->stroke_count; number += 1) {
     block.count = 0;
-    line_item(&block, &draft->strokes[number], ID_LAYER,
-              loose_stroke_id(number), previous);
+    rm_write_line_item(&block, &draft->strokes[number], ID_LAYER,
+                       loose_stroke_id(number), previous, ID_NONE);
     rm_write_top_block(&file, 0x05, 2, 2, block.bytes, block.count);
     if (block.failed) file.failed = true;
     previous = loose_stroke_id(number);

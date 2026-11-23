@@ -664,7 +664,18 @@ void* rm_vec_at(const rm_vec* vec, size_t index) {
   return (unsigned char*)vec->data + index * vec->elem;
 }
 
-size_t rm_utf8_repair_bound(size_t length) { return length * 3u + 1u; }
+void rm_text_counts_add(rm_text_counts* counts, const char* text,
+                        size_t length) {
+  for (size_t i = 0; i < length;) {
+    uint32_t scalar;
+    i = rm_utf8_next(text, length, i, &scalar);
+    counts->chars += scalar > 0xffff ? 2 : 1;
+    if (scalar == '\n') ++counts->lines;
+  }
+}
+size_t rm_utf8_repair_bound(size_t length) {
+  return length <= (SIZE_MAX - 1) / 3 ? length * 3u + 1u : 0;
+}
 
 bool rm_crdt_equal(rm_crdt_id a, rm_crdt_id b) {
   return a.counter == b.counter && a.author == b.author;

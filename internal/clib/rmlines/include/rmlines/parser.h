@@ -51,7 +51,8 @@ RM_API bool rm_header_version(const char* header, size_t length,
  * The statuses that reach this caller are: RM_ERR_INVALID_ARGUMENT when
  * `data` or `out_page` is null, RM_ERR_UNSUPPORTED_VERSION for a generation
  * this reader does not draw, RM_ERR_UNSUPPORTED_FORMAT for bytes that do not
- * begin as a page at all, RM_ERR_UNEXPECTED_EOF for a stream that ended
+ * begin as a page at all, RM_ERR_UNSUPPORTED_BLOCK_VERSION for a known v6
+ * block requiring a newer reader, RM_ERR_UNEXPECTED_EOF for a stream that ended
  * inside a field, and RM_ERR_OUT_OF_MEMORY when an allocation failed —
  * answered as a whole page lost rather than as a quietly shorter one, so a
  * caller that treats it as "no content here" is wrong about what it has.

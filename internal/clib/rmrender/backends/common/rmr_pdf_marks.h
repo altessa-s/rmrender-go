@@ -10,6 +10,8 @@
 #define RMR_PDF_MARKS_H
 #include <rmrender/pdf.h>
 
+#include "rmr_progress.h"
+
 typedef struct {
   /* Borrow page i's marks into *marks until release(context, i); fills
    * error on failure. Pages are acquired in order, one at a time. */
@@ -17,28 +19,9 @@ typedef struct {
                         rmr_error* error);
   void (*release)(void* context, size_t page);
   void* context;
-  /* Document progress only; plan release also happens on drawing failure. */
-  rmr_progress_fn progress;
-  void* progress_context;
+  /* Shared document progress; plan release also happens on drawing failure. */
+  rmr_progress* progress;
 } rmr_pdf_marks;
-
-/* Report a successfully completed page, after its pending output is settled.
- * Never used when draining earlier pages during failure cleanup. */
-static inline void rmr_pdf_marks_progress(const rmr_pdf_marks* marks,
-                                          size_t completed, size_t total) {
-  if (marks && marks->progress)
-    marks->progress(marks->progress_context, completed, total);
-}
-
-/* Report the settled prefix, including pages with no writer batches. */
-static inline void rmr_pdf_marks_progress_until(const rmr_pdf_marks* marks,
-                                                size_t* reported,
-                                                size_t watermark,
-                                                size_t total) {
-  if (marks && marks->progress)
-    while (*reported < watermark)
-      rmr_pdf_marks_progress(marks, ++*reported, total);
-}
 
 /* Page i's marks: pages[i].marks, or acquired from marks when given. */
 static inline rmr_status rmr_pdf_marks_acquire(const rmr_pdf_marks* marks,

@@ -105,8 +105,12 @@ typedef struct {
    * for an empty notebook. Refused/hidden source references, skipped blocks,
    * missing .rm files and BLANK/PLACEHOLDER pages do not remove output pages.
    * STRICT or unsupported preserving/recomposed pages fail, without reducing
-   * total. Validation/preflight failures may occur before drawing begins.
-   * Read only when struct_size covers both fields; null means no calls. */
+   * total. Argument validation, opening the attached PDF and page-count checks
+   * fail without a report.
+   * Once (0, total) is reported, any later failure follows that initial
+   * report, including a STRICT unreadable-page failure during preflight.
+   * Read only when struct_size covers both fields; null means no calls.
+   * A null callback adds no progress work. */
   rmr_progress_fn progress;
   void* progress_context; /* Borrowed; default null. */
 } rmr_pdf_options;
