@@ -56,7 +56,7 @@ import "C"
 import "unsafe"
 
 // Version is the version of the vendored rmrender-lib.
-const Version = "1.6.0"
+const Version = "1.6.1"
 
 // cVersion answers the C library's own version, so that a test can hold
 // [Version] to it.

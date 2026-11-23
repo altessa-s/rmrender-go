@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "rm_internal.h"
+#include "rmlines/editor.h"
 #include "rmlines/parser.h"
 
 /* ------------------------------------------------------------------ */
@@ -66,6 +67,7 @@ constexpr uint32_t TAG_PAPER_SIZE = 5;
 
 /* The same sheet as tag 5, unrounded — two float64. */
 constexpr uint32_t TAG_CANVAS_SIZE = 7;
+constexpr uint32_t TAG_STAMPED_SHEET_SIZE = 8;
 
 /* Field indexes of a tree node: the visibility, the anchor, and the
  * horizontal the anchored handwriting counts its x from. */
@@ -113,7 +115,8 @@ typedef enum : int {
   ITEM_TOMBSTONE,
   ITEM_STROKE,
   ITEM_GROUP,
-  ITEM_IMAGE
+  ITEM_IMAGE,
+  ITEM_GLYPH
 } item_kind;
 
 /* One item of a node's list of children — the unit the scene is ordered by. A
@@ -123,13 +126,17 @@ typedef enum : int {
 typedef struct scene_item {
   rm_crdt_id parent;
   rm_crdt_id id;
-  rm_crdt_id left;
+  rm_crdt_id left, right;
   /* How many records this one deletes — a counter, not a flag. A living
    * record carries nought and a value; a tombstone carries the count and no
    * value. */
   uint32_t deleted;
   item_kind kind;
-  rm_stroke stroke;
+  bool placement_only;
+  union {
+    rm_stroke stroke;
+    rm_highlight glyph;
+  };
   rm_crdt_id group;
   /* The opaque key of an image's attachment, pointing into the file's own
    * bytes, and the four vertices. */
@@ -152,40 +159,18 @@ typedef struct tree_event {
 /* What a node hangs on in the typed text: the character the file names, and
  * the horizontal it carries alongside. */
 typedef struct node_anchor {
+  bool has_target;
+  rm_crdt_id target_stamp, origin_stamp;
   rm_crdt_id anchor;
   bool has_origin_x;
   double origin_x;
 } node_anchor;
 
 typedef struct attachment {
+  rm_crdt_id stamp;
   uint8_t key[16];
   rm_str name;
 } attachment;
-
-/* One item of text: its own identifier, its neighbours in the CRDT list and
- * the characters themselves. The characters get identifiers running on from
- * the item's identifier. */
-typedef struct text_item {
-  rm_crdt_id id;
-  rm_crdt_id left;
-  rm_crdt_id right;
-  rm_str text;
-  /* How many characters this record deletes. Deleted characters keep their
-   * identifiers, so the next record's `left` counts past them. */
-  uint32_t deleted;
-  /* The code a record carries when it is not text but a marker — any value
-   * but nought; absent for text. 1 bold on, 2 bold off, 3 italic on, 4
-   * italic off: odd switches on and even switches off — but not one pair for
-   * every purpose, or italic would use the same two numbers as bold. 5 and 6
-   * open and close a link, and the opening record's string is the address.
-   * 0xFFFFFFFF is an image in the flow of the text, and its string is the
-   * `{UUID}` key of the image's row in block 0x0E.
-   *
-   * Whatever its string, a marker takes exactly one identifier: the address
-   * of a link adds no characters to the text. */
-  bool has_marker;
-  uint32_t marker;
-} text_item;
 
 /* How many identifiers a record covers: the characters it carries, the ones it
  * deleted, or the single one of a marker. Counted in Unicode scalars, the way
@@ -198,6 +183,7 @@ static uint64_t text_item_span(const text_item* item) {
 }
 
 typedef struct style_entry {
+  rm_crdt_id stamp;
   rm_crdt_id key;
   rm_paragraph_format format;
 } style_entry;
@@ -250,7 +236,6 @@ typedef struct parse_ctx {
   rm_idmap hidden_nodes;
   rm_idmap visibility_of_node; /* node id -> index into visibility_stamps */
   rm_vec visibility_stamps; /* rm_crdt_id, including currently visible nodes */
-  rm_vec highlights;        /* rm_highlight */
 
   bool has_text;
   text_layout text;
@@ -267,10 +252,13 @@ typedef struct parse_ctx {
    * for the next block. */
   char detail[120];
 
+  rm_crdt_id sheet_stamp;
+  bool has_stamped_sheet;
   bool has_paper_size;
   rm_size paper_size;
   /* Shown unless the file says otherwise: most pages carry no flag at all,
    * and a missing field means "never touched", not "hidden". */
+  rm_crdt_id background_stamp, document_stamp;
   bool background_visible;
   bool root_document_visible;
 } parse_ctx;
@@ -312,7 +300,7 @@ rm_status rm_parse_item_preamble(rm_reader* reader, rm_item_preamble* out) {
   RM_TRY(rm_read_crdt(reader, 1, &out->parent));
   RM_TRY(rm_read_crdt(reader, 2, &out->id));
   RM_TRY(rm_read_crdt(reader, 3, &out->left));
-  RM_TRY(rm_skip_crdt(reader, 4)); /* right */
+  RM_TRY(rm_read_crdt(reader, 4, &out->right));
   RM_TRY(rm_expect_tag(reader, 5, RM_TAG_BYTE4));
   return rm_read_u32(reader, &out->deleted);
 }
@@ -324,6 +312,7 @@ static scene_item item_tombstone(const rm_item_preamble* preamble) {
       .parent = preamble->parent,
       .id = preamble->id,
       .left = preamble->left,
+      .right = preamble->right,
       .deleted = preamble->deleted,
       .kind = ITEM_TOMBSTONE,
   };
@@ -432,6 +421,7 @@ static rm_pen_tool tool_of(uint32_t raw) {
     case 17:
     case 18:
     case 21:
+    case 22:
     case 23:
       return (rm_pen_tool)raw;
     default:
@@ -442,8 +432,8 @@ static rm_pen_tool tool_of(uint32_t raw) {
 /* The palette index the file's raw number names, or `fallback` when it is
  * past the end of the palette. */
 static rm_pen_color color_of(uint32_t raw, rm_pen_color fallback) {
-  return raw <= (uint32_t)RM_COLOR_HIGHLIGHTER_ORANGE ? (rm_pen_color)raw
-                                                      : fallback;
+  return raw <= (uint32_t)RM_COLOR_HIGHLIGHTER_GRAY ? (rm_pen_color)raw
+                                                    : fallback;
 }
 
 /* `end` is the end of the block, and the value has to lie inside it. The
@@ -510,7 +500,7 @@ static rm_status parse_line_item(parse_ctx* ctx, rm_reader* reader,
   size_t count = points_length / size;
   rm_stroke_point* points = nullptr;
   if (count != 0) {
-    points = rm_arena_alloc(ctx->arena, count * sizeof *points);
+    points = rm_alloc_stroke_points(ctx->arena, count);
     if (points == nullptr) return RM_ERR_OUT_OF_MEMORY;
     for (size_t i = 0; i < count; i += 1) {
       RM_TRY(parse_point(reader, point_version, &points[i]));
@@ -548,6 +538,7 @@ static rm_status parse_line_item(parse_ctx* ctx, rm_reader* reader,
       .parent = preamble.parent,
       .id = preamble.id,
       .left = preamble.left,
+      .right = preamble.right,
       .deleted = preamble.deleted,
       .kind = ITEM_STROKE,
       .stroke =
@@ -651,6 +642,7 @@ static rm_status parse_scene_tombstone(rm_reader* reader, scene_item* out) {
  * the caret is ambiguous. The remaining fields (the layer's name, the anchor
  * type and threshold) are skipped by length. */
 typedef struct tree_node {
+  rm_crdt_id target_stamp, origin_stamp;
   rm_crdt_id id;
   bool has_anchor;
   rm_crdt_id anchor;
@@ -664,8 +656,8 @@ typedef struct tree_node {
 /* One scene tree node's own identifier, anchor and visibility, read field by
  * field so that a field of an unknown shape ends the node rather than the
  * block. */
-static rm_status parse_tree_node(rm_reader* reader, size_t end,
-                                 tree_node* out) {
+static rm_status parse_tree_node(rm_reader* reader, size_t end, tree_node* out,
+                                 rm_anchor_field* location) {
   *out = (tree_node){0};
   RM_TRY(rm_read_crdt(reader, 1, &out->id));
 
@@ -679,6 +671,7 @@ static rm_status parse_tree_node(rm_reader* reader, size_t end,
     }
     switch (type) {
       case RM_TAG_LENGTH4: {
+        size_t length_at = reader->offset;
         uint32_t length;
         RM_TRY(rm_read_u32(reader, &length));
         size_t sub_end;
@@ -691,17 +684,17 @@ static rm_status parse_tree_node(rm_reader* reader, size_t end,
         rm_reader* outer = reader;
         reader = &field;
         if (index == TAG_ANCHOR) {
-          /* There are two identifiers here. The first is unique to
-           * the node, while the one pointing at a character of the
-           * text is the second: nodes share characters, so the
-           * second repeats where the first, one per node, never
-           * does. */
-          rm_crdt_id ignored;
-          (void)rm_read_crdt(reader, 1, &ignored);
+          rm_crdt_id stamp = RM_CRDT_NONE;
+          (void)rm_read_crdt(reader, 1, &stamp);
           rm_crdt_id anchor;
-          if (rm_read_crdt(reader, 2, &anchor) == RM_OK) {
+          if (rm_read_crdt(reader, 2, &anchor) == RM_OK &&
+              !rm_stamp_newer(out->target_stamp, stamp)) {
+            out->target_stamp = stamp;
             out->has_anchor = true;
             out->anchor = anchor;
+            if (location)
+              *location = (rm_anchor_field){out->id,   stamp,          anchor,
+                                            length_at, reader->offset, sub_end};
           }
         } else if (index == TAG_ANCHOR_ORIGIN) {
           /* The stamped spelling: a last-write-wins record — the
@@ -710,15 +703,17 @@ static rm_status parse_tree_node(rm_reader* reader, size_t end,
            * format also allows the bare spelling read below. A
            * field lost to the difference would mean a silently
            * recomputed horizontal. */
-          rm_crdt_id ignored;
-          (void)rm_read_crdt(reader, 1, &ignored);
+          rm_crdt_id stamp = RM_CRDT_NONE;
+          (void)rm_read_crdt(reader, 1, &stamp);
           float value;
           /* Left unset when it is not a place, the way the text
            * origin is: the horizontal is optional, and a renderer
            * without it recomputes — a renderer with a NaN draws
            * the handwriting nowhere. */
           if (rm_match_tag(reader, 2, RM_TAG_BYTE4) &&
-              rm_read_f32(reader, &value) == RM_OK && isfinite(value)) {
+              rm_read_f32(reader, &value) == RM_OK && isfinite(value) &&
+              !rm_stamp_newer(out->origin_stamp, stamp)) {
+            out->origin_stamp = stamp;
             out->has_origin_x = true;
             out->origin_x = (double)value;
           }
@@ -728,15 +723,17 @@ static rm_status parse_tree_node(rm_reader* reader, size_t end,
            * the newer wins. A layer never hidden or shown carries
            * (0, 0); every hide and every show is an edit with a real
            * identifier. */
-          if (rm_read_crdt(reader, 1, &out->visibility_stamp) != RM_OK) {
-            out->visibility_stamp = rm_crdt_make(0, 0);
-          }
+          rm_crdt_id stamp = RM_CRDT_NONE;
+          (void)rm_read_crdt(reader, 1, &stamp);
           if (rm_match_tag(reader, 2, RM_TAG_BYTE1)) {
             /* A flag cut short is no "hidden": only a nought
              * read hides the layer. */
             uint8_t flag;
-            out->has_visible = true;
-            out->visible = rm_read_u8(reader, &flag) != RM_OK || flag != 0;
+            if (!rm_stamp_newer(out->visibility_stamp, stamp)) {
+              out->has_visible = true;
+              out->visibility_stamp = stamp;
+              out->visible = rm_read_u8(reader, &flag) != RM_OK || flag != 0;
+            }
           }
         }
         reader = outer;
@@ -746,7 +743,8 @@ static rm_status parse_tree_node(rm_reader* reader, size_t end,
         if (index == TAG_ANCHOR_ORIGIN) {
           float value;
           RM_TRY(rm_read_f32(reader, &value));
-          if (isfinite(value)) {
+          if (isfinite(value) &&
+              rm_crdt_equal(out->origin_stamp, RM_CRDT_NONE)) {
             out->has_origin_x = true;
             out->origin_x = (double)value;
           }
@@ -780,6 +778,12 @@ static rm_status parse_tree_node(rm_reader* reader, size_t end,
     }
   }
   return RM_OK;
+}
+
+rm_status rm_read_node_anchor(rm_reader body, rm_anchor_field* anchor) {
+  tree_node node;
+  *anchor = (rm_anchor_field){0};
+  return parse_tree_node(&body, body.size, &node, anchor);
 }
 
 /* ------------------------------------------------------------------ */
@@ -822,35 +826,43 @@ static void parse_scene_info(parse_ctx* ctx, rm_reader* reader, size_t end) {
         paper = (rm_size){.width = (double)width, .height = (double)height};
         has_paper = true;
       }
-    } else if (index == TAG_CANVAS_SIZE && length >= 16) {
-      /* The same sheet unrounded. Tag 7 is read and never tag 8, which
-       * some readers take for the sheet: tag 7 is the sheet the page is
-       * drawn on. A Move's canvas is 820.295 × 1458.303 where tag 5
-       * says 820 × 1458, and the page comes out at 260 × 463 points —
-       * the canvas times the unit, rounded to whole points, and not the
-       * panel's 462.4. Read after the whole one so it wins when both
-       * are there, and a page carrying only tag 5 still has a sheet.
-       *
-       * `isfinite` and not only `> 0`: a NaN fails the comparison on its
-       * own, but +Inf passes it and becomes a sheet of infinite size —
-       * every page of the book rendered into a MediaBox no reader will
-       * open. */
+    } else if (index == TAG_CANVAS_SIZE || index == TAG_STAMPED_SHEET_SIZE) {
+      rm_crdt_id stamp = RM_CRDT_NONE;
+      rm_reader dimensions = *reader;
+      if (index == TAG_STAMPED_SHEET_SIZE &&
+          (rm_read_crdt(reader, 1, &stamp) != RM_OK ||
+           !rm_match_tag(reader, 2, RM_TAG_LENGTH4) ||
+           rm_read_subblock(reader, &dimensions) != RM_OK)) {
+        reader = outer;
+        continue;
+      }
       double width, height;
-      if (rm_read_f64(reader, &width) == RM_OK &&
-          rm_read_f64(reader, &height) == RM_OK && isfinite(width) &&
+      if (rm_read_f64(&dimensions, &width) == RM_OK &&
+          rm_read_f64(&dimensions, &height) == RM_OK && isfinite(width) &&
           isfinite(height) && width > 0 && height > 0) {
         canvas = (rm_size){.width = width, .height = height};
         has_canvas = true;
+        if (index == TAG_STAMPED_SHEET_SIZE &&
+            !rm_stamp_newer(ctx->sheet_stamp, stamp)) {
+          ctx->has_stamped_sheet = ctx->has_paper_size = true;
+          ctx->sheet_stamp = stamp;
+          ctx->paper_size = canvas;
+        }
       }
     } else if (index == TAG_BACKGROUND_VISIBLE ||
                index == TAG_ROOT_DOCUMENT_VISIBLE) {
       /* The timestamp of the last write, then the flag — the same shape
        * as a layer's visibility in the tree node. */
-      rm_crdt_id ignored;
-      (void)rm_read_crdt(reader, 1, &ignored);
+      rm_crdt_id stamp = RM_CRDT_NONE;
+      (void)rm_read_crdt(reader, 1, &stamp);
+      rm_crdt_id* previous = index == TAG_BACKGROUND_VISIBLE
+                                 ? &ctx->background_stamp
+                                 : &ctx->document_stamp;
       uint8_t flag;
       if (rm_match_tag(reader, 2, RM_TAG_BYTE1) &&
-          rm_read_u8(reader, &flag) == RM_OK) {
+          rm_read_u8(reader, &flag) == RM_OK &&
+          !rm_stamp_newer(*previous, stamp)) {
+        *previous = stamp;
         if (index == TAG_BACKGROUND_VISIBLE)
           ctx->background_visible = flag != 0;
         else
@@ -861,6 +873,7 @@ static void parse_scene_info(parse_ctx* ctx, rm_reader* reader, size_t end) {
     reader = outer;
   }
 
+  if (ctx->has_stamped_sheet) return;
   if (has_canvas) {
     ctx->paper_size = canvas;
     ctx->has_paper_size = true;
@@ -913,11 +926,13 @@ static void skip_optional_tail(rm_reader* reader, uint32_t index,
 /* One highlight record (0x03): the preamble, then its value — the fuller
  * contract is documented above `skip_optional_tail`. */
 static rm_status parse_glyph_item(parse_ctx* ctx, rm_reader* reader, size_t end,
-                                  bool* out_found, rm_highlight* out) {
+                                  bool* out_found, rm_highlight* out,
+                                  scene_item* position) {
   *out_found = false;
   rm_item_preamble preamble;
   RM_TRY(rm_parse_item_preamble(reader, &preamble));
 
+  *position = item_tombstone(&preamble);
   /* No value means the highlight was removed — as ordinary here as an erased
    * stroke, and answered "not found" rather than refused for that reason.
    * Only a real tombstone is that: a deleted length, and the block ending
@@ -1088,8 +1103,8 @@ static rm_status parse_attachment_entry(parse_ctx* ctx, rm_reader* row,
   if (!rm_match_tag(row, 1, RM_TAG_LENGTH4)) return RM_OK;
   uint32_t ignored;
   RM_TRY(rm_read_u32(row, &ignored));
+  rm_crdt_id stamp = RM_CRDT_NONE;
   if (rm_match_tag(row, 1, RM_TAG_ID)) {
-    rm_crdt_id stamp;
     RM_TRY(rm_read_bare_crdt(row, &stamp));
   }
   if (!rm_match_tag(row, 2, RM_TAG_LENGTH4)) return RM_OK;
@@ -1098,7 +1113,7 @@ static rm_status parse_attachment_entry(parse_ctx* ctx, rm_reader* row,
   rm_str name;
   RM_TRY(rm_read_string(&text, text.size, ctx->arena, &name));
   if (name.length == 0) return RM_OK;
-  attachment entry = {.name = name};
+  attachment entry = {.name = name, .stamp = stamp};
   memcpy(entry.key, key, 16);
   return rm_vec_push(out, &entry) ? RM_OK : RM_ERR_OUT_OF_MEMORY;
 }
@@ -1137,14 +1152,16 @@ static rm_status parse_attachment_map(parse_ctx* ctx, rm_reader* reader) {
     reader->offset = entry_end;
   }
 
-  /* Merged only once the block has read: later names win, within a block as
-   * across blocks. */
+  /* Merge only after the entire block has been validated. */
   for (size_t i = 0; i < entries.count; i += 1) {
     const attachment* entry = rm_vec_at(&entries, i);
     uint64_t existing_at;
     if (rm_keymap_get(&ctx->attachment_index, entry->key, &existing_at)) {
       attachment* existing = rm_vec_at(&ctx->attachments, (size_t)existing_at);
-      existing->name = entry->name;
+      /* Legacy map snapshots use the untouched stamp and replace by key. */
+      if (rm_crdt_equal(entry->stamp, RM_CRDT_NONE) ||
+          !rm_stamp_newer(existing->stamp, entry->stamp))
+        *existing = *entry;
     } else if (!rm_vec_push(&ctx->attachments, entry) ||
                !rm_keymap_set(&ctx->attachment_index, entry->key,
                               ctx->attachments.count - 1u)) {
@@ -1368,9 +1385,9 @@ static rm_status parse_text_items(parse_ctx* ctx, rm_reader* reader,
 
 /* The value of one paragraph style, held to its own bytes. */
 static rm_status parse_style_value(rm_reader* reader, rm_crdt_id key,
-                                   rm_vec* out) {
+                                   rm_crdt_id stamp, rm_vec* out) {
   if (rm_match_tag(reader, 1, RM_TAG_BYTE1)) {
-    style_entry entry = {.key = key};
+    style_entry entry = {.key = key, .stamp = stamp};
     RM_TRY(rm_read_u8(reader, &entry.format.raw));
     /* The value goes on past the first field, and reading only the
      * first would run two different presentations together: an
@@ -1443,12 +1460,8 @@ static rm_status parse_paragraph_styles(rm_reader* reader, rm_vec* out) {
     if (reader->offset >= list_end) break;
     rm_crdt_id key;
     RM_TRY(rm_read_bare_crdt(reader, &key));
-    /* The timestamp of the last write. Kept only to step over it: with one
-     * writer there is nothing to resolve. */
-    {
-      rm_crdt_id stamp;
-      (void)rm_read_crdt(reader, 1, &stamp);
-    }
+    rm_crdt_id stamp = RM_CRDT_NONE;
+    (void)rm_read_crdt(reader, 1, &stamp);
     if (!rm_match_tag(reader, 2, RM_TAG_LENGTH4)) break;
     uint32_t value_length;
     RM_TRY(rm_read_u32(reader, &value_length));
@@ -1457,7 +1470,7 @@ static rm_status parse_paragraph_styles(rm_reader* reader, rm_vec* out) {
 
     rm_reader value = *reader;
     value.size = value_end;
-    rm_status status = parse_style_value(&value, key, out);
+    rm_status status = parse_style_value(&value, key, stamp, out);
     if (status != RM_OK) {
       reader->offset = value.offset;
       return status;
@@ -1480,187 +1493,217 @@ static rm_crdt_id text_left_key(size_t index, void* ctx) {
   return ((text_key_ctx*)ctx)->items[index].left;
 }
 
-/* The grouping key for a position in a tie: the record's `right`. */
-static rm_crdt_id text_right_key(size_t position, void* ctx) {
-  /* Keyed over the positions of one tie, so the context carries the bucket
-   * as well as the items. */
-  struct {
-    const text_item* items;
-    const uint32_t* bucket;
-  }* state = ctx;
-  return state->items[state->bucket[position]].right;
+typedef struct neighbours {
+  rm_crdt_id id, left, right;
+} neighbours;
+
+typedef struct neighbour_ctx {
+  const uint32_t* indices;
+  const text_item* text;
+  const scene_item* scene;
+  const rm_idmap* run_positions;
+} neighbour_ctx;
+
+static neighbours neighbours_at(const neighbour_ctx* ctx, size_t position) {
+  size_t i = ctx->indices[position];
+  if (ctx->text) {
+    const text_item* row = &ctx->text[i];
+    return (neighbours){row->id, row->left, row->right};
+  }
+  const scene_item* item = &ctx->scene[i];
+  return (neighbours){item->id, item->left, item->right};
 }
 
-/* The order in which the records of one tie leave it.
- *
- * Two records with the same left neighbour are an everyday matter in a CRDT.
- * The one that comes first is the one whose own right link points at another
- * record of the same tie — a record inserted between `left` and an existing
- * record carries that record's id as its `right` and stands before it. Where
- * none does, file order decides.
- *
- * That rule reads a record against **what is still left of the tie**, so it
- * looks as if it must be asked afresh at every step. It need not be: taking a
- * record can only shrink the set of identifiers the tie holds, so a record
- * whose right has already fallen outside can never fall back in. Both answers
- * the rule needs — the first record still in the tie, and the first one still
- * pointing inside it — therefore only ever move forward, and two marks
- * walking the tie once give the whole order in time proportional to its size
- * instead of to its square. */
-static bool tie_order(const uint32_t* bucket, size_t count,
-                      const text_item* items, uint32_t* out) {
-  if (count <= 1) {
-    if (count == 1) out[0] = bucket[0];
-    return true;
-  }
+static rm_crdt_id neighbour_right(size_t i, void* opaque) {
+  const neighbour_ctx* ctx = opaque;
+  rm_crdt_id right = neighbours_at(ctx, i).right;
+  uint64_t owner;
+  if (ctx->run_positions && !rm_crdt_equal(right, RM_CRDT_NONE) &&
+      rm_idmap_get(ctx->run_positions, right, &owner))
+    return neighbours_at(ctx, owner).id;
+  return right;
+}
 
+/* Emit prerequisites first. Each edge is visited once, and a back edge
+ * into the current path is ignored so malformed cycles terminate. */
+static bool order_neighbours(const uint32_t* order, size_t count,
+                             neighbour_ctx* ctx, uint32_t* sorted) {
+  typedef struct frame {
+    uint32_t index;
+    size_t next, end;
+    bool left_done;
+  } frame;
+  rm_grouping before = {0};
+  rm_idmap positions;
+  rm_idmap_init(&positions);
+  frame* path = calloc(count, sizeof *path);
+  uint8_t* state = calloc(count, 1);
   bool ok = false;
-  rm_idmap id_count;
-  rm_idmap_init(&id_count);
-  rm_grouping dependents = {0};
-  bool* points_inside = calloc(count, sizeof *points_inside);
-  bool* gone = calloc(count, sizeof *gone);
-  if (points_inside == nullptr || gone == nullptr) goto done;
-
-  /* How many records of the tie still carry each identifier. Counted and not
-   * gathered into a set: two records may share an id, and the id leaves the
-   * tie only with the last of them. */
-  for (size_t i = 0; i < count; i += 1) {
-    uint64_t carried = 0;
-    (void)rm_idmap_get(&id_count, items[bucket[i]].id, &carried);
-    if (!rm_idmap_set(&id_count, items[bucket[i]].id, carried + 1u)) goto done;
-  }
-
-  /* Which positions point at each identifier, so that the identifier leaving
-   * the tie can put them all out at once. Every position leaves at most
-   * once, which is what keeps the total linear. */
-  {
-    struct {
-      const text_item* items;
-      const uint32_t* bucket;
-    } state = {.items = items, .bucket = bucket};
-    if (!rm_grouping_build(&dependents, count, text_right_key, &state))
-      goto done;
-  }
-  for (size_t position = 0; position < count; position += 1) {
-    points_inside[position] =
-        rm_idmap_contains(&id_count, items[bucket[position]].right);
-  }
-
-  /* The two marks. Neither ever goes back: a position one has passed is
-   * either gone from the tie or has stopped pointing inside it, and neither
-   * is undone. */
-  size_t pointing = 0;
-  size_t present = 0;
-  size_t written = 0;
-  while (written < count) {
-    while (pointing < count && (gone[pointing] || !points_inside[pointing]))
-      pointing += 1;
-    size_t position;
-    if (pointing < count) {
-      position = pointing;
-    } else {
-      while (present < count && gone[present]) present += 1;
-      if (present >= count) break;
-      position = present;
-    }
-
-    gone[position] = true;
-    out[written++] = bucket[position];
-
-    rm_crdt_id id = items[bucket[position]].id;
-    uint64_t carried;
-    if (!rm_idmap_get(&id_count, id, &carried)) continue;
-    if (carried > 1) {
-      if (!rm_idmap_set(&id_count, id, carried - 1u)) goto done;
-    } else {
-      (void)rm_idmap_take(&id_count, id, nullptr);
-      const uint32_t* pointers;
-      size_t pointer_count;
-      if (rm_grouping_find(&dependents, id, &pointers, &pointer_count)) {
-        for (size_t k = 0; k < pointer_count; k += 1)
-          points_inside[pointers[k]] = false;
+  if (!path || !state) goto done;
+  for (size_t i = 0; i < count; i++) {
+    rm_crdt_id id = neighbours_at(ctx, i).id;
+    if (!rm_idmap_set(&positions, id, i)) goto done;
+    {
+      /* A neighbour can name the final position of a compact run. */
+      uint64_t span = ctx->text ? text_item_span(&ctx->text[order[i]])
+                                : ctx->scene[order[i]].deleted;
+      if (span > 1 && span - 1 <= UINT64_MAX - id.counter) {
+        id.counter += span - 1;
+        if (!rm_idmap_set(&positions, id, i)) goto done;
       }
     }
   }
-  /* A tie always empties: every turn marks one record gone, and the second
-   * mark finds whichever is left. The fill below is belt and braces. */
-  for (size_t i = 0; written < count && i < count; i += 1) {
-    if (!gone[i]) {
-      gone[i] = true;
-      out[written++] = bucket[i];
+  neighbour_ctx keys = *ctx;
+  keys.run_positions = &positions;
+  if (!rm_grouping_build(&before, count, neighbour_right, &keys)) goto done;
+  size_t written = 0, depth = 0;
+  for (size_t root = 0; root < count; root++) {
+    if (state[root]) continue;
+    path[depth++] = (frame){.index = (uint32_t)root};
+    while (depth) {
+      frame* f = &path[depth - 1];
+      neighbours item = neighbours_at(ctx, f->index);
+      uint64_t dep;
+      if (!state[f->index]) {
+        state[f->index] = 1;
+        size_t g;
+        if (rm_grouping_number(&before, item.id, &g) &&
+            !rm_crdt_equal(item.id, RM_CRDT_NONE)) {
+          f->next = before.starts[g];
+          f->end = before.ends[g];
+          /* Identical IDs share the same predecessors. */
+          before.starts[g] = before.ends[g];
+        }
+      }
+      if (!f->left_done) {
+        f->left_done = true;
+        if (!rm_idmap_get(&positions, item.left, &dep)) continue;
+      } else if (f->next < f->end)
+        dep = before.items[f->next++];
+      else {
+        state[f->index] = 2;
+        sorted[written++] = order[f->index];
+        --depth;
+        continue;
+      }
+      if (!state[dep]) path[depth++] = (frame){.index = (uint32_t)dep};
     }
   }
   ok = true;
-
 done:
-  free(points_inside);
-  free(gone);
-  rm_grouping_free(&dependents);
-  rm_idmap_free(&id_count);
+  free(path);
+  free(state);
+  rm_idmap_free(&positions);
+  rm_grouping_free(&before);
   return ok;
 }
 
-/* The items in the order they read.
- *
- * The order is set by the `left` links: an item follows the character its link
- * points at. Sorting by the counter will not do — an item added later may
- * stand in the middle, and the marks of a face are added last of all.
- *
- * Indexed by the same grouping the scene walk uses, and for the same reason:
- * filtering the whole of what is left at every step and deleting from the
- * middle of it would be quadratic in the number of records — and a page
- * accumulates a record per edit, so the number is the file's to choose. On a
- * page big enough that is the parse itself hanging, in a task nothing
- * interrupts. */
-static bool in_document_order(const text_item* items, size_t count,
-                              uint32_t** out_order) {
+/* A left reference cuts after its scalar, a right reference before it.
+ * Sort the cut positions so even a large deleted span costs work only for
+ * the boundaries it contains. */
+static int compare_positions(const void* a, const void* b) {
+  const rm_crdt_id* x = a;
+  const rm_crdt_id* y = b;
+  if (x->author != y->author) return (int)x->author - (int)y->author;
+  return (x->counter > y->counter) - (x->counter < y->counter);
+}
+
+bool rm_split_text_runs(const text_item* rows, size_t count, rm_vec* parts) {
+  rm_vec cuts;
+  rm_vec_init(&cuts, sizeof(rm_crdt_id));
+  bool ok = false;
+  for (size_t i = 0; i < count; ++i) {
+    rm_crdt_id left = rows[i].left, right = rows[i].right;
+    if (!rm_crdt_equal(left, RM_CRDT_NONE) && left.counter < UINT64_MAX) {
+      ++left.counter;
+      if (!rm_vec_push(&cuts, &left)) goto done;
+    }
+    if (!rm_crdt_equal(right, RM_CRDT_NONE) && !rm_vec_push(&cuts, &right))
+      goto done;
+  }
+  rm_crdt_id* cut = cuts.data;
+  if (cuts.count) qsort(cut, cuts.count, sizeof *cut, compare_positions);
+  for (size_t i = 0; i < count; ++i) {
+    text_item part = rows[i];
+    part.source = i;
+    uint64_t span = text_item_span(&part);
+    size_t lo = 0, hi = cuts.count;
+    while (lo < hi) {
+      size_t mid = lo + (hi - lo) / 2;
+      if (compare_positions(&cut[mid], &part.id) <= 0)
+        lo = mid + 1;
+      else
+        hi = mid;
+    }
+    for (; lo < cuts.count && cut[lo].author == part.id.author; ++lo) {
+      uint64_t length = cut[lo].counter - part.id.counter;
+      if (length >= span) break;
+      if (!length) continue;
+      text_item prefix = part;
+      prefix.fragment = part.fragment = true;
+      prefix.right = cut[lo];
+      if (part.text.length) {
+        size_t byte = 0;
+        for (uint64_t k = 0; k < length; ++k)
+          byte = rm_utf8_next(part.text.bytes, part.text.length, byte, nullptr);
+        prefix.text.length = byte;
+        part.text.bytes += byte;
+        part.text.length -= byte;
+      } else {
+        prefix.deleted = (uint32_t)length;
+        part.deleted -= prefix.deleted;
+      }
+      if (!rm_vec_push(parts, &prefix)) goto done;
+      part.id = part.left = cut[lo];
+      --part.left.counter;
+      span -= length;
+    }
+    if (!rm_vec_push(parts, &part)) goto done;
+  }
+  ok = true;
+done:
+  rm_vec_free(&cuts);
+  return ok;
+}
+
+/* First walk the left-linked branches to get the reading order of ties.
+ * Then impose every explicit neighbour dependency on that sequence. */
+bool rm_text_record_order(const text_item* items, size_t count,
+                          uint32_t** out_order) {
   *out_order = nullptr;
   if (count == 0) return true;
 
   bool ok = false;
   rm_grouping by_left = {0};
   uint32_t* scratch = nullptr;
-  uint32_t* cursor_of_group = nullptr;
+  bool* spent = nullptr;
   bool* taken = nullptr;
   uint32_t* ordered = nullptr;
 
   text_key_ctx key_ctx = {.items = items};
   if (!rm_grouping_build(&by_left, count, text_left_key, &key_ctx)) goto done;
 
-  /* The order in which one bucket's records leave it depends on that bucket
-   * and on nothing else — not on the cursor, not on what has been read
-   * elsewhere — so it is worked out once per bucket rather than derived
-   * again on every visit.
-   *
-   * Derived again, it would be quadratic: a page whose records all name one
-   * `left` would re-scan the whole tie on every one of them, and the time
-   * would grow with the square of a count the file chooses. */
+  /* Use the left-link traversal as the tie-breaker for unrelated records. */
   scratch = calloc(count, sizeof *scratch);
-  cursor_of_group = calloc(by_left.group_count, sizeof *cursor_of_group);
+  spent = calloc(by_left.group_count, sizeof *spent);
   taken = calloc(count, sizeof *taken);
   ordered = calloc(count, sizeof *ordered);
-  if (scratch == nullptr || cursor_of_group == nullptr || taken == nullptr ||
+  if (scratch == nullptr || spent == nullptr || taken == nullptr ||
       ordered == nullptr) {
     goto done;
   }
-  for (size_t group = 0; group < by_left.group_count; group += 1) {
-    uint32_t start = by_left.starts[group];
-    size_t size = by_left.ends[group] - start;
-    if (!tie_order(by_left.items + start, size, items, scratch)) goto done;
-    memcpy(by_left.items + start, scratch, size * sizeof *scratch);
-  }
-
   size_t written = 0;
   rm_crdt_id cursor = RM_CRDT_NONE;
-  while (written < count) {
+  size_t pending = 0;
+  for (;;) {
     size_t group;
-    if (!rm_grouping_number(&by_left, cursor, &group)) break;
-    uint32_t start = by_left.starts[group];
-    if (cursor_of_group[group] >= by_left.ends[group] - start) break;
-    uint32_t index = by_left.items[start + cursor_of_group[group]];
-    cursor_of_group[group] += 1;
-
+    if (rm_grouping_number(&by_left, cursor, &group) && !spent[group]) {
+      spent[group] = true;
+      for (size_t j = by_left.ends[group]; j > by_left.starts[group]; --j)
+        scratch[pending++] = by_left.items[j - 1];
+    }
+    if (!pending) break;
+    uint32_t index = scratch[--pending];
     taken[index] = true;
     ordered[written++] = index;
 
@@ -1685,14 +1728,16 @@ static bool in_document_order(const text_item* items, size_t count,
     if (!taken[i]) ordered[written++] = (uint32_t)i;
   }
 
-  *out_order = ordered;
-  ordered = nullptr;
+  neighbour_ctx ctx = {.indices = ordered, .text = items};
+  if (!order_neighbours(ordered, count, &ctx, scratch)) goto done;
+  *out_order = scratch;
+  scratch = nullptr;
   ok = true;
 
 done:
   free(ordered);
   free(taken);
-  free(cursor_of_group);
+  free(spent);
   free(scratch);
   rm_grouping_free(&by_left);
   return ok;
@@ -1745,7 +1790,7 @@ static void layout_free(text_layout* layout) {
 static rm_status compose(const text_item* items, size_t count,
                          text_layout* layout) {
   uint32_t* order = nullptr;
-  if (!in_document_order(items, count, &order)) {
+  if (!rm_text_record_order(items, count, &order)) {
     return RM_ERR_OUT_OF_MEMORY;
   }
 
@@ -1936,7 +1981,8 @@ static bool layout_anchor(const text_layout* layout, rm_crdt_id anchor,
  * the width as a last-write-wins value — the stamp, then the float32. Pages
  * nest it so, one level deeper than a bare LWW (`5:{1:{1:stamp,
  * 2:f32}}`). Anything else, or a width that is not a width, answers false. */
-static bool read_settings_width(rm_reader* reader, double* out) {
+static bool read_settings_width(rm_reader* reader, rm_crdt_id* previous,
+                                double* out) {
   if (!rm_match_tag(reader, 1, RM_TAG_LENGTH4)) return false;
   rm_reader width;
   if (rm_read_subblock(reader, &width) != RM_OK) return false;
@@ -1948,7 +1994,9 @@ static bool read_settings_width(rm_reader* reader, double* out) {
     return false;
   }
   double result = (double)value;
-  if (!isfinite(result) || result <= 0) return false;
+  if (!isfinite(result) || result <= 0 || rm_stamp_newer(*previous, stamp))
+    return false;
+  *previous = stamp;
   *out = result;
   return true;
 }
@@ -1970,6 +2018,7 @@ static rm_status parse_root_text(parse_ctx* ctx, rm_reader* reader, size_t end,
 
   bool has_origin = false;
   bool has_settings_width = false;
+  rm_crdt_id width_stamp = RM_CRDT_NONE;
   double settings_width = 0;
   rm_status status = RM_OK;
 
@@ -2046,7 +2095,12 @@ static rm_status parse_root_text(parse_ctx* ctx, rm_reader* reader, size_t end,
     } else if (index == TAG_TEXT_SETTINGS) {
       rm_reader settings = *reader;
       settings.size = sub_end;
-      has_settings_width = read_settings_width(&settings, &settings_width);
+      while (settings.offset < settings.size) {
+        size_t before = settings.offset;
+        if (read_settings_width(&settings, &width_stamp, &settings_width))
+          has_settings_width = true;
+        if (before == settings.offset) break;
+      }
     }
     status = rm_read_seek(reader, sub_end);
     if (status != RM_OK) goto done;
@@ -2063,7 +2117,12 @@ static rm_status parse_root_text(parse_ctx* ctx, rm_reader* reader, size_t end,
     goto done;
   }
 
-  status = compose(items.data, items.count, &layout);
+  rm_vec parts;
+  rm_vec_init(&parts, sizeof(text_item));
+  status = rm_split_text_runs(items.data, items.count, &parts)
+               ? compose(parts.data, parts.count, &layout)
+               : RM_ERR_OUT_OF_MEMORY;
+  rm_vec_free(&parts);
   if (status != RM_OK) goto done;
 
   rm_vec_free(&items);
@@ -2153,6 +2212,13 @@ static uint32_t* chain_order(const uint32_t* indices, size_t count,
   *out_count = count;
   uint32_t* result = calloc(count == 0 ? 1 : count, sizeof *result);
   if (result == nullptr) return nullptr;
+  /* Unlinked placements follow all sequence items in placement-record order.
+   * They have no sequence IDs and cannot participate in neighbour resolution.
+   */
+  while (count && items[indices[count - 1]].placement_only) {
+    --count;
+    result[count] = indices[count];
+  }
   if (count <= 1) {
     if (count == 1) result[0] = indices[0];
     return result;
@@ -2205,6 +2271,9 @@ static uint32_t* chain_order(const uint32_t* indices, size_t count,
     uint32_t index = stack[--stack_count];
     result[written++] = index;
     cursor = items[index].id;
+    uint32_t span = items[index].deleted;
+    if (span > 1 && span - 1 <= UINT64_MAX - cursor.counter)
+      cursor.counter += span - 1;
   }
 
   /* Links that did not add up — appended as they lie, not lost. */
@@ -2213,6 +2282,9 @@ static uint32_t* chain_order(const uint32_t* indices, size_t count,
     if (!taken[position]) result[written++] = indices[position];
   }
 
+  neighbour_ctx ctx = {.indices = result, .scene = items};
+  if (!order_neighbours(result, count, &ctx, scratch)) goto fail;
+  memcpy(result, scratch, count * sizeof *result);
   free(spent);
   free(taken);
   free(stack);
@@ -2302,39 +2374,36 @@ static bool tree_links(const tree_state* tree, rm_crdt_id parent,
   return !tree_parent_of(tree, child, &placed) || rm_crdt_equal(placed, parent);
 }
 
-/* Whether `node` or a node above it, as the tree records place them, is in
- * `removed` or `hidden`; the answer in `*out_under`. The answer for every
- * node on the climb is kept in `known` (1 under, 0 not), so a page of many
- * items on one deep node climbs once and not once per item. The climb ends
- * at a node already known, at one no record places, or — a cycle in the
- * records — after one step more than there are placed nodes, which no climb
- * without a repeat can take. `path` is scratch. False only on allocation
- * failure. */
-static bool tree_is_under(const tree_state* tree, const rm_idmap* removed,
-                          const rm_idmap* hidden, rm_idmap* known, rm_vec* path,
-                          rm_crdt_id node, bool* out_under) {
-  path->count = 0;
-  bool under = false;
-  rm_crdt_id at = node;
-  for (size_t steps = 0; steps <= tree->placed_by.count; steps += 1) {
-    uint64_t answer;
-    if (rm_idmap_get(known, at, &answer)) {
-      under = answer != 0;
-      break;
-    }
-    if (!rm_vec_push(path, &at)) return false;
-    if (rm_idmap_contains(removed, at) || rm_idmap_contains(hidden, at)) {
-      under = true;
-      break;
-    }
-    if (!tree_parent_of(tree, at, &at)) break;
+/* Supply an in-memory group edge for each live placement missing its
+ * ordering link. Both drawing and layer enumeration order these edges last. */
+static bool append_unlinked_placements(parse_ctx* ctx, const tree_state* tree) {
+  rm_idmap linked = {0};
+  bool ok = false;
+  const scene_item* items = ctx->items.data;
+  for (size_t i = 0; i < ctx->items.count; ++i) {
+    const scene_item* item = &items[i];
+    if (item->kind == ITEM_GROUP && !item->deleted &&
+        tree_links(tree, item->parent, item->group) &&
+        !rm_idmap_set(&linked, item->group, 1))
+      goto done;
   }
-  for (size_t i = 0; i < path->count; i += 1) {
-    const rm_crdt_id* visited = rm_vec_at(path, i);
-    if (!rm_idmap_set(known, *visited, under ? 1 : 0)) return false;
+  for (size_t i = 0; i < ctx->tree_events.count; ++i) {
+    const tree_event* event = &tree->events[i];
+    uint64_t latest;
+    if (!rm_idmap_get(&tree->placed_by, event->node, &latest) || latest != i ||
+        rm_idmap_contains(&tree->removed, event->node) ||
+        rm_idmap_contains(&linked, event->node))
+      continue;
+    scene_item edge = {.kind = ITEM_GROUP,
+                       .group = event->node,
+                       .parent = event->parent,
+                       .placement_only = true};
+    if (!rm_vec_push(&ctx->items, &edge)) goto done;
   }
-  *out_under = under;
-  return true;
+  ok = true;
+done:
+  rm_idmap_free(&linked);
+  return ok;
 }
 
 typedef struct walk_frame {
@@ -2346,57 +2415,14 @@ typedef struct walk_frame {
 
 typedef struct scene_walk {
   const scene_item* items;
-  size_t item_count;
   const rm_grouping* children_of;
   const tree_state* tree;
-  const rm_idmap* removed;
-  const rm_idmap* hidden;
   bool* placed;
   rm_vec strokes; /* ordered_stroke */
   rm_vec images;  /* placed_image */
+  rm_vec* glyphs; /* rm_highlight */
   bool failed;
 } scene_walk;
-
-/* A subtree that is not drawn, and whose items are nonetheless spoken for:
- * the fallback pass must not resurrect a hidden layer. A node moved out of
- * it is not part of it any more and is left to be reached from where it is
- * now. */
-static void claim_subtree(scene_walk* walk, rm_crdt_id node) {
-  rm_vec stack;
-  rm_vec_init(&stack, sizeof(uint32_t));
-  const uint32_t* children;
-  size_t count;
-  if (rm_grouping_find(walk->children_of, node, &children, &count)) {
-    for (size_t i = 0; i < count; i += 1) {
-      if (!rm_vec_push(&stack, &children[i])) {
-        walk->failed = true;
-        break;
-      }
-    }
-  }
-  while (stack.count > 0 && !walk->failed) {
-    uint32_t index = *(uint32_t*)rm_vec_at(&stack, stack.count - 1);
-    stack.count -= 1;
-    if (walk->placed[index]) continue;
-    walk->placed[index] = true;
-    if (walk->items[index].kind != ITEM_GROUP) continue;
-    if (!tree_links(walk->tree, walk->items[index].parent,
-                    walk->items[index].group)) {
-      continue;
-    }
-    if (!rm_grouping_find(walk->children_of, walk->items[index].group,
-                          &children, &count)) {
-      continue;
-    }
-    for (size_t i = 0; i < count; i += 1) {
-      if (!rm_vec_push(&stack, &children[i])) {
-        walk->failed = true;
-        break;
-      }
-    }
-  }
-  rm_vec_free(&stack);
-}
 
 /* The node's children (there may be none), ordered the way `chain_order`
  * orders them. Malloc'd; the caller frees it. Null only on allocation
@@ -2418,11 +2444,7 @@ static uint32_t* children_in_chain_order(const scene_walk* walk,
  * process. Each frame is a node, its children in chain order, and how far down
  * them the walk has got. */
 static void walk_from(scene_walk* walk, rm_crdt_id root) {
-  if (rm_idmap_contains(walk->removed, root) ||
-      rm_idmap_contains(walk->hidden, root)) {
-    claim_subtree(walk, root);
-    return;
-  }
+  if (rm_idmap_contains(&walk->tree->removed, root)) return;
 
   rm_vec stack;
   rm_vec_init(&stack, sizeof(walk_frame));
@@ -2456,11 +2478,7 @@ static void walk_from(scene_walk* walk, rm_crdt_id root) {
           /* A stale link: the child is drawn, if at all, from its
            * present parent. */
           if (!tree_links(walk->tree, frame->node, child)) continue;
-          if (rm_idmap_contains(walk->removed, child) ||
-              rm_idmap_contains(walk->hidden, child)) {
-            claim_subtree(walk, child);
-            continue;
-          }
+          if (rm_idmap_contains(&walk->tree->removed, child)) continue;
           /* The parent stays on the stack with its place kept, and
            * the child goes on top of it: that is what "depth first"
            * is once the call stack is not doing the remembering. */
@@ -2485,6 +2503,10 @@ static void walk_from(scene_walk* walk, rm_crdt_id root) {
           if (!rm_vec_push(&walk->images, &entry)) walk->failed = true;
           break;
         }
+        case ITEM_GLYPH:
+          if (!rm_vec_push(walk->glyphs, &walk->items[index].glyph))
+            walk->failed = true;
+          break;
         case ITEM_TOMBSTONE:
           break;
       }
@@ -2498,6 +2520,8 @@ static void walk_from(scene_walk* walk, rm_crdt_id root) {
   rm_vec_free(&stack);
 }
 
+static bool removed_subtrees(const parse_ctx* ctx, tree_state* tree);
+
 /* The strokes in the order the tablet draws them: the scene tree walked
  * depth-first, each node's children in their chain order. File order is not
  * that order — a reordering of layers rewrites no stroke at all.
@@ -2507,24 +2531,31 @@ static void walk_from(scene_walk* walk, rm_crdt_id root) {
  * reaches — a file without group blocks, or links that do not add up — are
  * appended in file order rather than lost: order is worth less than the ink. */
 static bool ordered_scene(parse_ctx* ctx, rm_vec* out_strokes,
-                          rm_vec* out_images) {
-  const scene_item* items = ctx->items.data;
-  size_t count = ctx->items.count;
-
+                          rm_vec* out_images, rm_vec* glyphs) {
   bool ok = false;
   /* A group item that names a node the records have since put elsewhere is
    * a stale link: the node is reached from where it is now, or not at all. */
   tree_state tree;
-  rm_idmap interior, known;
-  rm_vec path;
+  rm_idmap interior;
   rm_idmap_init(&interior);
-  rm_idmap_init(&known);
-  rm_vec_init(&path, sizeof(rm_crdt_id));
+
   rm_grouping children_of = {0};
   bool* placed = nullptr;
 
   if (!tree_state_build(ctx, &tree)) goto done;
 
+  /* Propagate suppression over both placement records and live group links
+   * before selecting roots. Missing ordering links can interrupt a DFS. */
+  size_t cursor = 0;
+  rm_crdt_id hidden;
+  uint64_t value;
+  while (rm_idmap_next(&ctx->hidden_nodes, &cursor, &hidden, &value))
+    if (!rm_idmap_set(&tree.removed, hidden, 1)) goto done;
+  if (tree.removed.count && !removed_subtrees(ctx, &tree)) goto done;
+
+  if (!append_unlinked_placements(ctx, &tree)) goto done;
+  const scene_item* items = ctx->items.data;
+  size_t count = ctx->items.count;
   scene_key_ctx key_ctx = {.items = items, .positions = nullptr};
   if (!rm_grouping_build(&children_of, count, scene_parent_key, &key_ctx))
     goto done;
@@ -2532,7 +2563,9 @@ static bool ordered_scene(parse_ctx* ctx, rm_vec* out_strokes,
   /* The roots: nodes that hold items but are named by no group item — the
    * page root, ordinarily one. */
   for (size_t i = 0; i < count; i += 1) {
-    if (items[i].kind != ITEM_GROUP) continue;
+    if (items[i].kind != ITEM_GROUP || items[i].deleted ||
+        !tree_links(&tree, items[i].parent, items[i].group))
+      continue;
     if (!rm_idmap_set(&interior, items[i].group, 1)) goto done;
   }
 
@@ -2541,12 +2574,10 @@ static bool ordered_scene(parse_ctx* ctx, rm_vec* out_strokes,
 
   scene_walk walk = {
       .items = items,
-      .item_count = count,
       .children_of = &children_of,
       .tree = &tree,
-      .removed = &tree.removed,
-      .hidden = &ctx->hidden_nodes,
       .placed = placed,
+      .glyphs = glyphs,
   };
   walk.strokes = *out_strokes;
   walk.images = *out_images;
@@ -2564,12 +2595,7 @@ static bool ordered_scene(parse_ctx* ctx, rm_vec* out_strokes,
     if (placed[i]) continue;
     if (items[i].deleted != 0) continue;
     rm_crdt_id parent = items[i].parent;
-    bool gone;
-    if (!tree_is_under(&tree, &tree.removed, &ctx->hidden_nodes, &known, &path,
-                       parent, &gone)) {
-      goto done_walk;
-    }
-    if (gone) continue;
+    if (rm_idmap_contains(&tree.removed, parent)) continue;
     if (items[i].kind == ITEM_STROKE) {
       ordered_stroke entry = {.item = (uint32_t)i, .parent = parent};
       if (!rm_vec_push(&walk.strokes, &entry)) goto done_walk;
@@ -2580,6 +2606,8 @@ static bool ordered_scene(parse_ctx* ctx, rm_vec* out_strokes,
           .parent = parent,
       };
       if (!rm_vec_push(&walk.images, &entry)) goto done_walk;
+    } else if (items[i].kind == ITEM_GLYPH) {
+      if (!rm_vec_push(glyphs, &items[i].glyph)) goto done_walk;
     }
   }
   ok = !walk.failed;
@@ -2591,8 +2619,6 @@ done_walk:
 done:
   free(placed);
   rm_grouping_free(&children_of);
-  rm_vec_free(&path);
-  rm_idmap_free(&known);
   rm_idmap_free(&interior);
   tree_state_free(&tree);
   return ok;
@@ -2614,7 +2640,8 @@ static bool anchor_under(const parse_ctx* ctx, rm_crdt_id parent,
   if (!rm_idmap_get(&ctx->anchor_of_node, parent, &index)) return false;
   const node_anchor* node = rm_vec_at(&ctx->node_anchors, (size_t)index);
   rm_text_anchor place;
-  if (!layout_anchor(&ctx->text, node->anchor, &place)) return false;
+  if (!node->has_target || !layout_anchor(&ctx->text, node->anchor, &place))
+    return false;
   place.has_origin_x = node->has_origin_x;
   place.origin_x = node->origin_x;
   *out = place;
@@ -2679,8 +2706,11 @@ static rm_status build_faces(rm_arena* arena, const line_build* line,
  * the newline — and so belongs to the line after that one. The first paragraph
  * has no newline before it and is keyed by the format's start-of-text
  * sentinel. */
-static void apply_styles(const parse_ctx* ctx, rm_paragraph* paragraphs,
-                         size_t count) {
+static rm_status apply_styles(const parse_ctx* ctx, rm_paragraph* paragraphs,
+                              size_t count) {
+  if (!ctx->text.styles.count) return RM_OK;
+  rm_crdt_id* stamps = rm_arena_calloc(ctx->arena, count, sizeof *stamps);
+  if (!stamps) return RM_ERR_OUT_OF_MEMORY;
   for (size_t i = 0; i < ctx->text.styles.count; i += 1) {
     const style_entry* entry = rm_vec_at(&ctx->text.styles, i);
     size_t line;
@@ -2693,10 +2723,12 @@ static void apply_styles(const parse_ctx* ctx, rm_paragraph* paragraphs,
       rm_text_anchor place = anchor_unpack(packed);
       line = (size_t)place.paragraph + 1u;
     }
-    if (line >= count) continue;
+    if (line >= count || rm_stamp_newer(stamps[line], entry->stamp)) continue;
+    stamps[line] = entry->stamp;
     paragraphs[line].has_format = true;
     paragraphs[line].format = entry->format;
   }
+  return RM_OK;
 }
 
 /* The page's `rm_text_block`: one `rm_paragraph` per laid-out line, its text
@@ -2716,7 +2748,7 @@ static rm_status build_text_block(parse_ctx* ctx, rm_text_block* out) {
     RM_TRY(build_faces(ctx->arena, line, &paragraphs[i].faces,
                        &paragraphs[i].face_count));
   }
-  apply_styles(ctx, paragraphs, count);
+  RM_TRY(apply_styles(ctx, paragraphs, count));
 
   *out = (rm_text_block){
       .origin_x = ctx->text.origin_x,
@@ -2731,7 +2763,8 @@ static rm_status build_text_block(parse_ctx* ctx, rm_text_block* out) {
 
 /* The gathered blocks as one page. */
 static rm_status assemble(parse_ctx* ctx, rm_page* page) {
-  rm_vec strokes, images;
+  rm_vec strokes, images, glyphs;
+  rm_vec_init(&glyphs, sizeof(rm_highlight));
   rm_vec_init(&strokes, sizeof(ordered_stroke));
   rm_vec_init(&images, sizeof(placed_image));
   rm_status status = RM_OK;
@@ -2740,7 +2773,7 @@ static rm_status assemble(parse_ctx* ctx, rm_page* page) {
    * order of 0x04, strokes in their own chain within a layer. A hidden or
    * deleted layer is dropped here rather than at drawing time, so that it
    * widens no sheet and shifts no anchor either. */
-  if (!ordered_scene(ctx, &strokes, &images)) {
+  if (!ordered_scene(ctx, &strokes, &images, &glyphs)) {
     status = RM_ERR_OUT_OF_MEMORY;
     goto done;
   }
@@ -2815,22 +2848,21 @@ static rm_status assemble(parse_ctx* ctx, rm_page* page) {
   }
 
   rm_highlight* out_highlights = nullptr;
-  if (ctx->highlights.count != 0) {
-    out_highlights = rm_arena_alloc(
-        ctx->arena, ctx->highlights.count * sizeof *out_highlights);
+  if (glyphs.count != 0) {
+    out_highlights =
+        rm_arena_alloc(ctx->arena, glyphs.count * sizeof *out_highlights);
     if (out_highlights == nullptr) {
       status = RM_ERR_OUT_OF_MEMORY;
       goto done;
     }
-    memcpy(out_highlights, ctx->highlights.data,
-           ctx->highlights.count * sizeof *out_highlights);
+    memcpy(out_highlights, glyphs.data, glyphs.count * sizeof *out_highlights);
   }
 
   *page = (rm_page){
       .strokes = out_strokes,
       .stroke_count = strokes.count,
       .highlights = out_highlights,
-      .highlight_count = ctx->highlights.count,
+      .highlight_count = glyphs.count,
       .images = out_images,
       .image_count = image_count,
       .anchored_strokes = anchored,
@@ -2851,6 +2883,7 @@ static rm_status assemble(parse_ctx* ctx, rm_page* page) {
 done:
   rm_vec_free(&strokes);
   rm_vec_free(&images);
+  rm_vec_free(&glyphs);
   return status;
 }
 
@@ -2866,7 +2899,6 @@ static void ctx_free(parse_ctx* ctx) {
   rm_vec_free(&ctx->attachments);
   rm_keymap_free(&ctx->attachment_index);
   rm_vec_free(&ctx->node_anchors);
-  rm_vec_free(&ctx->highlights);
   rm_idmap_free(&ctx->anchor_of_node);
   rm_idmap_free(&ctx->hidden_nodes);
   rm_idmap_free(&ctx->visibility_of_node);
@@ -2894,10 +2926,7 @@ static rm_status apply_visibility(parse_ctx* ctx, const tree_node* node) {
     rm_crdt_id* stamp = rm_vec_at(&ctx->visibility_stamps, (size_t)index);
     /* Counters are page-wide. Author breaks concurrent ties; an older
      * record arriving later must not undo a newer visibility edit. */
-    if (node->visibility_stamp.counter < stamp->counter ||
-        (node->visibility_stamp.counter == stamp->counter &&
-         node->visibility_stamp.author < stamp->author))
-      return RM_OK;
+    if (rm_stamp_newer(*stamp, node->visibility_stamp)) return RM_OK;
     *stamp = node->visibility_stamp;
   } else {
     index = ctx->visibility_stamps.count;
@@ -2917,7 +2946,11 @@ static rm_status apply_visibility(parse_ctx* ctx, const tree_node* node) {
 /* Every top-level block of the page, dispatched by type and gathered into
  * `ctx`. An out-of-memory failure stops the parse; any other block failure
  * is counted and the parse moves on to the next block. */
-static rm_status parse_blocks(parse_ctx* ctx) {
+static rm_status parse_blocks(parse_ctx* ctx, rm_error* error) {
+  static const uint8_t supported[] = {
+      [0] = 1, [1] = 1, [2] = 2, [3] = 1,  [4] = 1,  [5] = 2,  [6] = 2,
+      [7] = 2, [8] = 1, [9] = 1, [10] = 1, [13] = 1, [14] = 3, [15] = 2,
+  };
   rm_reader* reader = &ctx->reader;
 
   while (rm_reader_remaining(reader) >= 8) {
@@ -2926,6 +2959,19 @@ static rm_status parse_blocks(parse_ctx* ctx) {
     size_t block_end = block.end;
     uint8_t current_version = block.current_version;
     uint8_t block_type = block.type;
+    if (block_type < sizeof supported && supported[block_type] &&
+        block.min_version > supported[block_type]) {
+      if (error) {
+        *error = (rm_error){.status = RM_ERR_UNSUPPORTED_BLOCK_VERSION,
+                            .value = block_type,
+                            .version = block.min_version};
+        snprintf(error->message, sizeof error->message,
+                 "block 0x%02x at offset %zu requires reader %u (supported %u)",
+                 block_type, block.start, block.min_version,
+                 supported[block_type]);
+      }
+      return RM_ERR_UNSUPPORTED_BLOCK_VERSION;
+    }
 
     rm_reader inner = *reader;
     inner.size = block_end;
@@ -2934,8 +2980,9 @@ static rm_status parse_blocks(parse_ctx* ctx) {
         /* A stroke we did not understand is a lost piece of the
          * drawing, but no reason to lose the whole page. */
         scene_item item;
-        rm_status status =
-            parse_line_item(ctx, &inner, current_version, block_end, &item);
+        rm_status status = parse_line_item(
+            ctx, &inner, current_version > 2 ? 2 : current_version, block_end,
+            &item);
         if (status == RM_OK) {
           if (item.kind == ITEM_TOMBSTONE) ctx->deleted_items += 1;
           if (!rm_vec_push(&ctx->items, &item)) return RM_ERR_OUT_OF_MEMORY;
@@ -3027,19 +3074,27 @@ static rm_status parse_blocks(parse_ctx* ctx) {
 
       case BLOCK_TREE_NODE: {
         tree_node node;
-        if (parse_tree_node(&inner, block_end, &node) == RM_OK) {
-          if (node.has_anchor) {
-            node_anchor anchor = {
-                .anchor = node.anchor,
-                .has_origin_x = node.has_origin_x,
-                .origin_x = node.origin_x,
-            };
-            if (!rm_vec_push(&ctx->node_anchors, &anchor)) {
-              return RM_ERR_OUT_OF_MEMORY;
+        if (parse_tree_node(&inner, block_end, &node, nullptr) == RM_OK) {
+          if (node.has_anchor || node.has_origin_x) {
+            uint64_t index;
+            if (!rm_idmap_get(&ctx->anchor_of_node, node.id, &index)) {
+              index = ctx->node_anchors.count;
+              if (!rm_vec_push(&ctx->node_anchors, &(node_anchor){0}) ||
+                  !rm_idmap_set(&ctx->anchor_of_node, node.id, index))
+                return RM_ERR_OUT_OF_MEMORY;
             }
-            if (!rm_idmap_set(&ctx->anchor_of_node, node.id,
-                              ctx->node_anchors.count - 1u)) {
-              return RM_ERR_OUT_OF_MEMORY;
+            node_anchor* a = rm_vec_at(&ctx->node_anchors, index);
+            if (node.has_anchor &&
+                !rm_stamp_newer(a->target_stamp, node.target_stamp)) {
+              a->anchor = node.anchor;
+              a->target_stamp = node.target_stamp;
+              a->has_target = true;
+            }
+            if (node.has_origin_x &&
+                !rm_stamp_newer(a->origin_stamp, node.origin_stamp)) {
+              a->origin_x = node.origin_x;
+              a->origin_stamp = node.origin_stamp;
+              a->has_origin_x = true;
             }
           }
           RM_TRY(apply_visibility(ctx, &node));
@@ -3069,16 +3124,20 @@ static rm_status parse_blocks(parse_ctx* ctx) {
          * is there and would not read is. */
         bool found = false;
         rm_highlight highlight;
-        rm_status status =
-            parse_glyph_item(ctx, &inner, block_end, &found, &highlight);
+        scene_item position;
+        rm_status status = parse_glyph_item(ctx, &inner, block_end, &found,
+                                            &highlight, &position);
+        if (status == RM_OK && found) {
+          position.kind = ITEM_GLYPH;
+          position.glyph = highlight;
+        }
+        if (status == RM_OK && !rm_vec_push(&ctx->items, &position))
+          return RM_ERR_OUT_OF_MEMORY;
         if (status == RM_ERR_OUT_OF_MEMORY) return status;
         if (status != RM_OK) {
           ctx->other_blocks += 1;
           ctx_note_failure(ctx, status);
-        } else if (found) {
-          if (!rm_vec_push(&ctx->highlights, &highlight))
-            return RM_ERR_OUT_OF_MEMORY;
-        } else {
+        } else if (!found) {
           ctx->deleted_items += 1;
         }
         break;
@@ -3142,6 +3201,49 @@ static rm_status check_header(const uint8_t* data, size_t size,
   return RM_OK;
 }
 
+/* A scene tombstone also reserves consecutive scalar IDs. Introduce
+ * virtual tombstones only at the boundaries other items actually name. */
+static rm_status split_scene_tombstones(parse_ctx* ctx) {
+  const scene_item* items = ctx->items.data;
+  size_t count = ctx->items.count;
+  size_t i = 0;
+  while (i < count && items[i].deleted <= 1) ++i;
+  if (i == count) return RM_OK;
+  text_item* rows = calloc(count, sizeof *rows);
+  if (!rows) return RM_ERR_OUT_OF_MEMORY;
+  for (i = 0; i < count; ++i)
+    rows[i] = (text_item){.id = items[i].id,
+                          .left = items[i].left,
+                          .right = items[i].right,
+                          .deleted = items[i].deleted};
+  rm_vec parts, expanded;
+  rm_vec_init(&parts, sizeof(text_item));
+  rm_vec_init(&expanded, sizeof(scene_item));
+  rm_status status = RM_ERR_OUT_OF_MEMORY;
+  if (!rm_split_text_runs(rows, count, &parts)) goto done;
+  if (parts.count != count) {
+    if (!rm_vec_reserve(&expanded, parts.count)) goto done;
+    for (i = 0; i < parts.count; ++i) {
+      const text_item* part = rm_vec_at(&parts, i);
+      scene_item item = items[part->source];
+      item.id = part->id;
+      item.left = part->left;
+      item.right = part->right;
+      item.deleted = part->deleted;
+      if (!rm_vec_push(&expanded, &item)) goto done;
+    }
+    rm_vec_free(&ctx->items);
+    ctx->items = expanded;
+    expanded = (rm_vec){0};
+  }
+  status = RM_OK;
+done:
+  free(rows);
+  rm_vec_free(&parts);
+  rm_vec_free(&expanded);
+  return status;
+}
+
 /* One pass over a page's blocks, everything gathered and nothing yet decided
  * about what is drawn: hidden layers are in here with the rest. On success
  * the context is the caller's to free, arena included; on failure nothing is
@@ -3166,20 +3268,183 @@ static rm_status read_blocks(const uint8_t* data, size_t size, parse_ctx* ctx,
   rm_vec_init(&ctx->attachments, sizeof(attachment));
   rm_keymap_init(&ctx->attachment_index);
   rm_vec_init(&ctx->node_anchors, sizeof(node_anchor));
-  rm_vec_init(&ctx->highlights, sizeof(rm_highlight));
   rm_idmap_init(&ctx->anchor_of_node);
   rm_idmap_init(&ctx->hidden_nodes);
   rm_idmap_init(&ctx->visibility_of_node);
   rm_vec_init(&ctx->visibility_stamps, sizeof(rm_crdt_id));
 
-  rm_status status = parse_blocks(ctx);
+  rm_status status = parse_blocks(ctx, out_error);
+  if (status == RM_OK) status = split_scene_tombstones(ctx);
   if (status != RM_OK) {
     ctx_free(ctx);
     rm_arena_destroy(ctx->arena);
-    fail_with(out_error, status, 0, nullptr);
+    if (status != RM_ERR_UNSUPPORTED_BLOCK_VERSION)
+      fail_with(out_error, status, 0, nullptr);
   }
   return status;
 }
+
+rm_status rm_text_check_ids(rm_reader root, rm_item_id first, size_t count) {
+  RM_TRY(rm_skip_crdt(&root, 1));
+  const uint32_t tags[] = {2, 1, 1};
+  for (size_t i = 0; i < 3; i++) {
+    if (!rm_match_tag(&root, tags[i], RM_TAG_LENGTH4)) return RM_OK;
+    rm_reader child;
+    RM_TRY(rm_read_subblock(&root, &child));
+    root = child;
+  }
+  size_t rows;
+  RM_TRY(rm_read_count(&root, &rows));
+  parse_ctx ctx = {.arena = rm_arena_create()};
+  if (!ctx.arena) return RM_ERR_OUT_OF_MEMORY;
+  rm_status status = RM_OK;
+  for (size_t i = 0; i < rows; i++) {
+    rm_reader row;
+    text_item it;
+    status = rm_expect_tag(&root, 0, RM_TAG_LENGTH4);
+    if (status == RM_OK) status = rm_read_subblock(&root, &row);
+    if (status == RM_OK) status = parse_text_row(&ctx, &row, &it);
+    if (status != RM_OK) break;
+    uint64_t span = text_item_span(&it);
+    if (rm_id_overlaps(it.id, span ? span : 1, first, count)) {
+      status = RM_ERR_INVALID_ARGUMENT;
+      break;
+    }
+  }
+  rm_arena_destroy(ctx.arena);
+  return status;
+}
+
+rm_status rm_edit_check_location(const uint8_t* data, size_t size,
+                                 rm_item_id parent, rm_item_id left,
+                                 rm_item_id right, rm_crdt_id* successor,
+                                 rm_error* error) {
+  parse_ctx ctx;
+  RM_TRY(read_blocks(data, size, &ctx, error));
+  const scene_item* items = ctx.items.data;
+  rm_vec indices;
+  rm_vec_init(&indices, sizeof(uint32_t));
+  rm_status status = RM_ERR_OUT_OF_MEMORY;
+  tree_state tree;
+  if (!tree_state_build(&ctx, &tree) ||
+      (tree.removed.count && !removed_subtrees(&ctx, &tree)))
+    goto done;
+  if (rm_idmap_contains(&tree.removed, rm_crdt_of(parent))) {
+    status = RM_ERR_ITEMS_NOT_FOUND;
+    goto done;
+  }
+  bool head = rm_crdt_equal(rm_crdt_of(left), RM_CRDT_NONE);
+  bool tail = rm_crdt_equal(rm_crdt_of(right), RM_CRDT_NONE);
+  if (!successor && head && tail) {
+    status = RM_OK;
+    goto done;
+  }
+  for (size_t i = 0; i < ctx.items.count; i++) {
+    if (!rm_crdt_equal(items[i].parent, rm_crdt_of(parent))) continue;
+    uint32_t index = (uint32_t)i;
+    if (index != i || !rm_vec_push(&indices, &index)) goto done;
+  }
+  size_t n;
+  uint32_t* ordered = chain_order(indices.data, indices.count, items, &n);
+  if (!ordered) goto done;
+  size_t l = n, r = n;
+  for (size_t i = 0; i < n; i++) {
+    const scene_item* item = &items[ordered[i]];
+    if (item->kind == ITEM_TOMBSTONE || item->deleted ||
+        (item->kind == ITEM_GROUP &&
+         (rm_idmap_contains(&tree.removed, item->group) ||
+          !tree_links(&tree, item->parent, item->group))))
+      continue;
+    if (rm_crdt_equal(items[ordered[i]].id, rm_crdt_of(left))) l = i;
+    if (rm_crdt_equal(items[ordered[i]].id, rm_crdt_of(right))) r = i;
+  }
+  if (successor) {
+    status = l < n ? RM_OK : RM_ERR_ITEMS_NOT_FOUND;
+    *successor = l < n && l + 1 < n ? items[ordered[l + 1]].id : RM_CRDT_NONE;
+  } else {
+    if ((!head && l == n) || (!tail && r == n))
+      status = RM_ERR_ITEMS_NOT_FOUND;
+    else
+      status = head || tail || l < r ? RM_OK : RM_ERR_INVALID_ARGUMENT;
+  }
+  free(ordered);
+done:
+  tree_state_free(&tree);
+  rm_vec_free(&indices);
+  ctx_free(&ctx);
+  rm_arena_destroy(ctx.arena);
+  fail_with(error, status, 0, nullptr);
+  return status;
+}
+
+rm_status rm_edit_layers(const rm_edit_session* session, rm_edit_layer** out,
+                         size_t* count, rm_error* error) {
+  if (!session || !out || !count) {
+    fail_with(error, RM_ERR_INVALID_ARGUMENT, 0, nullptr);
+    return RM_ERR_INVALID_ARGUMENT;
+  }
+  size_t size;
+  const uint8_t* data = rm_edit_bytes(session, &size);
+  parse_ctx ctx;
+  RM_TRY(read_blocks(data, size, &ctx, error));
+  tree_state tree;
+  rm_idmap live;
+  rm_idmap_init(&live);
+  rm_vec indices, layers;
+  rm_vec_init(&indices, sizeof(uint32_t));
+  rm_vec_init(&layers, sizeof(rm_edit_layer));
+  uint32_t* ordered = nullptr;
+  rm_status status = RM_ERR_OUT_OF_MEMORY;
+  if (!tree_state_build(&ctx, &tree)) goto done;
+  if (!append_unlinked_placements(&ctx, &tree)) goto done;
+  const scene_item* items = ctx.items.data;
+  rm_crdt_id root = rm_crdt_make(0, 1);
+  for (size_t i = 0; i < ctx.items.count; ++i) {
+    if (!rm_crdt_equal(items[i].parent, root)) continue;
+    if (i > UINT32_MAX) {
+      status = RM_ERR_TOO_MANY_TO_NUMBER;
+      goto done;
+    }
+    uint32_t index = (uint32_t)i;
+    if (!rm_vec_push(&indices, &index)) goto done;
+  }
+  size_t n;
+  ordered = chain_order(indices.data, indices.count, items, &n);
+  if (!ordered) goto done;
+  for (size_t i = 0; i < n; ++i) {
+    const scene_item* item = &items[ordered[i]];
+    if (item->kind != ITEM_GROUP || item->deleted ||
+        rm_idmap_contains(&tree.removed, item->group) ||
+        !tree_links(&tree, root, item->group))
+      continue;
+    if (rm_idmap_contains(&live, item->group)) {
+      status = RM_ERR_UNVERIFIED;
+      goto done;
+    }
+    if (!rm_idmap_set(&live, item->group, 1)) goto done;
+    rm_edit_layer layer = {
+        .node = rm_item_id_of(item->group),
+        .link = rm_item_id_of(item->id),
+        .visible = !rm_idmap_contains(&ctx.hidden_nodes, item->group)};
+    if (!rm_vec_push(&layers, &layer)) goto done;
+  }
+  *out = layers.data;
+  *count = layers.count;
+  layers.data = nullptr;
+  status = RM_OK;
+done:
+  rm_idmap_free(&live);
+  rm_vec_free(&layers);
+  rm_vec_free(&indices);
+  free(ordered);
+  tree_state_free(&tree);
+  ctx_free(&ctx);
+  rm_arena_destroy(ctx.arena);
+  fail_with(error, status, 0, nullptr);
+  return status;
+}
+
+void rm_edit_layers_free(rm_edit_layer* layers) { free(layers); }
 
 rm_status rm_parse_page(const uint8_t* data, size_t size, rm_page** out_page,
                         rm_error* out_error) {
@@ -3345,8 +3610,11 @@ rm_status rm_scan_highlighter_items(const uint8_t* data, size_t size,
     if (!rm_idmap_set(&seen, items[i].id, 1) || !rm_vec_push(out_ids, &id))
       goto done;
   }
-  for (size_t i = 0; i < ctx.highlights.count; i += 1) {
-    const rm_highlight* highlight = rm_vec_at(&ctx.highlights, i);
+  for (size_t i = 0; i < ctx.items.count; i += 1) {
+    if (items[i].kind != ITEM_GLYPH ||
+        rm_idmap_contains(removed, items[i].parent))
+      continue;
+    const rm_highlight* highlight = &items[i].glyph;
     rm_crdt_id key = rm_crdt_of(highlight->id);
     if (rm_idmap_contains(&seen, key)) continue;
     if (!rm_idmap_set(&seen, key, 1) || !rm_vec_push(out_ids, &highlight->id))

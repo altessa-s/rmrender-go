@@ -199,6 +199,7 @@ rmr_status rmr_linux_pdf_update_marks(
       rmr_pdf_update_create(source->data.bytes, source->data.size, fresh, &l,
                             cancel, ctx, output, &update, e);
   bool reported = s != RMR_OK; /* set once a marks or PDF call has filled e */
+  rmr_progress* progress = marks ? marks->progress : nullptr;
   for (size_t i = 0; i < count && s == RMR_OK; i++) {
     const rmr_pdf_page* p = &pages[i];
     if (cancel && cancel(ctx)) {
@@ -225,7 +226,7 @@ rmr_status rmr_linux_pdf_update_marks(
     if (s != RMR_OK) break;
     if (!rmr_plan_count(plan)) {
       rmr_pdf_marks_release(marks, i);
-      rmr_pdf_marks_progress(marks, i + 1, count);
+      rmr_progress_advance_to(progress, i + 1);
       continue;
     }
     rmr_transform t = inverse(placement(source->geometry[i], p));
@@ -253,7 +254,7 @@ rmr_status rmr_linux_pdf_update_marks(
     s = rmr_pdf_update_page(update, &overlay, 1, e);
     reported = s != RMR_OK;
     rmr_buffer_free(&pdf);
-    if (s == RMR_OK) rmr_pdf_marks_progress(marks, i + 1, count);
+    if (s == RMR_OK) rmr_progress_advance_to(progress, i + 1);
   }
 
   if (s == RMR_OK) {
@@ -631,6 +632,7 @@ rmr_status rmr_linux_pdf_overlay_marks(
 
   rmr_pdf_builder* builder = nullptr;
   rmr_linux_parts* parts = nullptr;
+  rmr_progress* progress = provider ? provider->progress : nullptr;
   composer k = {.pages = pages, .nav = &nav};
   rmr_output_guard guard = {0}; /* output, closed once the export fails */
   if (s == RMR_OK) {
@@ -651,9 +653,7 @@ rmr_status rmr_linux_pdf_overlay_marks(
     if (!rmr_pdf_builder_pages(builder, count)) s = RMR_ERR_LIMIT;
   }
   if (s == RMR_OK) {
-    s = rmr_linux_parts_create(
-        builder, compose_page, &k, provider ? provider->progress : nullptr,
-        provider ? provider->progress_context : nullptr, count, &parts);
+    s = rmr_linux_parts_create(builder, compose_page, &k, progress, &parts);
     if (s != RMR_OK) rmr_linux_error(&why, s, RMR_LINUX_ALLOCATION);
   }
 
@@ -796,10 +796,10 @@ rmr_status rmr_linux_pdf_overlay_marks(
    * earlier in the file and is the one reported, whichever thread got there
    * first. They are finished with the output closed, as the export fails
    * either way. A cancellation stops at once. */
+  if (s != RMR_OK) rmr_progress_silence(progress);
   if (drawn && s != RMR_OK && s != RMR_ERR_CANCELLED) {
     rmr_error earlier = {0};
     guard.closed = true;
-    rmr_linux_parts_stop_progress(parts);
     rmr_status first = rmr_linux_parts_collect(parts, true, &earlier);
     if (first != RMR_OK) {
       s = first;

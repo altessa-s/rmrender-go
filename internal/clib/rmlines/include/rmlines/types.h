@@ -99,17 +99,22 @@ typedef enum rm_status : int {
    * (`rm_error.value`), so what the page holds cannot be told in full. The
    * block lost may be a mark, and "every mark" less one is not every mark. */
   RM_ERR_INCOMPLETE_PAGE,
+  /* A known v6 block requires a newer reader. version is its minimum
+   * reader version and value is its block type. */
+  RM_ERR_UNSUPPORTED_BLOCK_VERSION,
 } rm_status;
 
 /* What went wrong, with the one number or phrase that makes it actionable.
  * Every field but `status` is only as meaningful as `status` says. */
 typedef struct rm_error {
   rm_status status;
-  /* RM_ERR_UNSUPPORTED_VERSION: the generation the header named. */
+  /* Header generation for RM_ERR_UNSUPPORTED_VERSION, minimum reader
+   * version for RM_ERR_UNSUPPORTED_BLOCK_VERSION. */
   int version;
   /* RM_ERR_ANCHOR_OUT_OF_RANGE: the paragraph that was not there.
    * RM_ERR_TOO_MANY_TO_NUMBER: the limit that was passed.
-   * RM_ERR_INCOMPLETE_PAGE: how many blocks would not read. */
+   * RM_ERR_INCOMPLETE_PAGE: how many blocks would not read.
+   * RM_ERR_UNSUPPORTED_BLOCK_VERSION: the top-level block type. */
   long value;
   /* RM_ERR_UNSUPPORTED_FORMAT: the first 32 bytes of the header.
    * Otherwise: what the block parser had to say. Always NUL-terminated. */
@@ -147,6 +152,7 @@ typedef enum rm_pen_tool : int32_t {
   RM_TOOL_FINELINER_2 = 17,
   RM_TOOL_HIGHLIGHTER_2 = 18,
   RM_TOOL_CALIGRAPHY = 21,
+  RM_TOOL_MASKED_ERASER = 22,
   RM_TOOL_SHADER = 23,
 } rm_pen_tool;
 
@@ -187,10 +193,10 @@ typedef enum rm_pen_color : int32_t {
    * tablet's palette names them (`HighlighterBlue = 0xFFBEEAFE`,
    * `HighlighterOrange = 0xFFFFC38C`), and the tablet writes them in `tag 2`
    * with no `argb` beside it; some pages spell the same two colours as 9
-   * plus `argb`. Index 16 (`LastColor`) closes the enumeration and is no
-   * colour at all. */
+   * plus `argb`. Desktop 3.29 also names gray at index 16. */
   RM_COLOR_HIGHLIGHTER_BLUE = 14,
   RM_COLOR_HIGHLIGHTER_ORANGE = 15,
+  RM_COLOR_HIGHLIGHTER_GRAY = 16,
 } rm_pen_color;
 
 /* ------------------------------------------------------------------ */

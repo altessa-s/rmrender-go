@@ -15,11 +15,119 @@
 #define RMLINES_EDITOR_H
 
 #include "rmlines/export.h"
-#include "rmlines/types.h"
+#include "rmlines/writer.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* A local editing session owns its source bytes and its undo history. A byte
+ * view is borrowed until the next successful edit or the session's release.
+ * Undo and redo navigate unpublished revisions of this page.
+ * The library applies its implemented CRDT rules to partially merged concurrent
+ * edits from several devices. These page shapes are verified with synthetic
+ * files only. */
+typedef struct rm_edit_session rm_edit_session;
+
+[[nodiscard]] RM_API rm_status rm_edit_open(const uint8_t* data, size_t size,
+                                            rm_edit_session** out,
+                                            rm_error* error);
+RM_API void rm_edit_close(rm_edit_session* session);
+RM_API const uint8_t* rm_edit_bytes(const rm_edit_session* session,
+                                    size_t* size);
+RM_API bool rm_edit_undo(rm_edit_session* session);
+RM_API bool rm_edit_redo(rm_edit_session* session);
+
+[[nodiscard]] RM_API rm_status rm_edit_erase(rm_edit_session* session,
+                                             const rm_item_id* ids,
+                                             size_t count, rm_error* error);
+
+/* Update a tree node's LWW label or visibility. The caller supplies a fresh
+ * stamp from its registered page author. A stale stamp refuses the edit.
+ * Node IDs are the IDs in SceneTreeNode blocks (layers and anchored groups). */
+[[nodiscard]] RM_API rm_status rm_edit_set_node_name(rm_edit_session* session,
+                                                     rm_item_id node,
+                                                     rm_item_id stamp,
+                                                     const char* name,
+                                                     rm_error* error);
+[[nodiscard]] RM_API rm_status
+rm_edit_set_node_visible(rm_edit_session* session, rm_item_id node,
+                         rm_item_id stamp, bool visible, rm_error* error);
+
+/* Insert a stroke between scene items in a node. {0,0} denotes the
+ * beginning or end. The caller reserves a fresh page-wide counter under
+ * its registered author for id, including across concurrent sessions. */
+[[nodiscard]] RM_API rm_status rm_edit_insert_stroke(
+    rm_edit_session* session, rm_item_id parent, rm_item_id id, rm_item_id left,
+    rm_item_id right, const rm_draft_stroke* stroke, rm_error* error);
+
+/* Replace a range of Unicode scalars in the root text. Paragraph breaks
+ * occupy one scalar. Reserve one consecutive ID per inserted scalar,
+ * starting at first_new, under the caller's registered author. When both
+ * removing and inserting scalars, reserve one additional ID at the end for
+ * the operation's anchor stamp. It must be newer than every anchor stamp
+ * being replaced. Pure deletion consumes no IDs. A text anchor
+ * follows the replacement scalar at the same index within the range. If
+ * that scalar is absent, the edit returns RM_ERR_UNVERIFIED atomically. */
+[[nodiscard]] RM_API rm_status rm_edit_replace_text(
+    rm_edit_session* session, size_t start, size_t remove_count,
+    const char* utf8, rm_item_id first_new, rm_error* error);
+
+typedef struct rm_edit_layer {
+  rm_item_id node, link;
+  bool visible;
+} rm_edit_layer;
+
+/* The live layers in drawing order. Layers without a live ordering link
+ * follow linked layers in placement-record order and have link {0,0}.
+ * Release the array with rm_edit_layers_free.
+ */
+[[nodiscard]] RM_API rm_status rm_edit_layers(const rm_edit_session* session,
+                                              rm_edit_layer** out,
+                                              size_t* count, rm_error* error);
+RM_API void rm_edit_layers_free(rm_edit_layer* layers);
+
+/* Positions are zero-based in the resulting drawing order. Reserve four
+ * fresh consecutive IDs from first for add (the first becomes the node),
+ * one for move and two for delete. A page retains at least one layer.
+ * Add returns RM_ERR_INVALID_ARGUMENT if five live layers already exist
+ * (the device limit documented in docs/FORMAT.md, section 2.9). */
+[[nodiscard]] RM_API rm_status rm_edit_add_layer(rm_edit_session* session,
+                                                 size_t position,
+                                                 const char* name,
+                                                 rm_item_id first,
+                                                 rm_error* error);
+[[nodiscard]] RM_API rm_status rm_edit_move_layer(rm_edit_session* session,
+                                                  rm_item_id node,
+                                                  size_t position,
+                                                  rm_item_id first,
+                                                  rm_error* error);
+[[nodiscard]] RM_API rm_status rm_edit_delete_layer(rm_edit_session* session,
+                                                    rm_item_id node,
+                                                    rm_item_id first,
+                                                    rm_error* error);
+
+typedef struct rm_edit_transform {
+  /* x' = a*x + c*y + tx, y' = b*x + d*y + ty, in the item's node space. */
+  double a, b, c, d, tx, ty;
+} rm_edit_transform;
+
+/* Transform a stroke or cut a half-open range of its recorded samples.
+ * Each edit tombstones the original. Reserve one fresh ID for a transform
+ * and up to two consecutive IDs for the surviving pieces of a cut.
+ * Both keep the parent node and its text anchor. */
+[[nodiscard]] RM_API rm_status rm_edit_transform_stroke(
+    rm_edit_session* session, rm_item_id stroke, rm_item_id fresh,
+    rm_edit_transform transform, rm_error* error);
+/* Apply one affine transform to a selection in a single undo step. Caller
+ * reserves count consecutive IDs. A missing item leaves the revision intact. */
+[[nodiscard]] RM_API rm_status rm_edit_transform_strokes(
+    rm_edit_session* session, const rm_item_id* strokes, size_t count,
+    rm_item_id first_new, rm_edit_transform transform, rm_error* error);
+
+[[nodiscard]] RM_API rm_status rm_edit_cut_stroke(
+    rm_edit_session* session, rm_item_id stroke, rm_item_id fresh,
+    size_t first_point, size_t point_count, rm_error* error);
 
 /* The page with these strokes and highlights erased, the way the tablet's own
  * eraser does it.

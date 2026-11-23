@@ -10,7 +10,7 @@
 // alike, so that the C names stay as written and the linker sees only the
 // prefixed ones: rmlines-go, rmdoc-go and rmmarks-go compile the same
 // libraries under their own names, and one program may link them all.
-// 580 symbols, read with nm from objects of both backends; Windows
+// 607 symbols, read with nm from objects of both backends; Windows
 // compiles the Cairo backend's sources, and its _WIN32 branches add no other.
 
 #ifndef RMRENDER_GO_CLIB_SYMBOLS_H
@@ -33,6 +33,28 @@
 #define rm_draft_column_of rmrgo_rm_draft_column_of
 #define rm_draft_point_make rmrgo_rm_draft_point_make
 #define rm_draft_stroke_make rmrgo_rm_draft_stroke_make
+#define rm_edit_add_layer rmrgo_rm_edit_add_layer
+#define rm_edit_bytes rmrgo_rm_edit_bytes
+#define rm_edit_check_ids rmrgo_rm_edit_check_ids
+#define rm_edit_check_location rmrgo_rm_edit_check_location
+#define rm_edit_close rmrgo_rm_edit_close
+#define rm_edit_commit rmrgo_rm_edit_commit
+#define rm_edit_cut_stroke rmrgo_rm_edit_cut_stroke
+#define rm_edit_delete_layer rmrgo_rm_edit_delete_layer
+#define rm_edit_erase rmrgo_rm_edit_erase
+#define rm_edit_forget_previous rmrgo_rm_edit_forget_previous
+#define rm_edit_insert_stroke rmrgo_rm_edit_insert_stroke
+#define rm_edit_layers rmrgo_rm_edit_layers
+#define rm_edit_layers_free rmrgo_rm_edit_layers_free
+#define rm_edit_move_layer rmrgo_rm_edit_move_layer
+#define rm_edit_open rmrgo_rm_edit_open
+#define rm_edit_redo rmrgo_rm_edit_redo
+#define rm_edit_replace_text rmrgo_rm_edit_replace_text
+#define rm_edit_set_node_name rmrgo_rm_edit_set_node_name
+#define rm_edit_set_node_visible rmrgo_rm_edit_set_node_visible
+#define rm_edit_transform_stroke rmrgo_rm_edit_transform_stroke
+#define rm_edit_transform_strokes rmrgo_rm_edit_transform_strokes
+#define rm_edit_undo rmrgo_rm_edit_undo
 #define rm_erase_items rmrgo_rm_erase_items
 #define rm_expect_tag rmrgo_rm_expect_tag
 #define rm_fits_within rmrgo_rm_fits_within
@@ -84,6 +106,7 @@
 #define rm_read_crdt rmrgo_rm_read_crdt
 #define rm_read_f32 rmrgo_rm_read_f32
 #define rm_read_f64 rmrgo_rm_read_f64
+#define rm_read_node_anchor rmrgo_rm_read_node_anchor
 #define rm_read_seek rmrgo_rm_read_seek
 #define rm_read_string rmrgo_rm_read_string
 #define rm_read_subblock rmrgo_rm_read_subblock
@@ -96,11 +119,15 @@
 #define rm_reader_remaining rmrgo_rm_reader_remaining
 #define rm_scan_highlighter_items rmrgo_rm_scan_highlighter_items
 #define rm_skip_crdt rmrgo_rm_skip_crdt
+#define rm_split_text_runs rmrgo_rm_split_text_runs
 #define rm_status_string rmrgo_rm_status_string
 #define rm_text_block_checkbox_state rmrgo_rm_text_block_checkbox_state
+#define rm_text_check_ids rmrgo_rm_text_check_ids
 #define rm_text_column_setting rmrgo_rm_text_column_setting
 #define rm_text_column_widest_fitting rmrgo_rm_text_column_widest_fitting
 #define rm_text_column_width rmrgo_rm_text_column_width
+#define rm_text_counts_add rmrgo_rm_text_counts_add
+#define rm_text_record_order rmrgo_rm_text_record_order
 #define rm_utf8_next rmrgo_rm_utf8_next
 #define rm_utf8_repair rmrgo_rm_utf8_repair
 #define rm_utf8_repair_bound rmrgo_rm_utf8_repair_bound
@@ -115,6 +142,7 @@
 #define rm_write_f32 rmrgo_rm_write_f32
 #define rm_write_f64 rmrgo_rm_write_f64
 #define rm_write_id rmrgo_rm_write_id
+#define rm_write_line_item rmrgo_rm_write_line_item
 #define rm_write_page rmrgo_rm_write_page
 #define rm_write_stamped_block rmrgo_rm_write_stamped_block
 #define rm_write_stamped_f32 rmrgo_rm_write_stamped_f32
@@ -436,7 +464,6 @@
 #define rmr_linux_parts_create rmrgo_rmr_linux_parts_create
 #define rmr_linux_parts_draw rmrgo_rmr_linux_parts_draw
 #define rmr_linux_parts_free rmrgo_rmr_linux_parts_free
-#define rmr_linux_parts_stop_progress rmrgo_rmr_linux_parts_stop_progress
 #define rmr_linux_path_capture rmrgo_rmr_linux_path_capture
 #define rmr_linux_pdf rmrgo_rmr_linux_pdf
 #define rmr_linux_pdf_incremental rmrgo_rmr_linux_pdf_incremental

@@ -787,7 +787,7 @@ rmr_status rmr_apple_pdf_overlay_marks(
   rmr_status status = RMR_OK;
   bool reported = false; /* set once a marks or drawing call has filled e */
   bool written = false;  /* set once writing the output has failed */
-  size_t completed = 0;  /* settled pages already reported */
+  rmr_progress* progress = marks ? marks->progress : nullptr;
   rmr_pdf_report result = {0};
   for (size_t i = 0; i < count; i++) {
     if (cancel && cancel(context)) {
@@ -900,15 +900,18 @@ rmr_status rmr_apple_pdf_overlay_marks(
 
     CGPDFContextEndPage(cg);
     if (status != RMR_OK || drawn.status != RMR_OK) break;
-    if (marks && marks->progress)
-      rmr_pdf_marks_progress_until(
-          marks, &completed, rmr_apple_writer_watermark(writer, i + 1), count);
+    /* Skip the watermark lock when there is no callback. */
+    if (progress && progress->fn)
+      rmr_progress_advance_to(progress,
+                              rmr_apple_writer_watermark(writer, i + 1));
   }
 
   /* The writer may still be deflating pages before the failing one: a
    * failure writing them is earlier in the file and is the one reported,
    * whichever thread got there first. They are finished with the output
    * closed, as the export fails either way. A cancellation stops at once. */
+  if (status != RMR_OK || drawn.status != RMR_OK)
+    rmr_progress_silence(progress);
   if (status != RMR_OK && status != RMR_ERR_CANCELLED && !written) {
     guard.closed = true;
     rmr_status first = rmr_apple_writer_flush(writer, true);
@@ -919,11 +922,10 @@ rmr_status rmr_apple_pdf_overlay_marks(
     }
   }
 
-  if (status == RMR_OK && drawn.status == RMR_OK && marks && marks->progress) {
+  if (status == RMR_OK && drawn.status == RMR_OK) {
     status = rmr_apple_writer_flush(writer, true);
     written = status != RMR_OK;
-    if (status == RMR_OK)
-      rmr_pdf_marks_progress_until(marks, &completed, count, count);
+    if (status == RMR_OK) rmr_progress_advance_to(progress, count);
   }
 
   if (status == RMR_OK && source && usable) {
@@ -1075,6 +1077,12 @@ typedef struct {
   size_t head, count, capacity;
 } pending_pages;
 
+/* The settled prefix stops at the oldest pending page, even when later
+ * submitted pages have no marks and therefore no queued overlay. */
+static size_t pending_watermark(const pending_pages* q, size_t submitted) {
+  return q->count ? q->items[q->head].overlay.page : submitted;
+}
+
 enum { PENDING_WINDOW = 16 };
 
 /* Hands the oldest pending pages to the update, each once its writer's share
@@ -1165,8 +1173,8 @@ rmr_status rmr_apple_pdf_update_marks(
    * alone. */
   rmr_apple_writer* writer = nullptr;
   rmr_pdf_update* update = nullptr;
-  bool settled = false;         /* set once settling the queue has failed */
-  size_t completed = 0;         /* settled pages already reported */
+  bool settled = false; /* set once settling the queue has failed */
+  rmr_progress* progress = marks ? marks->progress : nullptr;
   rmr_output_guard guard = {0}; /* output, closed once the export fails */
   if (output) rmr_output_guard_init(&guard, output);
   if (status == RMR_OK && rmr_apple_writer_create(&limits, checked.decimals,
@@ -1205,9 +1213,7 @@ rmr_status rmr_apple_pdf_update_marks(
     if (status != RMR_OK) break;
     if (!rmr_plan_count(plan)) {
       rmr_pdf_marks_release(marks, i);
-      rmr_pdf_marks_progress_until(
-          marks, &completed,
-          queue.count ? queue.items[queue.head].overlay.page : i + 1, count);
+      rmr_progress_advance_to(progress, pending_watermark(&queue, i + 1));
       continue;
     }
 
@@ -1258,15 +1264,14 @@ rmr_status rmr_apple_pdf_update_marks(
     status = settle(&queue, writer, update, false, e);
     settled = status != RMR_OK;
     if (status == RMR_OK)
-      rmr_pdf_marks_progress_until(
-          marks, &completed,
-          queue.count ? queue.items[queue.head].overlay.page : i + 1, count);
+      rmr_progress_advance_to(progress, pending_watermark(&queue, i + 1));
   }
 
   /* Pages before the failing one may still be queued: a failure adding them
    * to the update is earlier in the file and is the one reported, whichever
    * thread finished first. They are added with the output closed, as the
    * export fails either way. A cancellation stops at once. */
+  if (status != RMR_OK) rmr_progress_silence(progress);
   if (status != RMR_OK && status != RMR_ERR_CANCELLED && !settled && update) {
     rmr_error earlier = {0};
     guard.closed = true;
@@ -1278,8 +1283,7 @@ rmr_status rmr_apple_pdf_update_marks(
   }
   if (status == RMR_OK) {
     status = settle(&queue, writer, update, true, e);
-    if (status == RMR_OK)
-      rmr_pdf_marks_progress_until(marks, &completed, count, count);
+    if (status == RMR_OK) rmr_progress_advance_to(progress, count);
   }
   for (; queue.count; queue.count--) {
     rmr_buffer_free(&queue.items[queue.head].native);

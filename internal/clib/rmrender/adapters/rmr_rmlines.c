@@ -56,22 +56,24 @@ static rmr_grain grain(rm_pen_tool t) {
 /* The RGBA color for pen color c, substituting a lighter shade for a few
  * colors when the stroke darkens (highlighter/shader) rather than paints. */
 static rmr_color palette(rm_pen_color c, bool darkens) {
-  static const rmr_color colors[] = {{0, 0, 0, 1},
-                                     {144.0 / 255, 144.0 / 255, 144.0 / 255, 1},
-                                     {1, 1, 1, 1},
-                                     {0.98, 0.87, 0.16, 1},
-                                     {0.16, 0.72, 0.35, 1},
-                                     {0.95, 0.44, 0.7, 1},
-                                     {48.0 / 255, 74.0 / 255, 224.0 / 255, 1},
-                                     {194.0 / 255, 49.0 / 255, 50.0 / 255, 1},
-                                     {0.5, 0.5, 0.5, 1},
-                                     {0.98, 0.87, 0.16, 1},
-                                     {145.0 / 255, 218.0 / 255, 113.0 / 255, 1},
-                                     {116.0 / 255, 210.0 / 255, 232.0 / 255, 1},
-                                     {192.0 / 255, 127.0 / 255, 210.0 / 255, 1},
-                                     {250.0 / 255, 231.0 / 255, 25.0 / 255, 1},
-                                     {190.0 / 255, 234.0 / 255, 254.0 / 255, 1},
-                                     {1, 195.0 / 255, 140.0 / 255, 1}};
+  static const rmr_color colors[] = {
+      {0, 0, 0, 1},
+      {144.0 / 255, 144.0 / 255, 144.0 / 255, 1},
+      {1, 1, 1, 1},
+      {0.98, 0.87, 0.16, 1},
+      {0.16, 0.72, 0.35, 1},
+      {0.95, 0.44, 0.7, 1},
+      {48.0 / 255, 74.0 / 255, 224.0 / 255, 1},
+      {194.0 / 255, 49.0 / 255, 50.0 / 255, 1},
+      {0.5, 0.5, 0.5, 1},
+      {0.98, 0.87, 0.16, 1},
+      {145.0 / 255, 218.0 / 255, 113.0 / 255, 1},
+      {116.0 / 255, 210.0 / 255, 232.0 / 255, 1},
+      {192.0 / 255, 127.0 / 255, 210.0 / 255, 1},
+      {250.0 / 255, 231.0 / 255, 25.0 / 255, 1},
+      {190.0 / 255, 234.0 / 255, 254.0 / 255, 1},
+      {1, 195.0 / 255, 140.0 / 255, 1},
+      {199.0 / 255, 199.0 / 255, 198.0 / 255, 1}};
 
   if (darkens) {
     if (c == RM_COLOR_YELLOW || c == RM_COLOR_YELLOW_2 ||
@@ -89,7 +91,7 @@ static rmr_color palette(rm_pen_color c, bool darkens) {
 rmr_status rmr_lines_style(const rm_stroke* s, rmr_stroke_style* out,
                            rmr_error* e) {
   if (!s || !out || (!s->points && s->point_count) ||
-      s->color < RM_COLOR_BLACK || s->color > RM_COLOR_HIGHLIGHTER_ORANGE)
+      s->color < RM_COLOR_BLACK || (size_t)s->color > 16)
     return error(e, RMR_ERR_INVALID_ARGUMENT, 0, "invalid stroke");
 
   bool darkens = highlighter(s->tool) || s->tool == RM_TOOL_SHADER;
@@ -101,7 +103,7 @@ rmr_status rmr_lines_style(const rm_stroke* s, rmr_stroke_style* out,
       .grain = grain(s->tool),
       .stroked = highlighter(s->tool) || s->tool == RM_TOOL_FINELINER_1 ||
                  s->tool == RM_TOOL_FINELINER_2,
-      .eraser = s->tool == RM_TOOL_ERASER || s->tool == RM_TOOL_ERASER_AREA};
+      .eraser = rmr_path_eraser(s->tool) || s->tool == RM_TOOL_ERASER_AREA};
 
   float sum = 0;
   bool varying = false;
@@ -140,6 +142,15 @@ rmr_status rmr_lines_outline(const rm_stroke* s, const rmr_limits* given,
   if (s->point_count > l.maximum_points ||
       s->point_count > l.maximum_plan_bytes / sizeof(rmr_sample))
     return error(e, RMR_ERR_LIMIT, 0, "stroke points limit");
+
+  if (s->tool == rmr_masked_eraser && s->point_count == 1) {
+    /* A stationary path gives the outline builder a round eraser footprint. */
+    rm_stroke_point p = s->points[0];
+    rmr_sample sample = {{p.x, p.y}, rmr_line_width(p.width)};
+    rmr_sample dot[] = {sample, sample};
+    if (l.maximum_points == 1) l.maximum_points = 2;
+    return rmr_outline(dot, 2, RMR_CAP_ROUND, RMR_JOIN_ROUND, &l, out, e);
+  }
 
   rmr_sample* points =
       calloc(s->point_count ? s->point_count : 1, sizeof *points);
@@ -330,7 +341,8 @@ rmr_status rmr_lines_plan_with_raster(const rm_stroke* strokes, size_t count,
     rmr_stroke_style style;
     status = rmr_lines_style(s, &style, e);
     if (status != RMR_OK) break;
-    if (style.eraser && (s->tool == RM_TOOL_ERASER_AREA || s->point_count < 2))
+    if (style.eraser && (s->tool == RM_TOOL_ERASER_AREA || !s->point_count ||
+                         (s->tool == RM_TOOL_ERASER && s->point_count == 1)))
       continue;
 
     if (style.stroked && s->point_count > 1) {
@@ -395,7 +407,7 @@ rmr_status rmr_lines_plan_with_raster(const rm_stroke* strokes, size_t count,
   if (status == RMR_OK) {
     size_t erase_count = 0, reference_count = 0, work = 0;
     for (size_t i = 0; i < count; i++)
-      if (strokes[i].tool == RM_TOOL_ERASER) {
+      if (rmr_path_eraser(strokes[i].tool)) {
         if (paths[i].count)
           erasers[erase_count++] = (erase_record){i, path_box(paths[i])};
         draws[i].path = (rmr_path_view){0};

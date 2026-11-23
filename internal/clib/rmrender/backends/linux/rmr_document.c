@@ -249,7 +249,9 @@ static rmr_status document_pdf(
                            "document page count invalid");
   }
 
-  if (checked.progress) checked.progress(checked.progress_context, 0, count);
+  rmr_progress progress = {
+      .fn = checked.progress, .ctx = checked.progress_context, .total = count};
+  if (progress.fn) progress.fn(progress.ctx, 0, count);
 
   /* papers keeps only what rmr_lines_document_canvas reads of each page, its
    * declared paper size, so that no parsed page is held across pages. */
@@ -426,8 +428,7 @@ static rmr_status document_pdf(
                         cancel, context, &documents[i], e);
       if (status != RMR_OK) goto done;
 
-      if (checked.progress)
-        checked.progress(checked.progress_context, i + 1, count);
+      rmr_progress_advance_to(&progress, i + 1);
       produced += documents[i].size;
       remaining.maximum_plan_bytes += rmr_plan_bytes(pages[i].marks);
       rmr_plan_free((rmr_plan*)(uintptr_t)pages[i].marks);
@@ -452,8 +453,7 @@ static rmr_status document_pdf(
                             .listed = listed,
                             .source = source,
                             .placeholder = placeholder};
-  rmr_pdf_marks marks = {plan_acquire, plan_release, &marks_planner,
-                         checked.progress, checked.progress_context};
+  rmr_pdf_marks marks = {plan_acquire, plan_release, &marks_planner, &progress};
   if (mode == PDF_RECOMPOSED && source)
     status =
         rmr_linux_pdf_recompose_marks(source, pages, count, &marks, &remaining,
@@ -469,6 +469,7 @@ static rmr_status document_pdf(
   if (status == RMR_OK && report) *report = result;
 
 done:
+  if (status != RMR_OK) rmr_progress_silence(&progress);
   for (size_t i = 0; i < count; i++)
     rmr_plan_free((rmr_plan*)(uintptr_t)pages[i].marks);
   rmr_svg_pages unused = {documents, documents ? count : 0};

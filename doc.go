@@ -32,17 +32,8 @@
 // imported PDF page as a raster, at [Options].PDFRasterDPI. A PDF draws
 // grained ink as [Options].PDFGrain says.
 //
-// [Options.Progress] reports whole-document PDF exports in every mode,
-// buffered or written, and SVG exports: (0, total) before drawing, then one
-// report per settled page, in order through total. Total is the output page
-// count after MaximumPages. Settled means its page output is written and
-// its work cannot fail any more; reports can lag drawing by the pipeline
-// window. Failed, cancelled and pending pages are not reported, and final
-// PDF assembly can still fail after all pages settle. Validation can fail
-// before any report. Nil installs no callback. Progress runs synchronously
-// on the callback worker and must be quick and must not call into rmrender:
-// the Cairo backend may hold the PDFium lock. A panic or runtime.Goexit is
-// raised again on the calling goroutine after C stops and cleanup runs.
+// Whole-document PDF and SVG exports can report progress; see
+// [Options.Progress] for the callback contract.
 //
 // # Fonts and templates
 //

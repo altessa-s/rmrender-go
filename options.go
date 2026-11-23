@@ -227,16 +227,20 @@ type Options struct {
 	MaximumPages int
 	// Progress reports whole-document PDF exports (all modes, buffer or
 	// writer) and SVG exports. Runs synchronously on the callback worker:
-	// first (0, total), then (1, total) through (total, total), in order.
+	// first (0, total) before drawing, then (1, total) through (total, total),
+	// in order.
 	// Total is the output page count after MaximumPages. A completed page
 	// is settled: its output is written and its work can no longer fail.
 	// Reports may lag drawing by the pipeline window; failed, cancelled or
 	// still-pending pages are not reported. Final PDF assembly may still
-	// fail after all pages settle. Validation may fail before any report.
+	// fail after all pages settle. Argument and page-count checks fail
+	// without a report. Once (0, total) is reported, any later failure,
+	// including a strict unreadable-page failure, follows that report.
 	// Nil installs no callback. Progress must be quick and must not call
 	// back into rmrender: the Cairo backend may hold the PDFium lock.
 	// A panic or runtime.Goexit stops C and is raised again on the calling
 	// goroutine after cleanup, like the other callbacks.
+	// To stop an export, cancel its context from the callback.
 	Progress func(completed, total int)
 	// Unreadable is what the calls of a [Document] do with a page whose
 	// .rm file does not parse; the zero value, UnreadableStrict, fails.

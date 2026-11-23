@@ -118,9 +118,7 @@ struct rmr_linux_parts {
   rmr_pdf_builder* builder;
   rmr_pdf_pipeline* pipeline;
   size_t window;
-  rmr_progress_fn progress;
-  void* progress_context;
-  size_t completed, total;
+  rmr_progress* progress;
   rmr_linux_page_fn done;
   void* context;
   uint32_t* forms;
@@ -993,8 +991,7 @@ rmr_status rmr_linux_bitmap(const rmr_plan* plan, double scale, rmr_color bg,
 
 rmr_status rmr_linux_parts_create(rmr_pdf_builder* builder,
                                   rmr_linux_page_fn done, void* context,
-                                  rmr_progress_fn progress,
-                                  void* progress_context, size_t total,
+                                  rmr_progress* progress,
                                   rmr_linux_parts** out) {
   rmr_linux_parts* p = calloc(1, sizeof *p);
   if (!p) return RMR_ERR_OUT_OF_MEMORY;
@@ -1004,19 +1001,13 @@ rmr_status rmr_linux_parts_create(rmr_pdf_builder* builder,
                          .window = 2 * workers + 2,
                          .done = done,
                          .context = context,
-                         .progress = progress,
-                         .progress_context = progress_context,
-                         .total = total};
+                         .progress = progress};
   if (!p->pipeline) {
     free(p);
     return RMR_ERR_OUT_OF_MEMORY;
   }
   *out = p;
   return RMR_OK;
-}
-
-void rmr_linux_parts_stop_progress(rmr_linux_parts* p) {
-  if (p) p->progress = nullptr;
 }
 
 void rmr_linux_parts_free(rmr_linux_parts* p) {
@@ -1084,8 +1075,7 @@ rmr_status rmr_linux_parts_collect(rmr_linux_parts* p, bool all, rmr_error* e) {
       s = p->done(p->context, b->tag, p->forms, p->count, b->extra, e);
       b->extra = (rmr_buffer){0};
       p->count = 0;
-      if (s == RMR_OK && p->progress)
-        p->progress(p->progress_context, ++p->completed, p->total);
+      if (s == RMR_OK) rmr_progress_advance_to(p->progress, b->tag + 1);
     } else {
       if (p->count == p->capacity) {
         size_t capacity = p->capacity ? p->capacity * 2 : 8;
@@ -1156,8 +1146,7 @@ rmr_status rmr_linux_render_pdf(const rmr_plan* const* plans,
     if (!rmr_pdf_builder_pages(builder, count)) s = RMR_ERR_LIMIT;
   }
   if (s == RMR_OK) {
-    s = rmr_linux_parts_create(builder, sheet_page, &output, nullptr, nullptr,
-                               count, &parts);
+    s = rmr_linux_parts_create(builder, sheet_page, &output, nullptr, &parts);
     if (s != RMR_OK) rmr_linux_error(&why, s, RMR_LINUX_ALLOCATION);
   }
 
