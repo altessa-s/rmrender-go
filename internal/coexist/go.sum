@@ -1,8 +1,6 @@
 github.com/altessa-s/rmdoc-go v1.1.2 h1:1qBed3DUfjaRlZyqZcCiY2xt5Nc3mWVNbi3XpkywPCk=
 github.com/altessa-s/rmdoc-go v1.1.2/go.mod h1:g/8YBALvTkPelp6lgnv5+rZvCd4FCFjTHPpfvZl3C1s=
-github.com/altessa-s/rmlines-go v1.1.3 h1:GhOkkqX0xrfXL+k/T0YCjysbgmbR1v+6GQIezsnH414=
-github.com/altessa-s/rmlines-go v1.1.3/go.mod h1:P3mBD/5/LosB/uendofvLl1NhmCzN0Wfh+i/iXJuMFQ=
-github.com/altessa-s/rmlines-go v1.1.4 h1:dK+mqPyZ7HeT/7eIVJdKkwyTkxB4SBjMtgYgwkzq0a4=
-github.com/altessa-s/rmlines-go v1.1.4/go.mod h1:P3mBD/5/LosB/uendofvLl1NhmCzN0Wfh+i/iXJuMFQ=
+github.com/altessa-s/rmlines-go v1.2.0 h1:o1tKk3yAAieBKloqZHQksipoRmYIrReTO/Z/S9DtqTE=
+github.com/altessa-s/rmlines-go v1.2.0/go.mod h1:P3mBD/5/LosB/uendofvLl1NhmCzN0Wfh+i/iXJuMFQ=
 github.com/altessa-s/rmmarks-go v1.1.1 h1:wcWnqnQnzTAZ+AYMD2Z3v2674M9FQCsB4vDQ+ylVwtM=
 github.com/altessa-s/rmmarks-go v1.1.1/go.mod h1:oM1fe2hy1aypFY0cczK0BKvOD58u71iOtQyml9MLWIU=
